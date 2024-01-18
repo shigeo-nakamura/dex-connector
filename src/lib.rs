@@ -1,3 +1,6 @@
+use std::fmt;
+
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 mod dex_connector;
@@ -9,6 +12,22 @@ pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
 pub use rabbitx_connector::*;
 
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub enum OrderSide {
+    #[default]
+    Long,
+    Short,
+}
+
+impl fmt::Display for OrderSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OrderSide::Long => write!(f, "long"),
+            OrderSide::Short => write!(f, "short"),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct CommonErrorResponse {
     pub message: Option<String>,
@@ -16,16 +35,20 @@ pub struct CommonErrorResponse {
 
 #[derive(Deserialize, Debug, Default)]
 pub struct TickerResponse {
-    pub symbol: Option<String>,
-    pub price: Option<String>,
+    pub symbol: String,
+    pub price: Decimal,
+    pub min_tick: Decimal,
+    pub min_order: Decimal,
 }
 
 #[derive(Deserialize, Debug, Default)]
 pub struct FilledOrder {
-    pub order_id: Option<String>,
-    pub filled_size: Option<String>,
-    pub filled_value: Option<String>,
-    pub filled_fee: Option<String>,
+    pub order_id: String,
+    pub trade_id: String,
+    pub filled_side: OrderSide,
+    pub filled_size: Decimal,
+    pub filled_value: Decimal,
+    pub filled_fee: Decimal,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -35,14 +58,13 @@ pub struct FilledOrdersResponse {
 
 #[derive(Deserialize, Debug, Default)]
 pub struct BalanceResponse {
-    pub equity: Option<String>,
-    pub balance: Option<String>,
+    pub equity: Decimal,
+    pub balance: Decimal,
 }
 
 #[derive(Deserialize, Debug, Default)]
 pub struct CreateOrderResponse {
-    pub order_id: Option<String>,
+    pub order_id: String,
+    pub ordered_price: Decimal,
+    pub ordered_size: Decimal,
 }
-
-#[derive(Deserialize, Debug, Default)]
-pub struct DefaultResponse {}

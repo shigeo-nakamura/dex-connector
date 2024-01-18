@@ -1,8 +1,31 @@
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client, Method,
+};
+use serde::Serialize;
 use std::{
+    collections::HashMap,
     error::Error as StdError,
     fmt::{self, Display},
 };
+
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+impl From<HttpMethod> for Method {
+    fn from(method: HttpMethod) -> Self {
+        match method {
+            HttpMethod::Get => Method::GET,
+            HttpMethod::Post => Method::POST,
+            HttpMethod::Put => Method::PUT,
+            HttpMethod::Delete => Method::DELETE,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DexRequest {
@@ -16,6 +39,7 @@ pub enum DexError {
     Reqwest(reqwest::Error),
     ServerResponse(String),
     Other(String),
+    NoConnection,
 }
 
 impl Display for DexError {
@@ -25,6 +49,7 @@ impl Display for DexError {
             DexError::Reqwest(ref e) => write!(f, "Reqwest error: {}", e),
             DexError::ServerResponse(ref e) => write!(f, "Server response error: {}", e),
             DexError::Other(ref e) => write!(f, "Other error: {}", e),
+            DexError::NoConnection => write!(f, "No running WebSocketConnection"),
         }
     }
 }
@@ -36,6 +61,7 @@ impl StdError for DexError {
             DexError::Reqwest(ref e) => Some(e),
             DexError::ServerResponse(_) => None,
             DexError::Other(_) => None,
+            DexError::NoConnection => None,
         }
     }
 }
@@ -48,52 +74,59 @@ impl From<reqwest::Error> for DexError {
 
 impl DexRequest {
     pub async fn new(endpoint: String) -> Result<Self, DexError> {
-        let client = Client::builder()
-            // .default_headers(Self::headers_with_hashed_api_key(api_key))
-            .build()?;
+        let client = Client::builder().cookie_store(true).build()?;
 
         Ok(DexRequest { client, endpoint })
     }
 
-    // fn generate_auth_headers(api_key: String) -> HeaderMap {
-    //     let mut hasher = Sha256::new();
-    //     hasher.update(api_key);
-    //     let hashed_api_key = format!("{:x}", hasher.finalize());
+    pub async fn handle_request<T: serde::de::DeserializeOwned, U: Serialize + ?Sized>(
+        &self,
+        method: HttpMethod,
+        request_url: String,
+        headers: &HashMap<String, String>,
+        json_payload: String,
+    ) -> Result<T, DexError> {
+        let url = format!("{}{}", self.endpoint, request_url);
 
-    //     let mut headers = HeaderMap::new();
-    //     headers.insert("Authorization", hashed_api_key.parse().unwrap());
-    //     headers
-    // }
+        let mut header_map = HeaderMap::new();
+        for (key, value) in headers.iter() {
+            let key = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                .expect("Failed to create HeaderName");
+            let value = HeaderValue::from_str(value).expect("Failed to create HeaderValue");
+            header_map.insert(key, value);
+        }
 
-    // pub async fn handle_request<T: serde::de::DeserializeOwned>(
-    //     &self,
-    //     result: Result<reqwest::Response, reqwest::Error>,
-    //     url: &str,
-    // ) -> Result<T, DexError> {
-    //     let response = result.map_err(DexError::from)?;
-    //     let status = response.status();
+        let client = self.client.clone();
+        let request_builder = client
+            .request(Method::from(method), &url)
+            .headers(header_map);
 
-    //     if status.is_success() {
-    //         let headers = response.headers().clone();
-    //         let body = response.text().await.map_err(DexError::from)?;
-    //         log::trace!("Response body: {}", body);
+        log::trace!("payload = {}", json_payload);
 
-    //         serde_json::from_str(&body).map_err(|e| {
-    //             log::warn!("Response header: {:?}", headers);
-    //             log::error!("Failed to deserialize response: {}", e);
-    //             DexError::Serde(e)
-    //         })
-    //     } else {
-    //         let error_response: CommonErrorResponse = response
-    //             .json()
-    //             .await
-    //             .unwrap_or(CommonErrorResponse { message: None });
-    //         let error_message = format!(
-    //             "Server returned error: {}. Requested url: {}, message: {:?}",
-    //             status, url, error_response.message,
-    //         );
-    //         log::error!("{}", &error_message);
-    //         Err(DexError::ServerResponse(error_message))
-    //     }
-    // }
+        let request_builder = if !json_payload.is_empty() {
+            request_builder.body(json_payload)
+        } else {
+            request_builder
+        };
+
+        let response = request_builder.send().await.map_err(DexError::from)?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let error_message =
+                format!("Server returned error: {}. requested url: {}", status, url);
+            log::error!("{}", &error_message);
+        }
+
+        let response_headers = response.headers().clone();
+        log::trace!("Response header: {:?}", response_headers);
+
+        let response_body = response.text().await.map_err(DexError::from)?;
+        log::trace!("Response body: {}", response_body);
+
+        serde_json::from_str(&response_body).map_err(|e| {
+            log::error!("Failed to deserialize response: {}", e);
+            DexError::Serde(e)
+        })
+    }
 }
