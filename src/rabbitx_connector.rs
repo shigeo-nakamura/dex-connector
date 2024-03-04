@@ -1,5 +1,5 @@
 use crate::{
-    dex_connector::{string_to_decimal, DexConnector},
+    dex_connector::{slippage_price, string_to_decimal, DexConnector},
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
     BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, OrderSide,
@@ -12,7 +12,6 @@ use futures::{
     SinkExt, StreamExt,
 };
 use hmac::{Hmac, Mac};
-use lazy_static::lazy_static;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,7 +38,7 @@ struct Config {
     profile_id: String,
     api_key: String,
     // public_jwt: String,
-    refresh_token: String,
+    _refresh_token: String,
     secret: String,
     private_jwt: Arc<Mutex<String>>,
     market_ids: Vec<String>,
@@ -158,7 +157,7 @@ impl RabbitxConnector {
         let config = Config {
             profile_id: profile_id.to_owned(),
             api_key: api_key.to_owned(),
-            refresh_token: refresh_token.to_owned(),
+            _refresh_token: refresh_token.to_owned(),
             secret: secret.to_owned(),
             private_jwt: Arc::new(Mutex::new(private_jwt.to_owned())),
             market_ids: market_ids.to_vec(),
@@ -603,10 +602,6 @@ struct RabbitxUpdateTokenResponse {
     result: Vec<RabbitxUpdateTokenResult>,
 }
 
-lazy_static! {
-    static ref PRICE_DISCOUNT_RATIO: Decimal = Decimal::new(1, 1);
-}
-
 #[async_trait]
 impl DexConnector for RabbitxConnector {
     async fn start(&self) -> Result<(), DexError> {
@@ -674,8 +669,8 @@ impl DexConnector for RabbitxConnector {
         Ok(TickerResponse {
             symbol: symbol.to_owned(),
             price,
-            min_tick,
-            min_order,
+            min_tick: Some(min_tick),
+            min_order: Some(min_order),
         })
     }
 
@@ -789,7 +784,7 @@ impl DexConnector for RabbitxConnector {
             };
 
             rounded_price = self.round_price(price, min_tick, side);
-            rounded_size = self.round_size(size, min_order);
+            rounded_size = self.floor_size(size, min_order);
 
             log::debug!(
                 "{}, {}, {:?}({}), {:?}({})",
@@ -1048,12 +1043,7 @@ impl RabbitxConnector {
             None => return Err(DexError::Other("No price available".to_string())),
         };
 
-        let worst_price = if *side == OrderSide::Long {
-            last_price * (Decimal::new(1, 0) + *PRICE_DISCOUNT_RATIO)
-        } else {
-            last_price * (Decimal::new(1, 0) - *PRICE_DISCOUNT_RATIO)
-        };
-
+        let worst_price = slippage_price(last_price, *side == OrderSide::Long);
         Ok(worst_price)
     }
 
@@ -1079,5 +1069,16 @@ impl RabbitxConnector {
         } else {
             Err(DexError::Other(res.error))
         }
+    }
+
+    fn round_price(&self, price: Decimal, min_tick: Decimal, side: OrderSide) -> Decimal {
+        match side {
+            OrderSide::Long => (price / min_tick).floor() * min_tick,
+            OrderSide::Short => (price / min_tick).ceil() * min_tick,
+        }
+    }
+
+    fn floor_size(&self, size: Decimal, min_order: Decimal) -> Decimal {
+        (size / min_order).floor() * min_order
     }
 }

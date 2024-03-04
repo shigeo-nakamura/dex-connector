@@ -6,10 +6,12 @@ use serde::Deserialize;
 mod dex_connector;
 mod dex_request;
 mod dex_websocket;
+mod hyperliquid_connector;
 mod rabbitx_connector;
 
 pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
+pub use hyperliquid_connector::*;
 pub use rabbitx_connector::*;
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -37,8 +39,8 @@ pub struct CommonErrorResponse {
 pub struct TickerResponse {
     pub symbol: String,
     pub price: Decimal,
-    pub min_tick: Decimal,
-    pub min_order: Decimal,
+    pub min_tick: Option<Decimal>,
+    pub min_order: Option<Decimal>,
 }
 
 #[derive(Deserialize, Debug, Default)]

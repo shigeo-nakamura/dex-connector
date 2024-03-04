@@ -38,6 +38,7 @@ pub enum DexError {
     Serde(serde_json::Error),
     Reqwest(reqwest::Error),
     ServerResponse(String),
+    WebSocketError(String),
     Other(String),
     NoConnection,
 }
@@ -50,6 +51,7 @@ impl Display for DexError {
             DexError::ServerResponse(ref e) => write!(f, "Server response error: {}", e),
             DexError::Other(ref e) => write!(f, "Other error: {}", e),
             DexError::NoConnection => write!(f, "No running WebSocketConnection"),
+            DexError::WebSocketError(ref e) => write!(f, "WebSocket error: {}", e),
         }
     }
 }
@@ -62,6 +64,7 @@ impl StdError for DexError {
             DexError::ServerResponse(_) => None,
             DexError::Other(_) => None,
             DexError::NoConnection => None,
+            DexError::WebSocketError(_) => None,
         }
     }
 }
@@ -89,6 +92,11 @@ impl DexRequest {
         let url = format!("{}{}", self.endpoint, request_url);
 
         let mut header_map = HeaderMap::new();
+        header_map.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
         for (key, value) in headers.iter() {
             let key = reqwest::header::HeaderName::from_bytes(key.as_bytes())
                 .expect("Failed to create HeaderName");

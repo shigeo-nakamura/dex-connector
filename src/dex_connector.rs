@@ -4,7 +4,12 @@ use crate::{
 };
 use async_trait::async_trait;
 use debot_utils::parse_to_decimal;
+use lazy_static::lazy_static;
 use rust_decimal::Decimal;
+
+lazy_static! {
+    static ref DEFAULT_SLIPPAGE: Decimal = Decimal::new(5, 2);
+}
 
 pub fn string_to_decimal(string_value: Option<String>) -> Result<Decimal, DexError> {
     match string_value {
@@ -13,6 +18,14 @@ pub fn string_to_decimal(string_value: Option<String>) -> Result<Decimal, DexErr
             Err(_) => return Err(DexError::Other(format!("Invalid value: {}", value))),
         },
         None => return Err(DexError::Other("Value is None".to_owned())),
+    }
+}
+
+pub fn slippage_price(price: Decimal, is_buy: bool) -> Decimal {
+    if is_buy {
+        price * (Decimal::new(1, 0) + *DEFAULT_SLIPPAGE)
+    } else {
+        price * (Decimal::new(1, 0) - *DEFAULT_SLIPPAGE)
     }
 }
 
@@ -45,15 +58,4 @@ pub trait DexConnector: Send + Sync {
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError>;
 
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError>;
-
-    fn round_price(&self, price: Decimal, min_tick: Decimal, side: OrderSide) -> Decimal {
-        match side {
-            OrderSide::Long => (price / min_tick).floor() * min_tick,
-            OrderSide::Short => (price / min_tick).ceil() * min_tick,
-        }
-    }
-
-    fn round_size(&self, size: Decimal, min_order: Decimal) -> Decimal {
-        (size / min_order).round() * min_order
-    }
 }
