@@ -903,9 +903,9 @@ impl DexConnector for HyperliquidConnector {
         let rounded_price = Self::round_price(price);
         let rounded_size = self.floor_size(size, symbol);
 
-        log::debug!("{}, {}, {}, {}", symbol, price, rounded_price, rounded_size,);
+        log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
 
-        if rounded_size.is_zero() {
+        if rounded_price * rounded_size <= Decimal::new(10, 0) {
             return Ok(CreateOrderResponse {
                 order_id: String::new(),
                 ordered_price: Decimal::new(0, 0),
