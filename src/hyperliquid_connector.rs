@@ -551,7 +551,6 @@ struct HyperliquidMarginSummary {
 #[derive(Serialize, Debug, Clone)]
 struct HyperliquidCreateOrderPayload {
     r#type: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     orders: Vec<HyperliquidOrder>,
     grouping: String,
 }
@@ -1139,7 +1138,12 @@ impl HyperliquidConnector {
         };
         log::debug!("EIP712 TypedData prepared for signing: {:?}", typed_data);
 
-        let signature = self.wallet.sign_typed_data(&typed_data).await?;
+        let signature = self
+            .wallet
+            .sign_typed_data(&typed_data)
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to sign typed data: {}", e)))?;
+
         log::debug!("Signature obtained: {:?}", signature);
 
         Ok(signature)
