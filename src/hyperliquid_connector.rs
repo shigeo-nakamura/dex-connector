@@ -81,6 +81,8 @@ pub struct HyperliquidConnector {
     web_socket: DexWebSocket,
     running: Arc<AtomicBool>,
     read_socket: Arc<Mutex<Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>>,
+    write_socket:
+        Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>>,
     task_handle_read_message: Arc<Mutex<Option<JoinHandle<()>>>>,
     task_handle_read_sigterm: Arc<Mutex<Option<JoinHandle<()>>>>,
     // 1st key = symbol, 2nd key = order_id
@@ -200,6 +202,7 @@ impl HyperliquidConnector {
             trade_results: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
             read_socket: Arc::new(Mutex::new(None)),
+            write_socket: Arc::new(Mutex::new(None)),
             task_handle_read_message: Arc::new(Mutex::new(None)),
             task_handle_read_sigterm: Arc::new(Mutex::new(None)),
             nonce_history: Arc::new(Mutex::new(VecDeque::with_capacity(20))),
@@ -228,11 +231,16 @@ impl HyperliquidConnector {
         };
         let mut read_lock = self.read_socket.lock().await;
         *read_lock = Some(read);
+        drop(read_lock);
+
+        let mut write_lock = self.write_socket.lock().await;
+        *write_lock = Some(write);
+        drop(write_lock);
 
         self.running.store(true, Ordering::SeqCst);
 
         // Subscribe channels
-        self.subscribe_to_channels(&mut write, &self.config.evm_wallet_address)
+        self.subscribe_to_channels(&self.config.evm_wallet_address)
             .await
             .unwrap();
         log::debug!("subscription is done");
@@ -240,7 +248,7 @@ impl HyperliquidConnector {
         // Create a message recevie thread
         let running_clone = self.running.clone();
         let read_clone = self.read_socket.clone();
-        let write_clone = Arc::new(Mutex::new(write));
+        let write_clone = self.write_socket.clone();
         let dynamic_market_info_clone = self.dynamic_market_info.clone();
         let trade_results_clone = self.trade_results.clone();
         let handle = tokio::spawn(async move {
@@ -255,12 +263,15 @@ impl HyperliquidConnector {
                             Some(Ok(msg)) => {
                                 message_counter = 0;
                                 if msg == "{}".into() {
-                                    write_clone
-                                        .lock()
-                                        .await
-                                        .send(Message::Text(msg.to_string()))
-                                        .await
-                                        .unwrap();
+                                    if let Some(write_socket) = write_clone.lock().await.as_mut() {
+                                        if let Err(e) = write_socket.send(Message::Text(msg.to_string())).await {
+                                            log::error!("Failed to send message: {}", e);
+                                            break;
+                                        }
+                                    } else {
+                                        log::error!("Write socket is not available");
+                                        break;
+                                    }
                                     log::trace!("Responsed to the ping")
                                 } else {
                                     log::trace!("Received message: {:?}", msg);
@@ -337,14 +348,28 @@ impl HyperliquidConnector {
     pub async fn stop_web_socket(&self) -> Result<(), DexError> {
         log::info!("stop_web_socket");
         self.running.store(false, Ordering::SeqCst);
+
+        if let Some(handle) = self.task_handle_read_message.lock().await.take() {
+            let _ = handle.await;
+        }
+
+        if let Some(handle) = self.task_handle_read_sigterm.lock().await.take() {
+            let _ = handle.await;
+        }
+
+        // Drop the WebSocket write and read halves
+        {
+            let mut write_guard = self.write_socket.lock().await;
+            *write_guard = None;
+
+            let mut read_guard = self.read_socket.lock().await;
+            *read_guard = None;
+        }
+
         Ok(())
     }
 
-    async fn subscribe_to_channels(
-        &self,
-        socket: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-        user_address: &str,
-    ) -> Result<(), DexError> {
+    async fn subscribe_to_channels(&self, user_address: &str) -> Result<(), DexError> {
         let all_mids_subscription = serde_json::json!({
             "method": "subscribe",
             "subscription": {
@@ -362,18 +387,35 @@ impl HyperliquidConnector {
         })
         .to_string();
 
-        if let Err(e) = socket.send(Message::Text(all_mids_subscription)).await {
-            return Err(DexError::WebSocketError(format!(
-                "Failed to subscribe to allMids: {}",
-                e
-            )));
-        }
+        // Acquire the lock on the write_socket Mutex.
+        let mut write_socket_lock = self.write_socket.lock().await;
 
-        if let Err(e) = socket.send(Message::Text(user_fills_subscription)).await {
-            return Err(DexError::WebSocketError(format!(
-                "Failed to subscribe to userFills: {}",
-                e
-            )));
+        // Check if the write_socket is Some and then use it to send messages.
+        if let Some(write_socket) = write_socket_lock.as_mut() {
+            if let Err(e) = write_socket
+                .send(Message::Text(all_mids_subscription))
+                .await
+            {
+                return Err(DexError::WebSocketError(format!(
+                    "Failed to subscribe to allMids: {}",
+                    e
+                )));
+            }
+
+            if let Err(e) = write_socket
+                .send(Message::Text(user_fills_subscription))
+                .await
+            {
+                return Err(DexError::WebSocketError(format!(
+                    "Failed to subscribe to userFills: {}",
+                    e
+                )));
+            }
+        } else {
+            // Handle the case where write_socket is None (e.g., connection not established).
+            return Err(DexError::WebSocketError(
+                "Write socket is not available".to_string(),
+            ));
         }
 
         Ok(())
