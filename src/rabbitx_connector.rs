@@ -65,6 +65,8 @@ pub struct RabbitxConnector {
     web_socket: DexWebSocket,
     running: Arc<AtomicBool>,
     read_socket: Arc<Mutex<Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>>,
+    write_socket:
+        Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>>,
     task_handle_read_message: Arc<Mutex<Option<JoinHandle<()>>>>,
     task_handle_read_sigterm: Arc<Mutex<Option<JoinHandle<()>>>>,
     // 1st key = symbol, 2nd key = order_id
@@ -170,6 +172,7 @@ impl RabbitxConnector {
             market_info: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
             read_socket: Arc::new(Mutex::new(None)),
+            write_socket: Arc::new(Mutex::new(None)),
             task_handle_read_message: Arc::new(Mutex::new(None)),
             task_handle_read_sigterm: Arc::new(Mutex::new(None)),
         })
@@ -186,7 +189,7 @@ impl RabbitxConnector {
 
         // Establish socket connection
         let web_socket = self.web_socket.clone();
-        let (mut write, read) = match web_socket.connect().await {
+        let (write, read) = match web_socket.connect().await {
             Ok((write, read)) => (write, read),
             Err(_) => {
                 return Err(DexError::Other(
@@ -194,8 +197,12 @@ impl RabbitxConnector {
                 ))
             }
         };
-        let mut read_lock = self.read_socket.lock().await;
-        *read_lock = Some(read);
+        let mut read_socket_lock = self.read_socket.lock().await;
+        *read_socket_lock = Some(read);
+        drop(read_socket_lock);
+
+        let mut write_socket_lock = self.write_socket.lock().await;
+        *write_socket_lock = Some(write);
 
         self.running.store(true, Ordering::SeqCst);
 
@@ -204,11 +211,23 @@ impl RabbitxConnector {
             r#"{{ "connect": {{ "token": "{}", "name": "js" }}, "id": 1 }}"#,
             self.config.private_jwt.lock().await,
         ));
-        write.send(auth_message).await.unwrap();
+        if let Some(write_socket) = write_socket_lock.as_mut() {
+            if let Err(e) = write_socket.send(auth_message).await {
+                return Err(DexError::WebSocketError(format!(
+                    "Failed to send auth_message: {}",
+                    e
+                )));
+            }
+        } else {
+            return Err(DexError::WebSocketError(
+                "Write socket is not available".to_string(),
+            ));
+        }
+        drop(write_socket_lock);
         log::debug!("authentication is done");
 
         // Subscribe channels
-        self.subscribe_to_channels(&mut write, &self.config.market_ids)
+        self.subscribe_to_channels(&self.config.market_ids)
             .await
             .unwrap();
         log::debug!("subscription is done");
@@ -216,7 +235,7 @@ impl RabbitxConnector {
         // Create a message recevie thread
         let running_clone = self.running.clone();
         let read_clone = self.read_socket.clone();
-        let write_clone = Arc::new(Mutex::new(write));
+        let write_clone = self.write_socket.clone();
         let market_info_clone = self.market_info.clone();
         let trade_results_clone = self.trade_results.clone();
         let handle = tokio::spawn(async move {
@@ -231,12 +250,17 @@ impl RabbitxConnector {
                             Some(Ok(msg)) => {
                                 message_counter = 0;
                                 if msg == "{}".into() {
-                                    write_clone
-                                        .lock()
-                                        .await
-                                        .send(Message::Text(msg.to_string()))
-                                        .await
-                                        .unwrap();
+                                    let mut write_socket_lock = write_clone.lock().await;
+                                    if let Some(write_socket) = write_socket_lock.as_mut() {
+                                        if let Err(e) = write_socket.send(Message::Text(msg.to_string())).await {
+                                            log::error!("Failed to Respond to the ping: {}", e);
+                                            break;
+                                        }
+                                    } else {
+                                            log::error!("Write socket is not available");
+                                            break;
+                                    }
+                                    drop(write_socket_lock);
                                     log::trace!("Responsed to the ping")
                                 } else {
                                     log::trace!("Received message: {:?}", msg);
@@ -313,14 +337,27 @@ impl RabbitxConnector {
     pub async fn stop_web_socket(&self) -> Result<(), DexError> {
         log::info!("stop_web_socket");
         self.running.store(false, Ordering::SeqCst);
+
+        if let Some(handle) = self.task_handle_read_message.lock().await.take() {
+            let _ = handle.await;
+        }
+
+        if let Some(handle) = self.task_handle_read_sigterm.lock().await.take() {
+            let _ = handle.await;
+        }
+
+        {
+            let mut write_guard = self.write_socket.lock().await;
+            *write_guard = None;
+
+            let mut read_guard = self.read_socket.lock().await;
+            *read_guard = None;
+        }
+
         Ok(())
     }
 
-    async fn subscribe_to_channels(
-        &self,
-        socket: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-        market_ids: &[String],
-    ) -> Result<(), DexError> {
+    async fn subscribe_to_channels(&self, market_ids: &[String]) -> Result<(), DexError> {
         let mut channels = Vec::new();
 
         for market_id in market_ids {
@@ -331,15 +368,28 @@ impl RabbitxConnector {
 
         channels.push(format!("account@{}", self.config.profile_id));
 
-        for (idx, channel) in channels.iter().enumerate() {
-            let data = serde_json::json!({
-                "subscribe": {
-                    "channel": channel,
-                    "name": "js",
-                },
-                "id": idx + 1
-            });
-            socket.send(Message::Text(data.to_string())).await.unwrap();
+        let mut write_socket_lock = self.write_socket.lock().await;
+
+        if let Some(write_socket) = write_socket_lock.as_mut() {
+            for (idx, channel) in channels.iter().enumerate() {
+                let data = serde_json::json!({
+                    "subscribe": {
+                        "channel": channel,
+                        "name": "js",
+                    },
+                    "id": idx + 1
+                });
+                if let Err(e) = write_socket.send(Message::Text(data.to_string())).await {
+                    return Err(DexError::WebSocketError(format!(
+                        "Failed to subscribe to allMids: {}",
+                        e
+                    )));
+                }
+            }
+        } else {
+            return Err(DexError::WebSocketError(
+                "Write socket is not available".to_string(),
+            ));
         }
 
         Ok(())

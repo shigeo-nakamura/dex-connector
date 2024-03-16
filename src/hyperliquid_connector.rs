@@ -221,7 +221,7 @@ impl HyperliquidConnector {
 
         // Establish socket connection
         let web_socket = self.web_socket.clone();
-        let (mut write, read) = match web_socket.connect().await {
+        let (write, read) = match web_socket.connect().await {
             Ok((write, read)) => (write, read),
             Err(_) => {
                 return Err(DexError::Other(
@@ -229,13 +229,13 @@ impl HyperliquidConnector {
                 ))
             }
         };
-        let mut read_lock = self.read_socket.lock().await;
-        *read_lock = Some(read);
-        drop(read_lock);
+        let mut read_socket_lock = self.read_socket.lock().await;
+        *read_socket_lock = Some(read);
+        drop(read_socket_lock);
 
-        let mut write_lock = self.write_socket.lock().await;
-        *write_lock = Some(write);
-        drop(write_lock);
+        let mut write_socket_lock = self.write_socket.lock().await;
+        *write_socket_lock = Some(write);
+        drop(write_socket_lock);
 
         self.running.store(true, Ordering::SeqCst);
 
@@ -357,7 +357,6 @@ impl HyperliquidConnector {
             let _ = handle.await;
         }
 
-        // Drop the WebSocket write and read halves
         {
             let mut write_guard = self.write_socket.lock().await;
             *write_guard = None;
@@ -387,10 +386,8 @@ impl HyperliquidConnector {
         })
         .to_string();
 
-        // Acquire the lock on the write_socket Mutex.
         let mut write_socket_lock = self.write_socket.lock().await;
 
-        // Check if the write_socket is Some and then use it to send messages.
         if let Some(write_socket) = write_socket_lock.as_mut() {
             if let Err(e) = write_socket
                 .send(Message::Text(all_mids_subscription))
@@ -412,7 +409,6 @@ impl HyperliquidConnector {
                 )));
             }
         } else {
-            // Handle the case where write_socket is None (e.g., connection not established).
             return Err(DexError::WebSocketError(
                 "Write socket is not available".to_string(),
             ));
