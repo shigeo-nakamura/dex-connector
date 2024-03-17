@@ -854,10 +854,11 @@ impl DexConnector for HyperliquidConnector {
             let filled_order = FilledOrder {
                 order_id: order.order_id.clone(),
                 trade_id: trade_id.clone(),
-                filled_side: order.filled_side.clone(),
-                filled_size: order.filled_size,
-                filled_fee: order.filled_fee,
-                filled_value: order.filled_value,
+                is_rejected: false,
+                filled_side: Some(order.filled_side.clone()),
+                filled_size: Some(order.filled_size),
+                filled_fee: Some(order.filled_fee),
+                filled_value: Some(order.filled_value),
             };
             response.push(filled_order);
         }

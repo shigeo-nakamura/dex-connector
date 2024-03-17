@@ -46,11 +46,12 @@ pub struct TickerResponse {
 #[derive(Deserialize, Debug, Default)]
 pub struct FilledOrder {
     pub order_id: String,
+    pub is_rejected: bool,
     pub trade_id: String,
-    pub filled_side: OrderSide,
-    pub filled_size: Decimal,
-    pub filled_value: Decimal,
-    pub filled_fee: Decimal,
+    pub filled_side: Option<OrderSide>,
+    pub filled_size: Option<Decimal>,
+    pub filled_value: Option<Decimal>,
+    pub filled_fee: Option<Decimal>,
 }
 
 #[derive(Deserialize, Debug, Default)]

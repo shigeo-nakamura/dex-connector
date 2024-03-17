@@ -44,12 +44,19 @@ struct Config {
     market_ids: Vec<String>,
 }
 
+#[derive(PartialEq)]
+enum TradeResultStatus {
+    Filled,
+    Rejected,
+}
+
 struct TradeResult {
     pub order_id: String,
-    pub filled_side: OrderSide,
-    pub filled_size: Decimal,
-    pub filled_value: Decimal,
-    pub filled_fee: Decimal,
+    pub status: TradeResultStatus,
+    pub filled_side: Option<OrderSide>,
+    pub filled_size: Option<Decimal>,
+    pub filled_value: Option<Decimal>,
+    pub filled_fee: Option<Decimal>,
 }
 
 struct MarketInfo {
@@ -82,7 +89,6 @@ struct WebSocketMessage {
 
 #[derive(Deserialize, Debug)]
 struct PushData {
-    channel: String,
     #[serde(rename = "pub")]
     pub_data: PubData,
 }
@@ -112,17 +118,17 @@ struct Fill {
     trade_id: String,
 }
 
-// #[derive(Deserialize, Debug)]
-// struct Order {
-//     id: String,
-//     market_id: String,
-//     status: String,
-// }
+#[derive(Deserialize, Debug)]
+struct Order {
+    id: String,
+    market_id: String,
+    status: String,
+}
 
 #[derive(Deserialize, Debug)]
 struct AccountData {
-    fills: Vec<Fill>,
-    // orders: Vec<Order>,
+    fills: Option<Vec<Fill>>,
+    orders: Option<Vec<Order>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -132,7 +138,6 @@ struct AccountPubData {
 
 #[derive(Deserialize, Debug)]
 struct AccountPushData {
-    channel: String,
     #[serde(rename = "pub")]
     pub_data: AccountPubData,
 }
@@ -407,129 +412,164 @@ impl RabbitxConnector {
                         continue;
                     }
 
-                    if let Ok(account_message) =
-                        serde_json::from_str::<AccountWebSocketMessage>(line)
-                    {
-                        if let Some(account_push_data) = account_message.push {
-                            if account_push_data.channel.starts_with("account@") {
-                                Self::process_account_data(
-                                    &account_push_data.pub_data.data,
-                                    trade_results.clone(),
-                                )
-                                .await;
-                            }
-                        }
-                    } else if let Ok(market_message) =
-                        serde_json::from_str::<WebSocketMessage>(line)
-                    {
-                        if let Some(push_data) = market_message.push {
-                            if push_data.channel.starts_with("market:") {
-                                let market_id = match push_data.pub_data.data.id {
-                                    Some(v) => v,
-                                    None => return Ok(()),
-                                };
-                                let last_trade_price =
-                                    string_to_decimal(push_data.pub_data.data.last_trade_price)
-                                        .ok();
-                                let market_price =
-                                    string_to_decimal(push_data.pub_data.data.market_price).ok();
-                                let min_order =
-                                    string_to_decimal(push_data.pub_data.data.min_order).ok();
-                                let min_tick =
-                                    string_to_decimal(push_data.pub_data.data.min_tick).ok();
-
-                                let mut market_info_guard = market_info.write().await;
-                                let market_info_entry = market_info_guard
-                                    .entry(market_id.to_owned())
-                                    .or_insert_with(|| MarketInfo {
-                                        last_trade_price: None,
-                                        market_price: None,
-                                        min_order: None,
-                                        min_tick: None,
-                                    });
-
-                                log::trace!("last_trade_price = {:?}", last_trade_price);
-
-                                if last_trade_price.is_some() {
-                                    market_info_entry.last_trade_price = last_trade_price;
+                    let val: Result<serde_json::Value, _> = serde_json::from_str(line);
+                    if let Ok(value) = val {
+                        if let Some(channel) = value
+                            .get("push")
+                            .and_then(|v| v.get("channel"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if channel.starts_with("account@") {
+                                if let Ok(account_message) =
+                                    serde_json::from_value::<AccountWebSocketMessage>(value.clone())
+                                {
+                                    if let Some(account_push_data) = account_message.push {
+                                        Self::process_account_data(
+                                            account_push_data.pub_data.data,
+                                            trade_results.clone(),
+                                        )
+                                        .await;
+                                    }
                                 }
-
-                                if market_price.is_some() {
-                                    market_info_entry.market_price = market_price;
-                                }
-
-                                if min_order.is_some() {
-                                    market_info_entry.min_order = min_order;
-                                }
-                                if min_tick.is_some() {
-                                    market_info_entry.min_tick = min_tick;
+                            } else if channel.starts_with("market:") {
+                                if let Ok(market_message) =
+                                    serde_json::from_value::<WebSocketMessage>(value.clone())
+                                {
+                                    if let Some(market_push_data) = market_message.push {
+                                        Self::process_market_data(
+                                            market_push_data.pub_data.data,
+                                            market_info.clone(),
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            _ => {
-                log::warn!("Message is empty");
-            }
+            _ => log::warn!("Received non-text message or empty message."),
         }
         Ok(())
     }
 
+    async fn process_market_data(
+        data: MarketData,
+        market_info: Arc<RwLock<HashMap<String, MarketInfo>>>,
+    ) {
+        let market_id = match data.id {
+            Some(v) => v,
+            None => return,
+        };
+        let last_trade_price = string_to_decimal(data.last_trade_price).ok();
+        let market_price = string_to_decimal(data.market_price).ok();
+        let min_order = string_to_decimal(data.min_order).ok();
+        let min_tick = string_to_decimal(data.min_tick).ok();
+
+        let mut market_info_guard = market_info.write().await;
+        let market_info_entry = market_info_guard
+            .entry(market_id.to_owned())
+            .or_insert_with(|| MarketInfo {
+                last_trade_price: None,
+                market_price: None,
+                min_order: None,
+                min_tick: None,
+            });
+
+        log::trace!("last_trade_price = {:?}", last_trade_price);
+
+        if last_trade_price.is_some() {
+            market_info_entry.last_trade_price = last_trade_price;
+        }
+
+        if market_price.is_some() {
+            market_info_entry.market_price = market_price;
+        }
+
+        if min_order.is_some() {
+            market_info_entry.min_order = min_order;
+        }
+        if min_tick.is_some() {
+            market_info_entry.min_tick = min_tick;
+        }
+    }
+
     async fn process_account_data(
-        data: &AccountData,
+        data: AccountData,
         trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
     ) {
-        for fill in &data.fills {
-            log::debug!("fill: {:?}", fill);
+        let mut trade_results_guard = trade_results.write().await;
 
-            let filled_price = match parse_to_decimal(&fill.price) {
-                Ok(v) => v,
-                Err(_) => {
-                    log::error!("Invalid filled_price: {}", fill.price);
-                    return;
+        if let Some(orders) = &data.orders {
+            for order in orders {
+                if order.status == "rejected" {
+                    let trade_result = TradeResult {
+                        status: TradeResultStatus::Rejected,
+                        order_id: order.id.clone(),
+                        filled_side: None,
+                        filled_size: None,
+                        filled_value: None,
+                        filled_fee: None,
+                    };
+
+                    trade_results_guard
+                        .entry(order.market_id.clone())
+                        .or_default()
+                        .insert(order.id.to_owned(), trade_result);
                 }
-            };
+            }
+        }
 
-            let filled_side = match fill.side.as_str() {
-                "long" => OrderSide::Long,
-                "short" => OrderSide::Short,
-                _ => return,
-            };
+        if let Some(fills) = &data.fills {
+            for fill in fills {
+                log::debug!("fill: {:?}", fill);
 
-            let filled_size = match parse_to_decimal(&fill.size) {
-                Ok(v) => v,
-                Err(_) => {
-                    log::error!("Invalid filled_size: {}", fill.size);
-                    return;
-                }
-            };
+                let filled_price = match parse_to_decimal(&fill.price) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        log::error!("Invalid filled_price: {}", fill.price);
+                        return;
+                    }
+                };
 
-            let filled_fee = match parse_to_decimal(&fill.fee) {
-                Ok(v) => -v,
-                Err(_) => {
-                    log::error!("Invalid filled_fee: {}", fill.fee);
-                    return;
-                }
-            };
+                let filled_side = match fill.side.as_str() {
+                    "long" => OrderSide::Long,
+                    "short" => OrderSide::Short,
+                    _ => return,
+                };
 
-            let filled_value = filled_price * filled_size;
+                let filled_size = match parse_to_decimal(&fill.size) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        log::error!("Invalid filled_size: {}", fill.size);
+                        return;
+                    }
+                };
 
-            let trade_result = TradeResult {
-                filled_side,
-                filled_size,
-                filled_value,
-                filled_fee,
-                order_id: fill.order_id.clone(),
-            };
+                let filled_fee = match parse_to_decimal(&fill.fee) {
+                    Ok(v) => -v,
+                    Err(_) => {
+                        log::error!("Invalid filled_fee: {}", fill.fee);
+                        return;
+                    }
+                };
 
-            // let order_id_suffix = fill.order_id.split('@').nth(1).unwrap_or(&fill.order_id);
+                let filled_value = filled_price * filled_size;
 
-            let mut trade_results_guard = trade_results.write().await;
-            trade_results_guard
-                .entry(fill.market_id.clone())
-                .or_default()
-                .insert(fill.trade_id.to_owned(), trade_result);
+                let trade_result = TradeResult {
+                    order_id: fill.order_id.clone(),
+                    status: TradeResultStatus::Filled,
+                    filled_side: Some(filled_side),
+                    filled_size: Some(filled_size),
+                    filled_value: Some(filled_value),
+                    filled_fee: Some(filled_fee),
+                };
+
+                trade_results_guard
+                    .entry(fill.market_id.clone())
+                    .or_default()
+                    .insert(fill.trade_id.to_owned(), trade_result);
+            }
         }
     }
 }
@@ -735,6 +775,11 @@ impl DexConnector for RabbitxConnector {
             let filled_order = FilledOrder {
                 order_id: order.order_id.clone(),
                 trade_id: trade_id.clone(),
+                is_rejected: if order.status == TradeResultStatus::Rejected {
+                    true
+                } else {
+                    false
+                },
                 filled_side: order.filled_side.clone(),
                 filled_size: order.filled_size,
                 filled_fee: order.filled_fee,
