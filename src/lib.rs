@@ -71,3 +71,13 @@ pub struct CreateOrderResponse {
     pub ordered_price: Decimal,
     pub ordered_size: Decimal,
 }
+
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct LastTrade {
+    pub price: Decimal,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct LastTradeResponse {
+    pub last_trades: Vec<LastTrade>,
+}

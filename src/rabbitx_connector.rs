@@ -2,8 +2,8 @@ use crate::{
     dex_connector::{slippage_price, string_to_decimal, DexConnector},
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
-    BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, OrderSide,
-    TickerResponse,
+    BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade,
+    LastTradeResponse, OrderSide, TickerResponse,
 };
 use async_trait::async_trait;
 use debot_utils::{parse_to_decimal, serialize_decimal_as_f64};
@@ -60,7 +60,6 @@ struct TradeResult {
 }
 
 struct MarketInfo {
-    pub last_trade_price: Option<Decimal>,
     pub market_price: Option<Decimal>,
     pub min_order: Option<Decimal>,
     pub min_tick: Option<Decimal>,
@@ -80,6 +79,8 @@ pub struct RabbitxConnector {
     trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
     // key = symbol
     market_info: Arc<RwLock<HashMap<String, MarketInfo>>>,
+    // key = symbol
+    last_trades: Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -175,6 +176,7 @@ impl RabbitxConnector {
             web_socket,
             trade_results: Arc::new(RwLock::new(HashMap::new())),
             market_info: Arc::new(RwLock::new(HashMap::new())),
+            last_trades: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
             read_socket: Arc::new(Mutex::new(None)),
             write_socket: Arc::new(Mutex::new(None)),
@@ -242,6 +244,7 @@ impl RabbitxConnector {
         let read_clone = self.read_socket.clone();
         let write_clone = self.write_socket.clone();
         let market_info_clone = self.market_info.clone();
+        let last_trades_clone = self.last_trades.clone();
         let trade_results_clone = self.trade_results.clone();
         let handle = tokio::spawn(async move {
             log::debug!("WebSocket message handling task started");
@@ -272,6 +275,7 @@ impl RabbitxConnector {
                                     if let Err(e) = Self::handle_websocket_message(
                                         msg,
                                         market_info_clone.clone(),
+                                        last_trades_clone.clone(),
                                         trade_results_clone.clone(),
                                     )
                                     .await
@@ -403,6 +407,7 @@ impl RabbitxConnector {
     async fn handle_websocket_message(
         msg: Message,
         market_info: Arc<RwLock<HashMap<String, MarketInfo>>>,
+        last_trades: Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
         trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
     ) -> Result<(), DexError> {
         match msg {
@@ -439,6 +444,7 @@ impl RabbitxConnector {
                                         Self::process_market_data(
                                             market_push_data.pub_data.data,
                                             market_info.clone(),
+                                            last_trades.clone(),
                                         )
                                         .await;
                                     }
@@ -456,6 +462,7 @@ impl RabbitxConnector {
     async fn process_market_data(
         data: MarketData,
         market_info: Arc<RwLock<HashMap<String, MarketInfo>>>,
+        last_trades: Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
     ) {
         let market_id = match data.id {
             Some(v) => v,
@@ -470,17 +477,10 @@ impl RabbitxConnector {
         let market_info_entry = market_info_guard
             .entry(market_id.to_owned())
             .or_insert_with(|| MarketInfo {
-                last_trade_price: None,
                 market_price: None,
                 min_order: None,
                 min_tick: None,
             });
-
-        log::trace!("last_trade_price = {:?}", last_trade_price);
-
-        if last_trade_price.is_some() {
-            market_info_entry.last_trade_price = last_trade_price;
-        }
 
         if market_price.is_some() {
             market_info_entry.market_price = market_price;
@@ -491,6 +491,16 @@ impl RabbitxConnector {
         }
         if min_tick.is_some() {
             market_info_entry.min_tick = min_tick;
+        }
+
+        log::debug!("last_trade_price = {:?}", last_trade_price);
+
+        let mut last_trades_guard = last_trades.write().await;
+        let last_trade = last_trades_guard
+            .entry(market_id.to_owned())
+            .or_insert_with(|| vec![]);
+        if let Some(price) = last_trade_price {
+            last_trade.push(LastTrade { price });
         }
     }
 
@@ -1024,6 +1034,33 @@ impl DexConnector for RabbitxConnector {
             {
                 log::error!("close_all_positions: {:?}", e);
             }
+        }
+
+        Ok(())
+    }
+
+    async fn get_last_trades(&self, symbol: &str) -> Result<LastTradeResponse, DexError> {
+        let last_trades_guard = self.last_trades.read().await;
+        let last_trades = match last_trades_guard.get(symbol) {
+            Some(v) => v,
+            None => return Ok(LastTradeResponse::default()),
+        };
+
+        Ok(LastTradeResponse {
+            last_trades: last_trades.to_vec(),
+        })
+    }
+
+    async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError> {
+        let mut last_trades_guard = self.last_trades.write().await;
+
+        if let Some(last_trades) = last_trades_guard.get_mut(symbol) {
+            last_trades_guard.remove(symbol);
+        } else {
+            return Err(DexError::Other(format!(
+                "clear last_trade(symbol:{}) does not exist",
+                symbol
+            )));
         }
 
         Ok(())

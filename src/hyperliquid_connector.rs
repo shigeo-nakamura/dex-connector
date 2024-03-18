@@ -2,8 +2,8 @@ use crate::{
     dex_connector::{slippage_price, string_to_decimal, DexConnector},
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
-    BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, OrderSide,
-    TickerResponse,
+    BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTradeResponse,
+    OrderSide, TickerResponse,
 };
 use ::serde::{Deserialize, Serialize};
 use async_trait::async_trait;
@@ -1055,6 +1055,14 @@ impl DexConnector for HyperliquidConnector {
         }
 
         Ok(())
+    }
+
+    async fn get_last_trades(&self, symbol: &str) -> Result<LastTradeResponse, DexError> {
+        todo!("Not supported yet");
+    }
+
+    async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError> {
+        todo!("Not supported yet");
     }
 }
 
