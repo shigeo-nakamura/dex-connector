@@ -495,11 +495,11 @@ impl RabbitxConnector {
 
         log::debug!("last_trade_price = {:?}", last_trade_price);
 
-        let mut last_trades_guard = last_trades.write().await;
-        let last_trade = last_trades_guard
-            .entry(market_id.to_owned())
-            .or_insert_with(|| vec![]);
         if let Some(price) = last_trade_price {
+            let mut last_trades_guard = last_trades.write().await;
+            let last_trade = last_trades_guard
+                .entry(market_id.to_owned())
+                .or_insert_with(|| vec![]);
             last_trade.push(LastTrade { price });
         }
     }
