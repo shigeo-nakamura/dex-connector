@@ -1057,12 +1057,12 @@ impl DexConnector for HyperliquidConnector {
         Ok(())
     }
 
-    async fn get_last_trades(&self, symbol: &str) -> Result<LastTradeResponse, DexError> {
-        todo!("Not supported yet");
+    async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradeResponse, DexError> {
+        Ok(LastTradeResponse::default())
     }
 
-    async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError> {
-        todo!("Not supported yet");
+    async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
+        Ok(())
     }
 }
 
