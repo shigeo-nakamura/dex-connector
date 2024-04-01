@@ -1369,35 +1369,30 @@ impl HyperliquidConnector {
         let integer_part = parts.next().unwrap_or("0");
         let decimal_part = parts.next().unwrap_or("");
 
-        if decimal_part.len() <= 6 && integer_part.len() + decimal_part.len() <= 5 {
-            return Self::adjust_by_tick(price, order_side, integer_part, decimal_part);
-        }
-
-        let trimmed_decimal_part = &decimal_part[0..decimal_part.len().min(6)];
-
         if integer_part.len() >= 5 {
-            let rounded = integer_part[0..5].parse::<Decimal>().unwrap();
-            return Self::adjust_by_tick(rounded, order_side, integer_part, "");
+            let rounded = Decimal::from_str(integer_part).unwrap();
+            return Self::adjust_by_tick(rounded, order_side);
         }
 
-        if integer_part.len() + trimmed_decimal_part.len() > 5 {
-            let total_digits = 5 - integer_part.len();
-            let final_decimal_part = &trimmed_decimal_part[0..total_digits.min(6)];
-            let rounded_str = format!("{}.{}", integer_part, final_decimal_part);
-            let rounded = Decimal::from_str(&rounded_str).unwrap();
-            return Self::adjust_by_tick(rounded, order_side, integer_part, final_decimal_part);
-        }
+        let allowed_decimal_places = 5 - integer_part.len();
+        let trimmed_decimal_part = if decimal_part.len() > allowed_decimal_places {
+            &decimal_part[0..allowed_decimal_places.min(decimal_part.len())]
+        } else {
+            decimal_part
+        };
 
-        Self::adjust_by_tick(price, order_side, integer_part, decimal_part)
+        let rounded_str = format!("{}.{}", integer_part, trimmed_decimal_part);
+        let rounded = Decimal::from_str(&rounded_str).unwrap();
+        Self::adjust_by_tick(rounded, order_side)
     }
 
-    fn adjust_by_tick(
-        price: Decimal,
-        order_side: OrderSide,
-        integer_part: &str,
-        decimal_part: &str,
-    ) -> Decimal {
-        let adjustment = Decimal::new(1, (integer_part.len() + decimal_part.len()) as u32);
+    fn adjust_by_tick(price: Decimal, order_side: OrderSide) -> Decimal {
+        let adjustment = if price.scale() > 0 || price.to_string().contains('.') {
+            Decimal::new(1, 6)
+        } else {
+            Decimal::from(1)
+        };
+
         match order_side {
             OrderSide::Long => price - adjustment,
             OrderSide::Short => price + adjustment,
