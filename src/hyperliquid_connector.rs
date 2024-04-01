@@ -938,7 +938,7 @@ impl DexConnector for HyperliquidConnector {
             }
         };
 
-        let rounded_price = Self::round_price(price);
+        let rounded_price = Self::round_price(price, side.clone());
         let rounded_size = self.floor_size(size, symbol);
 
         log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
@@ -1363,31 +1363,45 @@ impl HyperliquidConnector {
         }
     }
 
-    fn round_price(price: Decimal) -> Decimal {
+    fn round_price(price: Decimal, order_side: OrderSide) -> Decimal {
         let price_str = price.to_string();
         let mut parts = price_str.split('.');
         let integer_part = parts.next().unwrap_or("0");
         let decimal_part = parts.next().unwrap_or("");
 
         if decimal_part.len() <= 6 && integer_part.len() + decimal_part.len() <= 5 {
-            return price;
+            return Self::adjust_by_tick(price, order_side, integer_part, decimal_part);
         }
 
-        let decimal_part = &decimal_part[0..decimal_part.len().min(6)];
+        let trimmed_decimal_part = &decimal_part[0..decimal_part.len().min(6)];
 
         if integer_part.len() >= 5 {
             let rounded = integer_part[0..5].parse::<Decimal>().unwrap();
-            return rounded;
+            return Self::adjust_by_tick(rounded, order_side, integer_part, "");
         }
 
-        if integer_part.len() + decimal_part.len() > 5 {
+        if integer_part.len() + trimmed_decimal_part.len() > 5 {
             let total_digits = 5 - integer_part.len();
-            let decimal_part = &decimal_part[0..total_digits.min(6)];
-            let rounded_str = format!("{}.{}", integer_part, decimal_part);
-            return Decimal::from_str(&rounded_str).unwrap();
+            let final_decimal_part = &trimmed_decimal_part[0..total_digits.min(6)];
+            let rounded_str = format!("{}.{}", integer_part, final_decimal_part);
+            let rounded = Decimal::from_str(&rounded_str).unwrap();
+            return Self::adjust_by_tick(rounded, order_side, integer_part, final_decimal_part);
         }
 
-        price
+        Self::adjust_by_tick(price, order_side, integer_part, decimal_part)
+    }
+
+    fn adjust_by_tick(
+        price: Decimal,
+        order_side: OrderSide,
+        integer_part: &str,
+        decimal_part: &str,
+    ) -> Decimal {
+        let adjustment = Decimal::new(1, (integer_part.len() + decimal_part.len()) as u32);
+        match order_side {
+            OrderSide::Long => price - adjustment,
+            OrderSide::Short => price + adjustment,
+        }
     }
 
     fn floor_size(&self, size: Decimal, symbol: &str) -> Decimal {

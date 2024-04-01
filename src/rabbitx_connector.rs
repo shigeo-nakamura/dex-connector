@@ -1203,10 +1203,10 @@ impl RabbitxConnector {
         }
     }
 
-    fn round_price(&self, price: Decimal, min_tick: Decimal, side: OrderSide) -> Decimal {
-        match side {
-            OrderSide::Long => (price / min_tick).floor() * min_tick,
-            OrderSide::Short => (price / min_tick).ceil() * min_tick,
+    fn round_price(&self, price: Decimal, min_tick: Decimal, order_side: OrderSide) -> Decimal {
+        match order_side {
+            OrderSide::Long => (price / min_tick - Decimal::ONE).floor() * min_tick,
+            OrderSide::Short => (price / min_tick + Decimal::ONE).ceil() * min_tick,
         }
     }
 
