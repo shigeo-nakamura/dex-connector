@@ -45,6 +45,8 @@ pub trait DexConnector: Send + Sync {
 
     async fn clear_filled_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
 
+    async fn clear_all_filled_order(&self) -> Result<(), DexError>;
+
     async fn create_order(
         &self,
         symbol: &str,

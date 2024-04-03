@@ -853,6 +853,12 @@ impl DexConnector for RabbitxConnector {
         Ok(())
     }
 
+    async fn clear_all_filled_order(&self) -> Result<(), DexError> {
+        let mut trade_results_guard = self.trade_results.write().await;
+        trade_results_guard.clear();
+        Ok(())
+    }
+
     async fn create_order(
         &self,
         symbol: &str,
