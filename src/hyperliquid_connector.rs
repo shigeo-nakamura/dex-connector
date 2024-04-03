@@ -460,13 +460,15 @@ impl HyperliquidConnector {
 
                     log::trace!("{} mid price = {:?}", market_id, mid_price);
 
+                    let rounded_mid_price = Self::round_price(mid_price, None);
+
                     let mut dynamic_market_info_guard = dynamic_market_info.write().await;
 
                     let market_info = dynamic_market_info_guard
                         .entry(market_id.to_string())
                         .or_insert_with(DynamicMarketInfo::default);
 
-                    market_info.market_price = Some(mid_price);
+                    market_info.market_price = Some(rounded_mid_price);
                 }
                 Err(e) => log::error!("Failed to parse mid price for symbol: {}: {:?}", symbol, e),
             }
@@ -944,7 +946,7 @@ impl DexConnector for HyperliquidConnector {
             }
         };
 
-        let rounded_price = Self::round_price(price, side.clone());
+        let rounded_price = Self::round_price(price, Some(side.clone()));
         let rounded_size = self.floor_size(size, symbol);
 
         log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
@@ -1369,7 +1371,7 @@ impl HyperliquidConnector {
         }
     }
 
-    fn round_price(price: Decimal, order_side: OrderSide) -> Decimal {
+    fn round_price(price: Decimal, order_side: Option<OrderSide>) -> Decimal {
         let price_str = price.to_string();
         let mut parts = price_str.split('.');
         let integer_part = parts.next().unwrap_or("0");
@@ -1392,7 +1394,12 @@ impl HyperliquidConnector {
         Self::adjust_by_tick(rounded, order_side)
     }
 
-    fn adjust_by_tick(price: Decimal, order_side: OrderSide) -> Decimal {
+    fn adjust_by_tick(price: Decimal, order_side: Option<OrderSide>) -> Decimal {
+        let order_side = match order_side {
+            Some(v) => v,
+            None => return price,
+        };
+
         let adjustment = if price.scale() > 0 || price.to_string().contains('.') {
             Decimal::new(1, 6)
         } else {

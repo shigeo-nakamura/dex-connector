@@ -482,15 +482,18 @@ impl RabbitxConnector {
                 min_tick: None,
             });
 
-        if market_price.is_some() {
-            market_info_entry.market_price = market_price;
-        }
-
         if min_order.is_some() {
             market_info_entry.min_order = min_order;
         }
+
         if min_tick.is_some() {
             market_info_entry.min_tick = min_tick;
+
+            if market_price.is_some() {
+                let min_tick = min_tick.unwrap();
+                let rounded_market_price = (market_price.unwrap() / min_tick).round() * min_tick;
+                market_info_entry.market_price = Some(rounded_market_price);
+            }
         }
 
         log::debug!("last_trade_price = {:?}", last_trade_price);
