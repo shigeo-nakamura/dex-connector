@@ -50,6 +50,7 @@ use tokio_tungstenite::WebSocketStream;
 
 struct Config {
     evm_wallet_address: String,
+    vault_address: Option<String>,
     market_ids: Vec<String>,
     chain_id: u64,
 }
@@ -172,12 +173,14 @@ impl HyperliquidConnector {
         web_socket_endpoint: &str,
         agent_private_key: &str,
         evm_wallet_address: &str,
+        vault_address: Option<String>,
         market_ids: &[String],
     ) -> Result<Self, DexError> {
         let request = DexRequest::new(rest_endpoint.to_owned()).await?;
         let web_socket = DexWebSocket::new(web_socket_endpoint.to_owned());
         let config = Config {
             evm_wallet_address: evm_wallet_address.to_owned(),
+            vault_address,
             market_ids: market_ids.to_vec(),
             chain_id: 1337,
         };
@@ -1238,7 +1241,7 @@ impl HyperliquidConnector {
         if modify_payload {
             let nonce = self.generate_nonce().await;
             let signature = self
-                .sign_l1_action(action, nonce, None, true)
+                .sign_l1_action(action, nonce, self.config.vault_address.as_deref(), true)
                 .await
                 .map_err(|e| DexError::Other(e.to_string()))?;
 

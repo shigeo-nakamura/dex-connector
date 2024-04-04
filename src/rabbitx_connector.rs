@@ -1063,7 +1063,7 @@ impl DexConnector for RabbitxConnector {
     async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError> {
         let mut last_trades_guard = self.last_trades.write().await;
 
-        if let Some(last_trades) = last_trades_guard.get_mut(symbol) {
+        if last_trades_guard.get_mut(symbol).is_some() {
             last_trades_guard.remove(symbol);
         } else {
             return Err(DexError::Other(format!(
