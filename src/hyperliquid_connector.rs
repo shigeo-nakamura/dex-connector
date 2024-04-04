@@ -1238,9 +1238,10 @@ impl HyperliquidConnector {
         U: Serialize + std::fmt::Debug + Clone,
     {
         if modify_payload {
+            let vault_address = self.config.vault_address.as_deref();
             let nonce = self.generate_nonce().await;
             let signature = self
-                .sign_l1_action(action, nonce, self.config.vault_address.as_deref(), true)
+                .sign_l1_action(action, nonce, vault_address, true)
                 .await
                 .map_err(|e| DexError::Other(e.to_string()))?;
 
@@ -1248,7 +1249,7 @@ impl HyperliquidConnector {
                 "action": action,
                 "nonce": nonce,
                 "signature": signature,
-                "vaultAddress": Option::<String>::None,
+                "vaultAddress": Some(vault_address.to_owned())
             });
 
             log::debug!("json_payload = {:?}", json_payload);
