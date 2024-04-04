@@ -178,8 +178,14 @@ impl HyperliquidConnector {
     ) -> Result<Self, DexError> {
         let request = DexRequest::new(rest_endpoint.to_owned()).await?;
         let web_socket = DexWebSocket::new(web_socket_endpoint.to_owned());
+
+        let evm_wallet_address = match vault_address.clone() {
+            Some(v) => v.to_owned(),
+            None => evm_wallet_address.to_owned(),
+        };
+
         let config = Config {
-            evm_wallet_address: evm_wallet_address.to_owned(),
+            evm_wallet_address,
             vault_address,
             market_ids: market_ids.to_vec(),
             chain_id: 1337,
