@@ -488,12 +488,10 @@ impl RabbitxConnector {
 
         if min_tick.is_some() {
             market_info_entry.min_tick = min_tick;
+        }
 
-            if market_price.is_some() {
-                let min_tick = min_tick.unwrap();
-                let rounded_market_price = (market_price.unwrap() / min_tick).round() * min_tick;
-                market_info_entry.market_price = Some(rounded_market_price);
-            }
+        if market_price.is_some() {
+            market_info_entry.market_price = market_price;
         }
 
         log::debug!("last_trade_price = {:?}", last_trade_price);
@@ -868,6 +866,7 @@ impl DexConnector for RabbitxConnector {
         size: Decimal,
         side: OrderSide,
         price: Option<Decimal>,
+        spread: Option<i64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let request_url = "/orders";
         let (price, r#type, time_in_force) = match price {
@@ -897,7 +896,7 @@ impl DexConnector for RabbitxConnector {
                 None => return Err(DexError::Other("No min_order available".to_string())),
             };
 
-            rounded_price = self.round_price(price, min_tick, side);
+            rounded_price = self.round_price(price, min_tick, side, spread);
             rounded_size = self.floor_size(size, min_order);
 
             log::debug!(
@@ -1038,7 +1037,13 @@ impl DexConnector for RabbitxConnector {
                 OrderSide::Long
             };
             if let Err(e) = self
-                .create_order(&position.market_id, position_size, reversed_side, None)
+                .create_order(
+                    &position.market_id,
+                    position_size,
+                    reversed_side,
+                    None,
+                    None,
+                )
                 .await
             {
                 log::error!("close_all_positions: {:?}", e);
@@ -1212,10 +1217,21 @@ impl RabbitxConnector {
         }
     }
 
-    fn round_price(&self, price: Decimal, min_tick: Decimal, order_side: OrderSide) -> Decimal {
+    fn round_price(
+        &self,
+        price: Decimal,
+        min_tick: Decimal,
+        order_side: OrderSide,
+        spread: Option<i64>,
+    ) -> Decimal {
+        let spread = match spread {
+            Some(v) => Decimal::new(v, 0),
+            None => Decimal::ZERO,
+        };
+
         match order_side {
-            OrderSide::Long => (price / min_tick - Decimal::ONE).floor() * min_tick,
-            OrderSide::Short => (price / min_tick + Decimal::ONE).ceil() * min_tick,
+            OrderSide::Long => (price / min_tick - spread).floor() * min_tick,
+            OrderSide::Short => (price / min_tick + spread).ceil() * min_tick,
         }
     }
 

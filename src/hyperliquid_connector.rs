@@ -463,15 +463,13 @@ impl HyperliquidConnector {
 
                     log::trace!("{} mid price = {:?}", market_id, mid_price);
 
-                    let rounded_mid_price = Self::round_price(mid_price, None);
-
                     let mut dynamic_market_info_guard = dynamic_market_info.write().await;
 
                     let market_info = dynamic_market_info_guard
                         .entry(market_id.to_string())
                         .or_insert_with(DynamicMarketInfo::default);
 
-                    market_info.market_price = Some(rounded_mid_price);
+                    market_info.market_price = Some(mid_price);
                 }
                 Err(e) => log::error!("Failed to parse mid price for symbol: {}: {:?}", symbol, e),
             }
@@ -939,6 +937,7 @@ impl DexConnector for HyperliquidConnector {
         size: Decimal,
         side: OrderSide,
         price: Option<Decimal>,
+        spread: Option<i64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let request_url = "/exchange";
         let (price, time_in_force) = match price {
@@ -949,7 +948,7 @@ impl DexConnector for HyperliquidConnector {
             }
         };
 
-        let rounded_price = Self::round_price(price, Some(side.clone()));
+        let rounded_price = Self::round_price(price, Some(side.clone()), spread);
         let rounded_size = self.floor_size(size, symbol);
 
         log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
@@ -1057,7 +1056,7 @@ impl DexConnector for HyperliquidConnector {
                 let size = position.szi.abs();
 
                 if let Err(e) = self
-                    .create_order(&order_symbol, size, reversed_side, None)
+                    .create_order(&order_symbol, size, reversed_side, None, None)
                     .await
                 {
                     log::error!("close_all_positions: {:?}", e);
@@ -1374,7 +1373,7 @@ impl HyperliquidConnector {
         }
     }
 
-    fn round_price(price: Decimal, order_side: Option<OrderSide>) -> Decimal {
+    fn round_price(price: Decimal, order_side: Option<OrderSide>, spread: Option<i64>) -> Decimal {
         let price_str = price.to_string();
         let mut parts = price_str.split('.');
         let integer_part = parts.next().unwrap_or("0");
@@ -1382,7 +1381,7 @@ impl HyperliquidConnector {
 
         if integer_part.len() >= 5 {
             let rounded = Decimal::from_str(integer_part).unwrap();
-            return Self::adjust_by_tick(rounded, order_side);
+            return Self::adjust_by_tick(rounded, order_side, spread);
         }
 
         let allowed_decimal_places = 5 - integer_part.len();
@@ -1394,10 +1393,19 @@ impl HyperliquidConnector {
 
         let rounded_str = format!("{}.{}", integer_part, trimmed_decimal_part);
         let rounded = Decimal::from_str(&rounded_str).unwrap();
-        Self::adjust_by_tick(rounded, order_side)
+        Self::adjust_by_tick(rounded, order_side, spread)
     }
 
-    fn adjust_by_tick(price: Decimal, order_side: Option<OrderSide>) -> Decimal {
+    fn adjust_by_tick(
+        price: Decimal,
+        order_side: Option<OrderSide>,
+        spread: Option<i64>,
+    ) -> Decimal {
+        let spread = match spread {
+            Some(v) => Decimal::new(v, 0),
+            None => return price,
+        };
+
         let order_side = match order_side {
             Some(v) => v,
             None => return price,
@@ -1410,8 +1418,8 @@ impl HyperliquidConnector {
         };
 
         match order_side {
-            OrderSide::Long => price - adjustment,
-            OrderSide::Short => price + adjustment,
+            OrderSide::Long => price - adjustment * spread,
+            OrderSide::Short => price + adjustment * spread,
         }
     }
 
