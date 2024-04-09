@@ -896,8 +896,8 @@ impl DexConnector for RabbitxConnector {
                 None => return Err(DexError::Other("No min_order available".to_string())),
             };
 
-            rounded_price = self.round_price(price, min_tick, side, spread);
-            rounded_size = self.floor_size(size, min_order);
+            rounded_price = Self::round_price(price, min_tick, side, spread);
+            rounded_size = Self::floor_size(size, min_order);
 
             log::debug!(
                 "{}, {}, {:?}({}), {:?}({})",
@@ -1218,7 +1218,6 @@ impl RabbitxConnector {
     }
 
     fn round_price(
-        &self,
         price: Decimal,
         min_tick: Decimal,
         order_side: OrderSide,
@@ -1235,7 +1234,7 @@ impl RabbitxConnector {
         }
     }
 
-    fn floor_size(&self, size: Decimal, min_order: Decimal) -> Decimal {
+    fn floor_size(size: Decimal, min_order: Decimal) -> Decimal {
         (size / min_order).floor() * min_order
     }
 }

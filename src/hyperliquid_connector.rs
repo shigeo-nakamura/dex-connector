@@ -971,7 +971,15 @@ impl DexConnector for HyperliquidConnector {
             }
         };
 
-        let rounded_price = Self::round_price(price, Some(side.clone()), spread);
+        let dynamic_market_info_guard = self.dynamic_market_info.read().await;
+        let market_info = dynamic_market_info_guard
+            .get(symbol)
+            .ok_or_else(|| DexError::Other("Market info not found".to_string()))?;
+        let min_tick = market_info
+            .min_tick
+            .ok_or_else(|| DexError::Other("Min tick not set for market".to_string()))?;
+
+        let rounded_price = Self::round_price(price, min_tick, side.clone(), spread);
         let rounded_size = self.floor_size(size, symbol);
 
         log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
@@ -1397,53 +1405,20 @@ impl HyperliquidConnector {
         }
     }
 
-    fn round_price(price: Decimal, order_side: Option<OrderSide>, spread: Option<i64>) -> Decimal {
-        let price_str = price.to_string();
-        let mut parts = price_str.split('.');
-        let integer_part = parts.next().unwrap_or("0");
-        let decimal_part = parts.next().unwrap_or("");
-
-        if integer_part.len() >= 5 {
-            let rounded = Decimal::from_str(integer_part).unwrap();
-            return Self::adjust_by_tick(rounded, order_side, spread);
-        }
-
-        let allowed_decimal_places = 5 - integer_part.len();
-        let trimmed_decimal_part = if decimal_part.len() > allowed_decimal_places {
-            &decimal_part[0..allowed_decimal_places.min(decimal_part.len())]
-        } else {
-            decimal_part
-        };
-
-        let rounded_str = format!("{}.{}", integer_part, trimmed_decimal_part);
-        let rounded = Decimal::from_str(&rounded_str).unwrap();
-        Self::adjust_by_tick(rounded, order_side, spread)
-    }
-
-    fn adjust_by_tick(
+    fn round_price(
         price: Decimal,
-        order_side: Option<OrderSide>,
+        min_tick: Decimal,
+        order_side: OrderSide,
         spread: Option<i64>,
     ) -> Decimal {
         let spread = match spread {
             Some(v) => Decimal::new(v, 0),
-            None => return price,
-        };
-
-        let order_side = match order_side {
-            Some(v) => v,
-            None => return price,
-        };
-
-        let adjustment = if price.scale() > 0 || price.to_string().contains('.') {
-            Decimal::new(1, 6)
-        } else {
-            Decimal::from(1)
+            None => Decimal::ZERO,
         };
 
         match order_side {
-            OrderSide::Long => price - adjustment * spread,
-            OrderSide::Short => price + adjustment * spread,
+            OrderSide::Long => (price / min_tick - spread).floor() * min_tick,
+            OrderSide::Short => (price / min_tick + spread).ceil() * min_tick,
         }
     }
 
