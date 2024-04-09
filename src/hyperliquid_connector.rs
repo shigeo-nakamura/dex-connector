@@ -21,7 +21,7 @@ use futures::{
 use generic_array::GenericArray;
 use k256::Secp256k1;
 use k256::SecretKey;
-use rust_decimal::Decimal;
+use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::de::Error as SerdeError;
 use serde::de::Visitor;
 use serde::ser::SerializeStruct;
@@ -477,17 +477,7 @@ impl HyperliquidConnector {
                         .or_insert_with(DynamicMarketInfo::default);
 
                     if market_info.min_tick.is_none() {
-                        let min_tick = if mid_price.to_string().contains('.')
-                            && mid_price.to_string().split('.').next().unwrap().len() >= 5
-                        {
-                            Decimal::from(1)
-                        } else {
-                            if mid_price.scale() > 0 || mid_price.to_string().contains('.') {
-                                Decimal::new(1, 6)
-                            } else {
-                                Decimal::from(1)
-                            }
-                        };
+                        let min_tick = Self::calculate_min_tick(mid_price);
                         market_info.min_tick = Some(min_tick);
                     }
 
@@ -1403,6 +1393,23 @@ impl HyperliquidConnector {
             },
             None => Err(DexError::Other("No price available".to_string())),
         }
+    }
+
+    fn calculate_min_tick(price: Decimal) -> Decimal {
+        let price_str = price.to_string();
+        let parts: Vec<&str> = price_str.split('.').collect();
+        let integer_part = parts[0];
+
+        if integer_part.len() >= 5 {
+            return Decimal::ONE;
+        }
+
+        let decimal_part = parts.get(1).map_or("", |&d| d);
+        let decimal_len = decimal_part.trim_end_matches('0').len();
+
+        let scale = 5 - integer_part.len();
+
+        Decimal::new(1, scale as u32)
     }
 
     fn round_price(
