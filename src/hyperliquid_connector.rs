@@ -68,6 +68,7 @@ struct TradeResult {
 struct DynamicMarketInfo {
     pub last_trade_price: Option<Decimal>,
     pub market_price: Option<Decimal>,
+    pub min_tick: Option<Decimal>,
 }
 
 struct StaticMarketInfo {
@@ -475,6 +476,21 @@ impl HyperliquidConnector {
                         .entry(market_id.to_string())
                         .or_insert_with(DynamicMarketInfo::default);
 
+                    if market_info.min_tick.is_none() {
+                        let min_tick = if mid_price.to_string().contains('.')
+                            && mid_price.to_string().split('.').next().unwrap().len() >= 5
+                        {
+                            Decimal::from(1)
+                        } else {
+                            if mid_price.scale() > 0 || mid_price.to_string().contains('.') {
+                                Decimal::new(1, 6)
+                            } else {
+                                Decimal::from(1)
+                            }
+                        };
+                        market_info.min_tick = Some(min_tick);
+                    }
+
                     market_info.market_price = Some(mid_price);
                 }
                 Err(e) => log::error!("Failed to parse mid price for symbol: {}: {:?}", symbol, e),
@@ -843,11 +859,12 @@ impl DexConnector for HyperliquidConnector {
         let price = dynamic_info
             .market_price
             .ok_or_else(|| DexError::Other("No price available".to_string()))?;
+        let min_tick = dynamic_info.min_tick;
 
         Ok(TickerResponse {
             symbol: symbol.to_owned(),
             price,
-            min_tick: None,
+            min_tick,
             min_order: None,
         })
     }
