@@ -8,35 +8,26 @@ use crate::{
 use ::serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use debot_utils::parse_to_decimal;
-use ecdsa::SigningKey;
-use ethers::{prelude::Signer, types::transaction::eip712::EIP712Domain};
-use ethers::{
-    prelude::*,
-    types::transaction::eip712::{Eip712DomainType, TypedData, Types},
-};
+use ethers::signers::Signer;
+use ethers::{signers::LocalWallet, types::H160};
 use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
-use generic_array::GenericArray;
-use k256::Secp256k1;
-use k256::SecretKey;
-use rust_decimal::{prelude::FromPrimitive, Decimal};
-use serde::de::Error as SerdeError;
-use serde::de::Visitor;
-use serde::ser::SerializeStruct;
-use serde_json::json;
-use serde_json::Value;
-use sha3::{Digest, Keccak256};
-use std::fmt;
+use hyperliquid_rust_sdk::{
+    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
+    ExchangeDataStatus, ExchangeResponseStatus,
+};
+use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::HashMap,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Mutex;
@@ -50,7 +41,6 @@ use tokio_tungstenite::WebSocketStream;
 
 struct Config {
     evm_wallet_address: String,
-    vault_address: Option<String>,
     market_ids: Vec<String>,
     chain_id: u64,
 }
@@ -73,8 +63,7 @@ struct DynamicMarketInfo {
 
 struct StaticMarketInfo {
     pub decimals: u32,
-    pub max_leverage: u32,
-    pub asset_index: u32,
+    pub _max_leverage: u32,
 }
 
 pub struct HyperliquidConnector {
@@ -92,8 +81,7 @@ pub struct HyperliquidConnector {
     // key = symbol
     dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
     static_market_info: HashMap<String, StaticMarketInfo>,
-    nonce_history: Arc<Mutex<VecDeque<u64>>>,
-    wallet: Wallet<SigningKey<Secp256k1>>,
+    exchange_client: ExchangeClient,
 }
 
 #[derive(Debug)]
@@ -187,23 +175,26 @@ impl HyperliquidConnector {
 
         let config = Config {
             evm_wallet_address,
-            vault_address,
             market_ids: market_ids.to_vec(),
             chain_id: 1337,
         };
 
-        let private_key_bytes = hex::decode(agent_private_key)
-            .map_err(|e| DexError::Other(format!("Failed to decode private key: {}", e)))?;
+        let vault_address: Option<H160> = match vault_address {
+            Some(v) => H160::from_str(&v).ok(),
+            None => None,
+        };
 
-        let private_key_bytes = GenericArray::from_slice(&private_key_bytes);
+        let local_wallet: LocalWallet = agent_private_key.parse().unwrap();
 
-        let secret_key = SecretKey::from_bytes(private_key_bytes)
-            .map_err(|e| DexError::Other(format!("Failed to create secret key: {}", e)))?;
-
-        let signing_key = SigningKey::from(&secret_key);
-
-        let wallet = Wallet::from(signing_key);
-        log::debug!("wallet = {:?}", wallet);
+        let exchange_client = ExchangeClient::new(
+            None,
+            local_wallet,
+            Some(BaseUrl::Mainnet),
+            None,
+            vault_address,
+        )
+        .await
+        .unwrap();
 
         let mut instance = HyperliquidConnector {
             config,
@@ -215,10 +206,9 @@ impl HyperliquidConnector {
             write_socket: Arc::new(Mutex::new(None)),
             task_handle_read_message: Arc::new(Mutex::new(None)),
             task_handle_read_sigterm: Arc::new(Mutex::new(None)),
-            nonce_history: Arc::new(Mutex::new(VecDeque::with_capacity(20))),
-            wallet,
             dynamic_market_info: Arc::new(RwLock::new(HashMap::new())),
             static_market_info: HashMap::new(),
+            exchange_client,
         };
 
         instance.retrive_market_metadata().await?;
@@ -533,61 +523,6 @@ struct HyperliquidDefaultPayload {
     user: Option<String>,
 }
 
-impl HyperliquidCommonResponse {
-    fn is_success(&self) -> Result<(), DexError> {
-        match self.status.as_str() {
-            "ok" => Ok(()),
-            "err" => match &self.response {
-                HyperliquidResponse::Err(err_msg) => Err(DexError::Other(err_msg.clone())),
-                HyperliquidResponse::Ok(_) => {
-                    Err(DexError::Other("Unexpected success response".to_owned()))
-                }
-            },
-            _ => Err(DexError::Other("Unknown status".to_owned())),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct HyperliquidCommonResponse {
-    status: String,
-    response: HyperliquidResponse,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-enum HyperliquidResponse {
-    Ok(ResponseType),
-    Err(String),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ResponseType {
-    #[serde(rename = "type")]
-    response_type: String,
-}
-#[derive(Deserialize, Debug)]
-struct HyperliquidCommonResponseData {
-    statuses: Vec<HyperliquidCommonResponseStatus>,
-}
-#[derive(Deserialize, Debug)]
-struct HyperliquidCommonResponseStatus {
-    error: Option<String>,
-}
-
-#[derive(Serialize, Debug, Clone)]
-struct HyperliquidUpdateLeveragePayload {
-    r#type: String,
-    asset: u32,
-    #[serde(rename = "isCross")]
-    is_cross: bool,
-    leverage: u32,
-}
-#[derive(Deserialize, Debug)]
-struct HyperliquidUpdateLeverageResponse {
-    status: String,
-}
-
 #[derive(Deserialize, Debug)]
 struct HyperliquidRetrieveUserStateResponse {
     #[serde(rename = "marginSummary")]
@@ -599,153 +534,6 @@ struct HyperliquidMarginSummary {
     account_value: String,
     #[serde(rename = "totalRawUsd")]
     total_rawusd: String,
-}
-
-#[derive(Serialize, Debug, Clone)]
-struct HyperliquidCreateOrderPayload {
-    r#type: String,
-    orders: Vec<HyperliquidOrder>,
-    grouping: String,
-}
-impl Serialize for HyperliquidOrder {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = serializer.serialize_struct("HyperliquidOrder", 6)?;
-        state.serialize_field("a", &self.asset)?;
-        state.serialize_field("b", &self.is_buy)?;
-        state.serialize_field("p", &self.limit_px.to_string())?;
-        state.serialize_field("s", &self.sz.to_string())?;
-        state.serialize_field("r", &self.reduce_only)?;
-        state.serialize_field("t", &self.order_type)?;
-        state.end()
-    }
-}
-#[derive(Debug, Clone)]
-struct HyperliquidOrder {
-    asset: u32,
-    is_buy: bool,
-    limit_px: Decimal,
-    sz: Decimal,
-    reduce_only: bool,
-    order_type: HyperliquidOrderType,
-}
-impl HyperliquidOrderType {
-    fn new(tif_type: &str) -> Self {
-        let limit_order_type = HyperliquidLimitOrderType {
-            tif: tif_type.to_owned(),
-        };
-        Self {
-            limit: limit_order_type,
-        }
-    }
-}
-#[derive(Serialize, Debug, Clone)]
-struct HyperliquidOrderType {
-    limit: HyperliquidLimitOrderType,
-}
-#[derive(Serialize, Debug, Clone)]
-struct HyperliquidLimitOrderType {
-    tif: String,
-}
-
-impl HyperliquidCreateOrderResponse {
-    fn is_success(&self) -> Result<HyperliquidOrderStatus, DexError> {
-        if self.status == "ok" {
-            match &self.response.data.statuses[0] {
-                HyperliquidOrderOrErrorResponse::ErrorResponse(err) => {
-                    Err(DexError::Other(err.error.clone()))
-                }
-                HyperliquidOrderOrErrorResponse::OrderStatus(status) => Ok(status.clone()),
-            }
-        } else {
-            Err(DexError::Other("Order creation failed".to_owned()))
-        }
-    }
-}
-#[derive(Deserialize, Debug)]
-struct HyperliquidCreateOrderResponse {
-    status: String,
-    response: HyperliquidOrderResponseBody,
-}
-#[derive(Deserialize, Debug, Clone)]
-struct HyperliquidOrderResponseBody {
-    r#type: String,
-    data: HyperliquidOrderResponseData,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct HyperliquidOrderResponseData {
-    #[serde(deserialize_with = "deserialize_order_or_error")]
-    statuses: Vec<HyperliquidOrderOrErrorResponse>,
-}
-fn deserialize_order_or_error<'de, D>(
-    deserializer: D,
-) -> Result<Vec<HyperliquidOrderOrErrorResponse>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct OrderOrErrorResponseVisitor;
-
-    impl<'de> Visitor<'de> for OrderOrErrorResponseVisitor {
-        type Value = Vec<HyperliquidOrderOrErrorResponse>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a list of order statuses or errors")
-        }
-
-        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-        where
-            S: serde::de::SeqAccess<'de>,
-        {
-            let mut items = Vec::new();
-
-            while let Some(value) = seq.next_element::<Value>()? {
-                let item = if value.get("resting").is_some() || value.get("filled").is_some() {
-                    serde_json::from_value(value)
-                        .map(HyperliquidOrderOrErrorResponse::OrderStatus)
-                        .map_err(SerdeError::custom)?
-                } else {
-                    serde_json::from_value(value)
-                        .map(HyperliquidOrderOrErrorResponse::ErrorResponse)
-                        .map_err(SerdeError::custom)?
-                };
-                items.push(item);
-            }
-
-            Ok(items)
-        }
-    }
-
-    deserializer.deserialize_seq(OrderOrErrorResponseVisitor)
-}
-#[derive(Deserialize, Debug, Clone)]
-#[serde(untagged)]
-enum HyperliquidOrderOrErrorResponse {
-    OrderStatus(HyperliquidOrderStatus),
-    ErrorResponse(HyperliquidErrorResponse),
-}
-#[derive(Deserialize, Debug, Clone)]
-struct HyperliquidErrorResponse {
-    error: String,
-}
-#[derive(Deserialize, Debug, Clone)]
-struct HyperliquidOrderStatus {
-    resting: Option<HyperliquidOrderStatusDetail>,
-    filled: Option<HyperliquidOrderStatusDetail>,
-}
-#[derive(Deserialize, Debug, Clone)]
-struct HyperliquidOrderStatusDetail {
-    oid: u64,
-}
-impl HyperliquidOrderStatus {
-    fn get_oid(&self) -> Option<u64> {
-        self.resting
-            .as_ref()
-            .map(|d| d.oid)
-            .or_else(|| self.filled.as_ref().map(|d| d.oid))
-    }
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -800,7 +588,7 @@ struct HyperliquidRetriveMarketMetadata {
     #[serde(rename = "maxLeverage")]
     max_leverage: u32,
     #[serde(rename = "onlyIsolated")]
-    only_isolated: bool,
+    _only_isolated: bool,
 }
 
 #[async_trait]
@@ -817,24 +605,12 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), DexError> {
-        let request_url = "/exchange";
-        let asset = self.get_asset_index(symbol)?;
-        let action = HyperliquidUpdateLeveragePayload {
-            r#type: "updateLeverage".to_owned(),
-            asset,
-            is_cross: false,
-            leverage,
-        };
-
-        let res = self
-            .handle_request_with_action::<HyperliquidCommonResponse, HyperliquidUpdateLeveragePayload>(
-                request_url.to_string(),
-                &action,
-                true,
-            )
-            .await?;
-
-        res.is_success()
+        let asset = Self::extract_asset_name(symbol);
+        self.exchange_client
+            .update_leverage(leverage, asset, false, None)
+            .await
+            .map_err(|e| DexError::Other(e.to_string()))?;
+        Ok(())
     }
 
     async fn get_ticker(&self, symbol: &str) -> Result<TickerResponse, DexError> {
@@ -892,7 +668,6 @@ impl DexConnector for HyperliquidConnector {
             .handle_request_with_action::<HyperliquidRetrieveUserStateResponse, HyperliquidDefaultPayload>(
                 request_url.to_string(),
                 &action,
-                false,
             )
             .await?;
 
@@ -952,7 +727,6 @@ impl DexConnector for HyperliquidConnector {
         price: Option<Decimal>,
         spread: Option<i64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        let request_url = "/exchange";
         let (price, time_in_force) = match price {
             Some(v) => (v, "Alo"),
             None => {
@@ -982,37 +756,41 @@ impl DexConnector for HyperliquidConnector {
             });
         }
 
-        let asset = self.get_asset_index(symbol)?;
+        let asset = Self::extract_asset_name(symbol).to_owned();
 
-        let order = HyperliquidOrder {
+        let order = ClientOrderRequest {
             asset,
             is_buy: side == OrderSide::Long,
-            limit_px: rounded_price,
-            sz: rounded_size,
             reduce_only: false,
-            order_type: HyperliquidOrderType::new(time_in_force),
-        };
-
-        let action = HyperliquidCreateOrderPayload {
-            r#type: "order".to_string(),
-            grouping: "na".to_string(),
-            orders: vec![order],
+            limit_px: rounded_price
+                .to_f64()
+                .ok_or_else(|| DexError::Other("Conversion to f64 failed".to_string()))?,
+            sz: rounded_size
+                .to_f64()
+                .ok_or_else(|| DexError::Other("Conversion to f64 failed".to_string()))?,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: time_in_force.to_string(),
+            }),
         };
 
         let res = self
-            .handle_request_with_action::<HyperliquidCreateOrderResponse, HyperliquidCreateOrderPayload>(
-                request_url.to_string(),
-                &action,
-                true,
-            )
-            .await?;
+            .exchange_client
+            .order(order, None)
+            .await
+            .map_err(|e| DexError::Other(e.to_string()))?;
 
-        let order_status = res.is_success()?;
-
-        let order_id = match order_status.get_oid() {
-            Some(v) => v,
-            None => {
-                return Err(DexError::Other("order_id is unknown".to_string()));
+        let res = match res {
+            ExchangeResponseStatus::Ok(exchange_response) => exchange_response,
+            ExchangeResponseStatus::Err(e) => return Err(DexError::ServerResponse(e.to_string())),
+        };
+        let status = res.data.unwrap().statuses[0].clone();
+        let order_id = match status {
+            ExchangeDataStatus::Filled(order) => order.oid,
+            ExchangeDataStatus::Resting(order) => order.oid,
+            _ => {
+                return Err(DexError::ServerResponse(
+                    "Unknown ExchangeDataStaus".to_owned(),
+                ))
             }
         };
 
@@ -1024,25 +802,18 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
-        let request_url = "/exchange";
-        let asset = self.get_asset_index(symbol)?;
-        let action = HyperliquidCancelOrderPayload {
-            r#type: "cancel".to_owned(),
-            cancels: vec![HyperliquidCancelOrder {
-                a: asset,
-                o: u64::from_str(order_id).unwrap_or_default(),
-            }],
+        let asset = Self::extract_asset_name(symbol).to_owned();
+        let cancel = ClientCancelRequest {
+            asset,
+            oid: u64::from_str(order_id).unwrap_or_default(),
         };
 
-        let res = self
-            .handle_request_with_action::<HyperliquidCommonResponse, HyperliquidCancelOrderPayload>(
-                request_url.to_string(),
-                &action,
-                true,
-            )
-            .await?;
+        self.exchange_client
+            .cancel(cancel, None)
+            .await
+            .map_err(|e| DexError::Other(e.to_string()))?;
 
-        res.is_success()
+        Ok(())
     }
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
@@ -1097,209 +868,30 @@ impl DexConnector for HyperliquidConnector {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct PhantomAgent {
-    source: String,
-    connection_id: Vec<u8>,
-}
-
-impl PhantomAgent {
-    fn new(hash: &[u8], is_mainnet: bool) -> Self {
-        Self {
-            source: if is_mainnet {
-                "a".to_string()
-            } else {
-                "b".to_string()
-            },
-            connection_id: hash.to_vec(),
-        }
-    }
-}
-
 impl HyperliquidConnector {
-    fn action_hash<A: Serialize + std::fmt::Debug>(
-        action: &A,
-        vault_address: Option<&str>,
-        nonce: u64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        action
-            .serialize(&mut rmp_serde::Serializer::new(&mut buf).with_struct_map())
-            .unwrap();
-
-        buf.extend_from_slice(&nonce.to_be_bytes());
-
-        if let Some(address) = vault_address {
-            buf.push(1);
-            buf.extend_from_slice(&hex::decode(address.trim_start_matches("0x")).unwrap());
-        } else {
-            buf.push(0);
-        }
-
-        let mut hasher = Keccak256::new();
-        hasher.update(&buf);
-        hasher.finalize().to_vec()
-    }
-
-    async fn sign_l1_action<A: Serialize + std::fmt::Debug>(
-        &self,
-        action: &A,
-        nonce: u64,
-        vault_address: Option<&str>,
-        is_mainnet: bool,
-    ) -> Result<Signature, Box<dyn std::error::Error + Send + Sync>> {
-        let hash = Self::action_hash(action, vault_address, nonce);
-        let phantom_agent = PhantomAgent::new(&hash, is_mainnet);
-        let connection_id_hex = phantom_agent
-            .connection_id
-            .iter()
-            .map(|byte| format!("{:02x}", byte))
-            .collect::<String>();
-        let phantom_agent_value = serde_json::to_value(phantom_agent)?;
-
-        let mut types = Types::new();
-        types.insert(
-            "EIP712Domain".to_string(),
-            vec![
-                Eip712DomainType {
-                    name: "name".to_string(),
-                    r#type: "string".to_string(),
-                },
-                Eip712DomainType {
-                    name: "version".to_string(),
-                    r#type: "string".to_string(),
-                },
-                Eip712DomainType {
-                    name: "chainId".to_string(),
-                    r#type: "uint256".to_string(),
-                },
-                Eip712DomainType {
-                    name: "verifyingContract".to_string(),
-                    r#type: "address".to_string(),
-                },
-            ],
-        );
-        types.insert(
-            "Agent".to_string(),
-            vec![
-                Eip712DomainType {
-                    name: "source".to_string(),
-                    r#type: "string".to_string(),
-                },
-                Eip712DomainType {
-                    name: "connectionId".to_string(),
-                    r#type: "bytes32".to_string(),
-                },
-            ],
-        );
-        log::debug!("EIP712 types: {:?}", types);
-
-        let domain = EIP712Domain {
-            name: Some("Exchange".to_string()),
-            version: Some("1".to_string()),
-            chain_id: Some(self.config.chain_id.into()),
-            verifying_contract: Some("0x0000000000000000000000000000000000000000".parse()?),
-            salt: None,
-        };
-
-        let typed_data = TypedData {
-            types,
-            domain,
-            primary_type: "Agent".to_string(),
-            message: BTreeMap::from([
-                ("source".to_string(), phantom_agent_value["source"].clone()),
-                (
-                    "connectionId".to_string(),
-                    Value::String(format!("0x{}", connection_id_hex)),
-                ),
-            ]),
-        };
-        log::debug!("EIP712 TypedData prepared for signing: {:?}", typed_data);
-
-        let signature = self
-            .wallet
-            .sign_typed_data(&typed_data)
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to sign typed data: {}", e)))?;
-
-        log::debug!("Signature obtained: {:?}", signature);
-
-        Ok(signature)
-    }
-
-    async fn generate_nonce(&self) -> u64 {
-        let mut nonce_history = self.nonce_history.lock().await;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-
-        let mut nonce = now;
-        while nonce_history.contains(&nonce) {
-            nonce += 1;
-        }
-
-        if nonce_history.len() == nonce_history.capacity() {
-            nonce_history.pop_front();
-        }
-        nonce_history.push_back(nonce);
-
-        nonce
-    }
-
-    // Add a new parameter `modify_payload` to determine how to handle the payload
     async fn handle_request_with_action<T, U>(
         &self,
         request_url: String,
         action: &U,
-        modify_payload: bool, // New parameter to control payload modification
     ) -> Result<T, DexError>
     where
         T: for<'de> Deserialize<'de>,
         U: Serialize + std::fmt::Debug + Clone,
     {
-        if modify_payload {
-            let vault_address = self.config.vault_address.as_deref();
-            let nonce = self.generate_nonce().await;
-            let signature = self
-                .sign_l1_action(action, nonce, vault_address, true)
-                .await
-                .map_err(|e| DexError::Other(e.to_string()))?;
+        let json_payload =
+            serde_json::to_value(action).map_err(|e| DexError::Other(e.to_string()))?;
 
-            let json_payload = json!({
-                "action": action,
-                "nonce": nonce,
-                "signature": signature,
-                "vaultAddress": Some(vault_address.to_owned())
-            });
+        log::debug!("json_payload = {:?}", json_payload);
 
-            log::debug!("json_payload = {:?}", json_payload);
-
-            self.request
-                .handle_request::<T, U>(
-                    HttpMethod::Post,
-                    request_url,
-                    &HashMap::new(),
-                    json_payload.to_string(),
-                )
-                .await
-                .map_err(|e| DexError::Other(e.to_string()))
-        } else {
-            let json_payload =
-                serde_json::to_value(action).map_err(|e| DexError::Other(e.to_string()))?;
-
-            log::debug!("json_payload = {:?}", json_payload);
-
-            self.request
-                .handle_request::<T, U>(
-                    HttpMethod::Post,
-                    request_url,
-                    &HashMap::new(),
-                    json_payload.to_string(),
-                )
-                .await
-                .map_err(|e| DexError::Other(e.to_string()))
-        }
+        self.request
+            .handle_request::<T, U>(
+                HttpMethod::Post,
+                request_url,
+                &HashMap::new(),
+                json_payload.to_string(),
+            )
+            .await
+            .map_err(|e| DexError::Other(e.to_string()))
     }
 
     async fn get_positions(
@@ -1314,7 +906,6 @@ impl HyperliquidConnector {
             .handle_request_with_action::<HyperliquidRetriveUserPositionResponse, HyperliquidDefaultPayload>(
                 request_url.to_string(),
                 &action,
-                false,
             )
             .await?;
 
@@ -1331,7 +922,6 @@ impl HyperliquidConnector {
             .handle_request_with_action::<Vec<HyperliquidRetriveUserOpenOrder>, HyperliquidDefaultPayload>(
                 request_url.to_string(),
                 &action,
-                false,
             )
             .await?;
 
@@ -1348,19 +938,17 @@ impl HyperliquidConnector {
             .handle_request_with_action::<HyperliquidRetriveMarketMetadataResponse, HyperliquidDefaultPayload>(
                 request_url.to_string(),
                 &action,
-                false,
             )
             .await?;
 
         let mut static_market_info_update = HashMap::new();
-        for (index, metadata) in res.universe.into_iter().enumerate() {
+        for metadata in res.universe.into_iter() {
             let market_id = format!("{}-USD", metadata.name);
             static_market_info_update.insert(
                 market_id,
                 StaticMarketInfo {
                     decimals: metadata.decimals,
-                    max_leverage: metadata.max_leverage,
-                    asset_index: index as u32,
+                    _max_leverage: metadata.max_leverage,
                 },
             );
         }
@@ -1375,13 +963,6 @@ impl HyperliquidConnector {
 
         let worst_price = slippage_price(market_price, *side == OrderSide::Long);
         Ok(worst_price)
-    }
-
-    fn get_asset_index(&self, symbol: &str) -> Result<u32, DexError> {
-        match self.static_market_info.get(symbol) {
-            Some(info) => Ok(info.asset_index),
-            None => Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
-        }
     }
 
     async fn get_market_price(&self, symbol: &str) -> Result<Decimal, DexError> {
@@ -1403,9 +984,6 @@ impl HyperliquidConnector {
         if integer_part.len() >= 5 {
             return Decimal::ONE;
         }
-
-        let decimal_part = parts.get(1).map_or("", |&d| d);
-        let decimal_len = decimal_part.trim_end_matches('0').len();
 
         let scale = 5 - integer_part.len();
 
@@ -1439,5 +1017,9 @@ impl HyperliquidConnector {
         };
 
         size.round_dp(decimals)
+    }
+
+    fn extract_asset_name(symbol: &str) -> &str {
+        symbol.split('-').next().unwrap_or(symbol)
     }
 }
