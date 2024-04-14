@@ -112,7 +112,7 @@ impl DexRequest {
         log::trace!("payload = {}", json_payload);
 
         let request_builder = if !json_payload.is_empty() {
-            request_builder.body(json_payload)
+            request_builder.body(json_payload.clone())
         } else {
             request_builder
         };
@@ -133,7 +133,11 @@ impl DexRequest {
         log::trace!("Response body: {}", response_body);
 
         serde_json::from_str(&response_body).map_err(|e| {
-            log::error!("Failed to deserialize response: {}", e);
+            log::error!(
+                "Failed to deserialize response: {}, payload = {}",
+                e,
+                json_payload
+            );
             DexError::Serde(e)
         })
     }
