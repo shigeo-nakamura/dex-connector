@@ -8,7 +8,6 @@ use crate::{
 use ::serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use debot_utils::parse_to_decimal;
-use ethers::signers::Signer;
 use ethers::{signers::LocalWallet, types::H160};
 use futures::{
     stream::{SplitSink, SplitStream},
@@ -41,8 +40,6 @@ use tokio_tungstenite::WebSocketStream;
 
 struct Config {
     evm_wallet_address: String,
-    market_ids: Vec<String>,
-    chain_id: u64,
 }
 
 #[derive(Debug)]
@@ -86,7 +83,7 @@ pub struct HyperliquidConnector {
 
 #[derive(Debug)]
 struct WebSocketMessage {
-    channel: String,
+    _channel: String,
     data: WebSocketData,
 }
 
@@ -150,7 +147,7 @@ impl<'de> Deserialize<'de> for WebSocketMessage {
         };
 
         Ok(WebSocketMessage {
-            channel: helper.channel,
+            _channel: helper.channel,
             data,
         })
     }
@@ -163,7 +160,6 @@ impl HyperliquidConnector {
         agent_private_key: &str,
         evm_wallet_address: &str,
         vault_address: Option<String>,
-        market_ids: &[String],
     ) -> Result<Self, DexError> {
         let request = DexRequest::new(rest_endpoint.to_owned()).await?;
         let web_socket = DexWebSocket::new(web_socket_endpoint.to_owned());
@@ -173,11 +169,7 @@ impl HyperliquidConnector {
             None => evm_wallet_address.to_owned(),
         };
 
-        let config = Config {
-            evm_wallet_address,
-            market_ids: market_ids.to_vec(),
-            chain_id: 1337,
-        };
+        let config = Config { evm_wallet_address };
 
         let vault_address: Option<H160> = match vault_address {
             Some(v) => H160::from_str(&v).ok(),
@@ -534,17 +526,6 @@ struct HyperliquidMarginSummary {
     account_value: String,
     #[serde(rename = "totalRawUsd")]
     total_rawusd: String,
-}
-
-#[derive(Serialize, Debug, Clone)]
-struct HyperliquidCancelOrderPayload {
-    r#type: String,
-    cancels: Vec<HyperliquidCancelOrder>,
-}
-#[derive(Serialize, Debug, Clone)]
-struct HyperliquidCancelOrder {
-    a: u32,
-    o: u64,
 }
 
 #[derive(Deserialize, Debug)]
