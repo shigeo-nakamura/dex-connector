@@ -43,7 +43,7 @@ pub struct TickerResponse {
     pub min_order: Option<Decimal>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct FilledOrder {
     pub order_id: String,
     pub is_rejected: bool,
