@@ -729,14 +729,6 @@ impl DexConnector for HyperliquidConnector {
 
         log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
 
-        if rounded_price * rounded_size <= Decimal::new(10, 0) {
-            return Ok(CreateOrderResponse {
-                order_id: String::new(),
-                ordered_price: Decimal::new(0, 0),
-                ordered_size: Decimal::new(0, 0),
-            });
-        }
-
         let asset = Self::extract_asset_name(symbol).to_owned();
 
         let order = ClientOrderRequest {
