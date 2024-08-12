@@ -7,12 +7,10 @@ mod dex_connector;
 mod dex_request;
 mod dex_websocket;
 mod hyperliquid_connector;
-mod rabbitx_connector;
 
 pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
 pub use hyperliquid_connector::*;
-pub use rabbitx_connector::*;
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub enum OrderSide {
@@ -75,9 +73,4 @@ pub struct CreateOrderResponse {
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct LastTrade {
     pub price: Decimal,
-}
-
-#[derive(Deserialize, Debug, Default)]
-pub struct LastTradeResponse {
-    pub last_trades: Vec<LastTrade>,
 }

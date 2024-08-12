@@ -2,8 +2,8 @@ use crate::{
     dex_connector::{slippage_price, string_to_decimal, DexConnector},
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
-    BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTradeResponse,
-    OrderSide, TickerResponse,
+    BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, OrderSide,
+    TickerResponse,
 };
 use ::serde::{Deserialize, Serialize};
 use async_trait::async_trait;
@@ -53,7 +53,6 @@ struct TradeResult {
 
 #[derive(Default)]
 struct DynamicMarketInfo {
-    pub last_trade_price: Option<Decimal>,
     pub market_price: Option<Decimal>,
     pub min_tick: Option<Decimal>,
 }
@@ -830,10 +829,6 @@ impl DexConnector for HyperliquidConnector {
         }
 
         Ok(())
-    }
-
-    async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradeResponse, DexError> {
-        Ok(LastTradeResponse::default())
     }
 
     async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
