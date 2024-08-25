@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "1.2.0"
+version = "1.2.1"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"

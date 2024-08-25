@@ -584,6 +584,59 @@ impl DexConnector for HyperliquidConnector {
         Ok(())
     }
 
+    async fn restart(&self) -> Result<(), DexError> {
+        log::info!("Restarting WebSocket connection...");
+
+        let max_retries = 3;
+        let mut retry_count = 0;
+        let mut backoff_delay = Duration::from_secs(1);
+
+        while retry_count < max_retries {
+            if let Err(e) = self.stop_web_socket().await {
+                log::error!(
+                    "Failed to stop WebSocket on attempt {}: {:?}",
+                    retry_count + 1,
+                    e
+                );
+            } else {
+                log::info!(
+                    "Successfully stopped WebSocket on attempt {}.",
+                    retry_count + 1
+                );
+            }
+
+            sleep(backoff_delay).await;
+
+            match self.start_web_socket().await {
+                Ok(_) => {
+                    log::info!(
+                        "Successfully started WebSocket on attempt {}.",
+                        retry_count + 1
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to start WebSocket on attempt {}: {:?}",
+                        retry_count + 1,
+                        e
+                    );
+                    retry_count += 1;
+                    backoff_delay *= 2; // Exponential backoff
+                }
+            }
+        }
+
+        log::error!(
+            "Failed to restart WebSocket after {} attempts.",
+            max_retries
+        );
+        Err(DexError::Other(format!(
+            "Failed to restart WebSocket after {} attempts.",
+            max_retries
+        )))
+    }
+
     async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), DexError> {
         let asset = Self::extract_asset_name(symbol);
         self.exchange_client
