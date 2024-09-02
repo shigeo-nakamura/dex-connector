@@ -340,6 +340,21 @@ impl HyperliquidConnector {
         log::info!("stop_web_socket");
         self.running.store(false, Ordering::SeqCst);
 
+        {
+            let mut write_guard = self.write_socket.lock().await;
+            if let Some(write_socket) = write_guard.as_mut() {
+                if let Err(e) = write_socket.send(Message::Close(None)).await {
+                    log::error!("Failed to send WebSocket close message: {:?}", e);
+                }
+            }
+            *write_guard = None;
+        }
+
+        {
+            let mut read_guard = self.read_socket.lock().await;
+            *read_guard = None;
+        }
+
         if let Some(handle) = self.task_handle_read_message.lock().await.take() {
             let _ = handle.await;
         }
@@ -348,13 +363,7 @@ impl HyperliquidConnector {
             let _ = handle.await;
         }
 
-        {
-            let mut write_guard = self.write_socket.lock().await;
-            *write_guard = None;
-
-            let mut read_guard = self.read_socket.lock().await;
-            *read_guard = None;
-        }
+        drop(self.web_socket.clone());
 
         Ok(())
     }
