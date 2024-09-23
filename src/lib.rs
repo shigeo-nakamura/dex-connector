@@ -39,6 +39,8 @@ pub struct TickerResponse {
     pub price: Decimal,
     pub min_tick: Option<Decimal>,
     pub min_order: Option<Decimal>,
+    pub volume: Option<Decimal>,
+    pub num_trades: Option<u64>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]

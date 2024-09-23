@@ -40,6 +40,7 @@ use tokio_tungstenite::WebSocketStream;
 
 struct Config {
     evm_wallet_address: String,
+    symbol_list: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -55,6 +56,8 @@ struct TradeResult {
 struct DynamicMarketInfo {
     pub market_price: Option<Decimal>,
     pub min_tick: Option<Decimal>,
+    pub volume: Decimal,
+    pub num_trades: u64,
 }
 
 struct StaticMarketInfo {
@@ -90,11 +93,27 @@ struct WebSocketMessage {
 enum WebSocketData {
     AllMidsData(AllMidsData),
     UserFillsData(UserFillsData),
+    CandleData(CandleData),
 }
 
 #[derive(Deserialize, Debug)]
 struct AllMidsData {
     mids: HashMap<String, String>,
+}
+
+#[allow(dead_code, non_snake_case)]
+#[derive(Deserialize, Debug)]
+struct CandleData {
+    t: u64,     // Open time (milliseconds)
+    T: u64,     // Close time (milliseconds)
+    s: String,  // Symbol
+    i: String,  // Interval
+    o: Decimal, // Open price
+    c: Decimal, // Close price
+    h: Decimal, // High price
+    l: Decimal, // Low price
+    v: Decimal, // Volume
+    n: u64,     // Number of trades
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -142,6 +161,12 @@ impl<'de> Deserialize<'de> for WebSocketMessage {
                     .map_err(serde::de::Error::custom)?;
                 fills_data
             }
+            "candle" => {
+                let candle_data = CandleData::deserialize(helper.data)
+                    .map(WebSocketData::CandleData)
+                    .map_err(serde::de::Error::custom)?;
+                candle_data
+            }
             _ => return Err(serde::de::Error::custom("unknown channel type")),
         };
 
@@ -159,6 +184,7 @@ impl HyperliquidConnector {
         agent_private_key: &str,
         evm_wallet_address: &str,
         vault_address: Option<String>,
+        symbol_list: &[&str],
     ) -> Result<Self, DexError> {
         let request = DexRequest::new(rest_endpoint.to_owned()).await?;
         let web_socket = DexWebSocket::new(web_socket_endpoint.to_owned());
@@ -168,7 +194,13 @@ impl HyperliquidConnector {
             None => evm_wallet_address.to_owned(),
         };
 
-        let config = Config { evm_wallet_address };
+        let config = Config {
+            evm_wallet_address,
+            symbol_list: symbol_list
+                .iter()
+                .map(|&s| s.strip_suffix("-USD").unwrap_or(s).to_string())
+                .collect(),
+        };
 
         let vault_address: Option<H160> = match vault_address {
             Some(v) => H160::from_str(&v).ok(),
@@ -408,6 +440,25 @@ impl HyperliquidConnector {
                     e
                 )));
             }
+
+            for symbol in &self.config.symbol_list {
+                let candle_subscription = serde_json::json!({
+                    "method": "subscribe",
+                    "subscription": {
+                        "type": "candle",
+                        "coin": symbol,
+                        "interval": "1m"
+                    }
+                })
+                .to_string();
+
+                if let Err(e) = write_socket.send(Message::Text(candle_subscription)).await {
+                    return Err(DexError::WebSocketError(format!(
+                        "Failed to subscribe to candle for {}: {}",
+                        symbol, e
+                    )));
+                }
+            }
         } else {
             return Err(DexError::WebSocketError(
                 "Write socket is not available".to_string(),
@@ -433,6 +484,10 @@ impl HyperliquidConnector {
                         match &message.data {
                             WebSocketData::AllMidsData(data) => {
                                 Self::process_all_mids_message(data, dynamic_market_info.clone())
+                                    .await;
+                            }
+                            WebSocketData::CandleData(data) => {
+                                Self::process_candle_message(data, dynamic_market_info.clone())
                                     .await;
                             }
                             WebSocketData::UserFillsData(data) => {
@@ -476,6 +531,32 @@ impl HyperliquidConnector {
                 Err(e) => log::error!("Failed to parse mid price for symbol: {}: {:?}", symbol, e),
             }
         }
+    }
+
+    async fn process_candle_message(
+        candle_data: &CandleData,
+        dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
+    ) {
+        let symbol = &candle_data.s;
+        let volume = candle_data.v;
+        let num_trades = candle_data.n;
+        log::debug!(
+            "Candle update for {}: volume = {}, num_trades = {}",
+            symbol,
+            volume,
+            num_trades
+        );
+
+        let market_id = format!("{}-USD", symbol);
+
+        let mut dynamic_market_info_guard = dynamic_market_info.write().await;
+
+        let market_info = dynamic_market_info_guard
+            .entry(market_id.to_string())
+            .or_insert_with(DynamicMarketInfo::default);
+
+        market_info.volume = volume;
+        market_info.num_trades = num_trades;
     }
 
     async fn process_account_data(
@@ -672,12 +753,16 @@ impl DexConnector for HyperliquidConnector {
             .market_price
             .ok_or_else(|| DexError::Other("No price available".to_string()))?;
         let min_tick = dynamic_info.min_tick;
+        let volume = dynamic_info.volume;
+        let num_trades = dynamic_info.num_trades;
 
         Ok(TickerResponse {
             symbol: symbol.to_owned(),
             price,
             min_tick,
             min_order: None,
+            volume: Some(volume),
+            num_trades: Some(num_trades),
         })
     }
 
