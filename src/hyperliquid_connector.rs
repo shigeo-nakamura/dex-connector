@@ -56,8 +56,11 @@ struct TradeResult {
 struct DynamicMarketInfo {
     pub market_price: Option<Decimal>,
     pub min_tick: Option<Decimal>,
-    pub volume: Decimal,
-    pub num_trades: u64,
+    pub volume: Option<Decimal>,
+    pub num_trades: Option<u64>,
+    pub open_interest: Option<Decimal>,
+    pub funding_rate: Option<Decimal>,
+    pub oracle_price: Option<Decimal>,
 }
 
 struct StaticMarketInfo {
@@ -94,6 +97,7 @@ enum WebSocketData {
     AllMidsData(AllMidsData),
     UserFillsData(UserFillsData),
     CandleData(CandleData),
+    ActiveAssetCtxData(ActiveAssetCtxData),
 }
 
 #[derive(Deserialize, Debug)]
@@ -114,6 +118,24 @@ struct CandleData {
     l: Decimal, // Low price
     v: Decimal, // Volume
     n: u64,     // Number of trades
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ActiveAssetCtxData {
+    pub coin: String,       // The asset symbol (e.g., BTC-USD)
+    pub ctx: PerpsAssetCtx, // The asset context containing market details
+}
+
+#[allow(dead_code, non_snake_case)]
+#[derive(Deserialize, Debug)]
+pub struct PerpsAssetCtx {
+    pub dayNtlVlm: Decimal,     // Daily notional volume
+    pub prevDayPx: Decimal,     // Previous day's price
+    pub markPx: Decimal,        // Mark price
+    pub midPx: Option<Decimal>, // Mid price (optional)
+    pub funding: Decimal,       // Funding rate
+    pub openInterest: Decimal,  // Open interest
+    pub oraclePx: Decimal,      // Oracle price
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -166,6 +188,12 @@ impl<'de> Deserialize<'de> for WebSocketMessage {
                     .map(WebSocketData::CandleData)
                     .map_err(serde::de::Error::custom)?;
                 candle_data
+            }
+            "activeAssetCtx" => {
+                let active_asset_ctx_data = ActiveAssetCtxData::deserialize(helper.data)
+                    .map(WebSocketData::ActiveAssetCtxData)
+                    .map_err(serde::de::Error::custom)?;
+                active_asset_ctx_data
             }
             _ => return Err(serde::de::Error::custom("unknown channel type")),
         };
@@ -458,6 +486,25 @@ impl HyperliquidConnector {
                         symbol, e
                     )));
                 }
+
+                let active_asset_ctx_subscription = serde_json::json!({
+                    "method": "subscribe",
+                    "subscription": {
+                        "type": "activeAssetCtx",
+                        "coin": symbol,
+                    }
+                })
+                .to_string();
+
+                if let Err(e) = write_socket
+                    .send(Message::Text(active_asset_ctx_subscription))
+                    .await
+                {
+                    return Err(DexError::WebSocketError(format!(
+                        "Failed to subscribe to activeAssetCtx: {}",
+                        e
+                    )));
+                }
             }
         } else {
             return Err(DexError::WebSocketError(
@@ -492,6 +539,13 @@ impl HyperliquidConnector {
                             }
                             WebSocketData::UserFillsData(data) => {
                                 Self::process_account_data(data, trade_results.clone()).await;
+                            }
+                            WebSocketData::ActiveAssetCtxData(data) => {
+                                Self::process_active_asset_ctx_message(
+                                    data,
+                                    dynamic_market_info.clone(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -555,8 +609,38 @@ impl HyperliquidConnector {
             .entry(market_id.to_string())
             .or_insert_with(DynamicMarketInfo::default);
 
-        market_info.volume = volume;
-        market_info.num_trades = num_trades;
+        market_info.volume = Some(volume);
+        market_info.num_trades = Some(num_trades);
+    }
+
+    async fn process_active_asset_ctx_message(
+        asset_data: &ActiveAssetCtxData,
+        dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
+    ) {
+        let symbol = &asset_data.coin;
+        let funding_rate = asset_data.ctx.funding;
+        let open_interest = asset_data.ctx.openInterest;
+        let oracle_price = asset_data.ctx.oraclePx;
+
+        log::debug!(
+            "Asset CTX update for {}: funding_rate = {}, open_intereset = {}, oracle_price = {}",
+            symbol,
+            funding_rate,
+            open_interest,
+            oracle_price,
+        );
+
+        let market_id = format!("{}-USD", symbol);
+
+        let mut dynamic_market_info_guard = dynamic_market_info.write().await;
+
+        let market_info = dynamic_market_info_guard
+            .entry(market_id.to_string())
+            .or_insert_with(DynamicMarketInfo::default);
+
+        market_info.funding_rate = Some(funding_rate);
+        market_info.open_interest = Some(open_interest);
+        market_info.oracle_price = Some(oracle_price);
     }
 
     async fn process_account_data(
@@ -755,14 +839,20 @@ impl DexConnector for HyperliquidConnector {
         let min_tick = dynamic_info.min_tick;
         let volume = dynamic_info.volume;
         let num_trades = dynamic_info.num_trades;
+        let funding_rate = dynamic_info.funding_rate;
+        let open_interest = dynamic_info.open_interest;
+        let oracle_price = dynamic_info.oracle_price;
 
         Ok(TickerResponse {
             symbol: symbol.to_owned(),
             price,
             min_tick,
             min_order: None,
-            volume: Some(volume),
-            num_trades: Some(num_trades),
+            volume,
+            num_trades,
+            funding_rate,
+            open_interest,
+            oracle_price,
         })
     }
 

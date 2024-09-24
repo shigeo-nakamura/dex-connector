@@ -41,6 +41,9 @@ pub struct TickerResponse {
     pub min_order: Option<Decimal>,
     pub volume: Option<Decimal>,
     pub num_trades: Option<u64>,
+    pub open_interest: Option<Decimal>,
+    pub funding_rate: Option<Decimal>,
+    pub oracle_price: Option<Decimal>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
