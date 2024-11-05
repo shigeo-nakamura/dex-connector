@@ -722,14 +722,6 @@ struct HyperliquidRetriveUserPosition {
     szi: Decimal,
 }
 
-#[derive(Serialize, Debug)]
-struct HyperliquidRetrieveUserFillsPayload {
-    r#type: String,
-    user: String,
-    #[serde(rename = "startTime")]
-    start_time: u128,
-}
-
 #[derive(Deserialize, Debug)]
 struct HyperliquidRetriveMarketMetadataResponse {
     universe: Vec<HyperliquidRetriveMarketMetadata>,
@@ -981,6 +973,7 @@ impl DexConnector for HyperliquidConnector {
             sz: rounded_size
                 .to_f64()
                 .ok_or_else(|| DexError::Other("Conversion to f64 failed".to_string()))?,
+            cloid: None,
             order_type: ClientOrder::Limit(ClientLimit {
                 tif: time_in_force.to_string(),
             }),

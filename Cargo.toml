@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "1.4.0"
+version = "1.5.0"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -28,12 +28,13 @@ sha3 = "0.10.1"
 crypto-mac = "0.11"
 rust_decimal = { version = "1.0", features = ["serde"] }
 lazy_static = "1.3"
-ethers = { version = "0.17", features = ["eip712", "abigen"] } # Updated to match hyperliquid_rust_sdk
+ethers = { version = "2.0.14", features = ["eip712", "abigen"] } # Updated to match hyperliquid_rust_sdk
 debot-utils = "1.0.*"
 ecdsa = "0.16.9"
 hex-literal = "0.4.1"
 k256 = "0.13.3"
-hyperliquid_rust_sdk = "0.3.0"
+primitive-types = "0.12"
+hyperliquid_rust_sdk = "0.5.0"
 
 [dependencies.generic-array]
 version = "0.14.6"
