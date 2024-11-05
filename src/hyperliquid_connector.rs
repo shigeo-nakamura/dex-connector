@@ -733,8 +733,6 @@ struct HyperliquidRetriveMarketMetadata {
     decimals: u32,
     #[serde(rename = "maxLeverage")]
     max_leverage: u32,
-    #[serde(rename = "onlyIsolated")]
-    _only_isolated: bool,
 }
 
 #[async_trait]
