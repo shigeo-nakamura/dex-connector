@@ -8,7 +8,10 @@ use crate::{
 use ::serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use debot_utils::parse_to_decimal;
-use ethers::{signers::LocalWallet, types::H160};
+use ethers::{
+    signers::{LocalWallet, Signer},
+    types::H160,
+};
 use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
@@ -212,6 +215,7 @@ impl HyperliquidConnector {
         private_key: &str,
         evm_wallet_address: &str,
         vault_address: Option<String>,
+        use_agent: bool,
         symbol_list: &[&str],
     ) -> Result<Self, DexError> {
         let request = DexRequest::new(rest_endpoint.to_owned()).await?;
@@ -235,7 +239,21 @@ impl HyperliquidConnector {
             None => None,
         };
 
-        let local_wallet: LocalWallet = private_key.parse().unwrap();
+        let mut local_wallet: LocalWallet = private_key.parse().unwrap();
+
+        if use_agent {
+            let exchange_client =
+                ExchangeClient::new(None, local_wallet, Some(BaseUrl::Mainnet), None, None)
+                    .await
+                    .unwrap();
+
+            let (private_key, response) = exchange_client.approve_agent(None).await.unwrap();
+            log::info!("Agent creation response: {response:?}");
+
+            local_wallet = private_key.parse().unwrap();
+            local_wallet.address();
+            log::info!("Agent address: {:?}", local_wallet.address());
+        }
 
         let exchange_client = ExchangeClient::new(
             None,
