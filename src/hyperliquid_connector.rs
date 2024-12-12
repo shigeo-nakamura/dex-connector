@@ -209,7 +209,7 @@ impl HyperliquidConnector {
     pub async fn new(
         rest_endpoint: &str,
         web_socket_endpoint: &str,
-        agent_private_key: &str,
+        private_key: &str,
         evm_wallet_address: &str,
         vault_address: Option<String>,
         symbol_list: &[&str],
@@ -235,7 +235,7 @@ impl HyperliquidConnector {
             None => None,
         };
 
-        let local_wallet: LocalWallet = agent_private_key.parse().unwrap();
+        let local_wallet: LocalWallet = private_key.parse().unwrap();
 
         let exchange_client = ExchangeClient::new(
             None,
