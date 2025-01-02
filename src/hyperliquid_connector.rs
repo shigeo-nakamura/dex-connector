@@ -1040,15 +1040,21 @@ impl DexConnector for HyperliquidConnector {
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
         let open_orders = self.get_orders().await?;
+
+        let mut cancels = Vec::new();
         for order in open_orders {
             let order_symbol = format!("{}-USD", order.coin);
             if symbol.as_deref() == Some(&order_symbol) || symbol.is_none() {
-                if let Err(e) = self
-                    .cancel_order(&order_symbol, &order.oid.to_string())
-                    .await
-                {
-                    log::error!("cancel_all_orders: {:?}", e);
-                }
+                cancels.push(ClientCancelRequest {
+                    asset: Self::extract_asset_name(&order_symbol).to_owned(),
+                    oid: order.oid,
+                });
+            }
+        }
+
+        if !cancels.is_empty() {
+            if let Err(e) = self.exchange_client.bulk_cancel(cancels, None).await {
+                log::error!("cancel_all_orders: Failed to cancel orders: {:?}", e);
             }
         }
 
