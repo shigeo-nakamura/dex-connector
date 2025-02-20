@@ -1040,11 +1040,30 @@ impl DexConnector for HyperliquidConnector {
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
         let open_orders = self.get_orders().await?;
+        let order_ids: Vec<String> = open_orders
+            .iter()
+            .filter(|order| {
+                symbol.as_deref() == Some(&format!("{}-USD", order.coin)) || symbol.is_none()
+            })
+            .map(|order| order.oid.to_string())
+            .collect();
+
+        self.cancel_orders(symbol, order_ids).await
+    }
+
+    async fn cancel_orders(
+        &self,
+        symbol: Option<String>,
+        order_ids: Vec<String>,
+    ) -> Result<(), DexError> {
+        let open_orders = self.get_orders().await?;
 
         let mut cancels = Vec::new();
         for order in open_orders {
             let order_symbol = format!("{}-USD", order.coin);
-            if symbol.as_deref() == Some(&order_symbol) || symbol.is_none() {
+            if (symbol.as_deref() == Some(&order_symbol) || symbol.is_none())
+                && order_ids.contains(&order.oid.to_string())
+            {
                 cancels.push(ClientCancelRequest {
                     asset: Self::extract_asset_name(&order_symbol).to_owned(),
                     oid: order.oid,
@@ -1054,7 +1073,7 @@ impl DexConnector for HyperliquidConnector {
 
         if !cancels.is_empty() {
             if let Err(e) = self.exchange_client.bulk_cancel(cancels, None).await {
-                log::error!("cancel_all_orders: Failed to cancel orders: {:?}", e);
+                log::error!("cancel_orders: Failed to cancel orders: {:?}", e);
             }
         }
 

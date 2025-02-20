@@ -66,6 +66,12 @@ pub trait DexConnector: Send + Sync {
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError>;
 
+    async fn cancel_orders(
+        &self,
+        symbol: Option<String>,
+        order_ids: Vec<String>,
+    ) -> Result<(), DexError>;
+
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError>;
 
     async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError>;
