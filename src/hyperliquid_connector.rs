@@ -1239,6 +1239,10 @@ impl HyperliquidConnector {
         order_side: OrderSide,
         spread: Option<i64>,
     ) -> Decimal {
+        if min_tick.is_zero() {
+            log::error!("round_price: min_tick is zero");
+            return price;
+        }
         let spread = match spread {
             Some(v) => Decimal::new(v, 0),
             None => Decimal::ZERO,
