@@ -35,7 +35,7 @@ pub trait DexConnector: Send + Sync {
 
     async fn stop(&self) -> Result<(), DexError>;
 
-    async fn restart(&self) -> Result<(), DexError>;
+    async fn restart(&self, max_retries: i32) -> Result<(), DexError>;
 
     async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), DexError>;
 

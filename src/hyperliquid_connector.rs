@@ -766,10 +766,9 @@ impl DexConnector for HyperliquidConnector {
         Ok(())
     }
 
-    async fn restart(&self) -> Result<(), DexError> {
+    async fn restart(&self, max_retries: i32) -> Result<(), DexError> {
         log::info!("Restarting WebSocket connection...");
 
-        let max_retries = 3;
         let mut retry_count = 0;
         let mut backoff_delay = Duration::from_secs(1);
 
