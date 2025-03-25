@@ -16,7 +16,7 @@ use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
-use hyperliquid_rust_sdk::{
+use hyperliquid_rust_sdk_fork::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
     ExchangeDataStatus, ExchangeResponseStatus,
 };
@@ -216,6 +216,7 @@ impl HyperliquidConnector {
         evm_wallet_address: &str,
         vault_address: Option<String>,
         use_agent: bool,
+        agent_name: Option<String>,
         symbol_list: &[&str],
     ) -> Result<Self, DexError> {
         let request = DexRequest::new(rest_endpoint.to_owned()).await?;
@@ -247,7 +248,10 @@ impl HyperliquidConnector {
                     .await
                     .unwrap();
 
-            let (private_key, response) = exchange_client.approve_agent(None).await.unwrap();
+            let (private_key, response) = exchange_client
+                .approve_agent(None, agent_name)
+                .await
+                .unwrap();
             log::info!("Agent creation response: {response:?}");
 
             local_wallet = private_key.parse().unwrap();
