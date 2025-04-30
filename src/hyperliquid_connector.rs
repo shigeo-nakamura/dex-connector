@@ -1086,6 +1086,8 @@ impl DexConnector for HyperliquidConnector {
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
         let open_positions = self.get_positions().await?;
 
+        log::warn!("close_all_positions: symbol = {:?}", symbol);
+
         for p in open_positions {
             let position = p.position;
             let order_symbol = format!("{}-USD", position.coin);
