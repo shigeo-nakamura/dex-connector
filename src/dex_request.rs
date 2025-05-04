@@ -1,3 +1,4 @@
+use debot_utils::ParseDecimalError;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client, Method,
@@ -41,6 +42,12 @@ pub enum DexError {
     WebSocketError(String),
     Other(String),
     NoConnection,
+}
+
+impl From<ParseDecimalError> for DexError {
+    fn from(e: ParseDecimalError) -> Self {
+        DexError::Other(format!("{:?}", e))
+    }
 }
 
 impl Display for DexError {

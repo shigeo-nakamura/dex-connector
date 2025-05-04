@@ -47,7 +47,7 @@ pub trait DexConnector: Send + Sync {
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError>;
 
-    async fn get_balance(&self) -> Result<BalanceResponse, DexError>;
+    async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError>;
 
     async fn clear_filled_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
 

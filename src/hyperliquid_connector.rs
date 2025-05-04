@@ -8,10 +8,7 @@ use crate::{
 use ::serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use debot_utils::parse_to_decimal;
-use ethers::{
-    signers::{LocalWallet, Signer},
-    types::H160,
-};
+use ethers::{signers::LocalWallet, types::H160};
 use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
@@ -44,6 +41,45 @@ use tokio_tungstenite::WebSocketStream;
 struct Config {
     evm_wallet_address: String,
     symbol_list: Vec<String>,
+}
+
+// --- Spot metadata support ---
+#[derive(Deserialize, Debug)]
+struct SpotMetaToken {
+    #[serde(rename = "name")]
+    _name: String,
+    #[serde(rename = "szDecimals")]
+    _sz_decimals: u32,
+    #[serde(rename = "weiDecimals")]
+    _wei_decimals: u32,
+    #[serde(rename = "index")]
+    _index: usize,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct SpotMetaUniverse {
+    #[serde(rename = "name")]
+    name: String,
+    #[serde(rename = "tokens")]
+    _tokens: Vec<usize>,
+    #[serde(rename = "index")]
+    index: usize,
+}
+
+#[derive(Deserialize, Debug)]
+struct SpotMetaResponse {
+    #[serde(rename = "tokens")]
+    _tokens: Vec<SpotMetaToken>,
+    #[serde(rename = "universe")]
+    universe: Vec<SpotMetaUniverse>,
+}
+
+#[derive(Serialize, Debug)]
+struct InfoRequest<'a> {
+    #[serde(rename = "type")]
+    req_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -86,6 +122,8 @@ pub struct HyperliquidConnector {
     // key = symbol
     dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
     static_market_info: HashMap<String, StaticMarketInfo>,
+    spot_index_map: HashMap<String, usize>,
+    spot_reverse_map: Arc<HashMap<usize, String>>,
     exchange_client: ExchangeClient,
 }
 
@@ -222,41 +260,33 @@ impl HyperliquidConnector {
         let request = DexRequest::new(rest_endpoint.to_owned()).await?;
         let web_socket = DexWebSocket::new(web_socket_endpoint.to_owned());
 
-        let evm_wallet_address = match vault_address.clone() {
-            Some(v) => v.to_owned(),
-            None => evm_wallet_address.to_owned(),
-        };
-
+        let evm_wallet_address = vault_address
+            .clone()
+            .unwrap_or_else(|| evm_wallet_address.into());
         let config = Config {
             evm_wallet_address,
-            symbol_list: symbol_list
-                .iter()
-                .map(|&s| s.strip_suffix("-USD").unwrap_or(s).to_string())
-                .collect(),
+            symbol_list: symbol_list.iter().map(|s| s.to_string()).collect(),
         };
 
-        let vault_address: Option<H160> = match vault_address {
-            Some(v) => H160::from_str(&v).ok(),
-            None => None,
-        };
+        let vault_address: Option<H160> = vault_address
+            .as_deref()
+            .and_then(|v| H160::from_str(v).ok());
 
         let mut local_wallet: LocalWallet = private_key.parse().unwrap();
 
         if use_agent {
-            let exchange_client =
+            let ec_tmp =
                 ExchangeClient::new(None, local_wallet, Some(BaseUrl::Mainnet), None, None)
                     .await
-                    .unwrap();
+                    .map_err(|e| DexError::Other(e.to_string()))?;
 
-            let (private_key, response) = exchange_client
+            let (pk, resp) = ec_tmp
                 .approve_agent(None, agent_name)
                 .await
-                .unwrap();
-            log::info!("Agent creation response: {response:?}");
+                .map_err(|e| DexError::Other(e.to_string()))?;
+            log::info!("Agent approved: {resp:?}");
 
-            local_wallet = private_key.parse().unwrap();
-            local_wallet.address();
-            log::info!("Agent address: {:?}", local_wallet.address());
+            local_wallet = pk.parse().unwrap();
         }
 
         let exchange_client = ExchangeClient::new(
@@ -267,7 +297,7 @@ impl HyperliquidConnector {
             vault_address,
         )
         .await
-        .unwrap();
+        .map_err(|e| DexError::Other(e.to_string()))?;
 
         let mut instance = HyperliquidConnector {
             config,
@@ -281,10 +311,63 @@ impl HyperliquidConnector {
             task_handle_read_sigterm: Arc::new(Mutex::new(None)),
             dynamic_market_info: Arc::new(RwLock::new(HashMap::new())),
             static_market_info: HashMap::new(),
+            spot_index_map: HashMap::new(),
+            spot_reverse_map: Arc::new(HashMap::new()),
             exchange_client,
         };
 
         instance.retrive_market_metadata().await?;
+
+        let info_payload = serde_json::to_string(&InfoRequest {
+            req_type: "spotMeta",
+            user: None,
+        })
+        .map_err(|e| DexError::Other(e.to_string()))?;
+
+        let spot_meta: SpotMetaResponse = instance
+            .request
+            .handle_request::<SpotMetaResponse, InfoRequest<'_>>(
+                HttpMethod::Post,
+                "/info".into(),
+                &HashMap::new(),
+                info_payload,
+            )
+            .await?;
+
+        // index → token_name
+        let token_name_map: HashMap<usize, String> = spot_meta
+            ._tokens
+            .iter()
+            .map(|t| (t._index, t._name.clone()))
+            .collect();
+
+        let mut idx_from_pair = HashMap::<String, usize>::new();
+        let mut pair_from_idx = HashMap::<usize, String>::new();
+
+        for uni in &spot_meta.universe {
+            let pair = if !uni.name.starts_with('@') {
+                uni.name.clone()
+            } else if uni._tokens.len() == 2 {
+                format!(
+                    "{}/{}",
+                    token_name_map.get(&uni._tokens[0]).unwrap_or(&"?".into()),
+                    token_name_map.get(&uni._tokens[1]).unwrap_or(&"?".into())
+                )
+            } else {
+                log::warn!(
+                    "universe idx {} has unexpected token vec {:?}",
+                    uni.index,
+                    uni._tokens
+                );
+                uni.name.clone()
+            };
+
+            idx_from_pair.insert(pair.clone(), uni.index);
+            pair_from_idx.insert(uni.index, pair);
+        }
+
+        instance.spot_index_map = idx_from_pair;
+        instance.spot_reverse_map = Arc::new(pair_from_idx);
 
         Ok(instance)
     }
@@ -292,128 +375,103 @@ impl HyperliquidConnector {
     pub async fn start_web_socket(&self) -> Result<(), DexError> {
         log::info!("start_web_socket");
 
-        // Establish socket connection
-        let web_socket = self.web_socket.clone();
-        let (write, read) = match web_socket.connect().await {
-            Ok((write, read)) => (write, read),
-            Err(_) => {
-                return Err(DexError::Other(
-                    "Failed to connect to WebSocket".to_string(),
-                ))
-            }
-        };
-        let mut read_socket_lock = self.read_socket.lock().await;
-        *read_socket_lock = Some(read);
-        drop(read_socket_lock);
+        let (write, read) = self
+            .web_socket
+            .clone()
+            .connect()
+            .await
+            .map_err(|_| DexError::Other("Failed to connect to WebSocket".to_string()))?;
 
-        let mut write_socket_lock = self.write_socket.lock().await;
-        *write_socket_lock = Some(write);
-        drop(write_socket_lock);
+        {
+            let mut read_lock = self.read_socket.lock().await;
+            *read_lock = Some(read);
+        }
+        {
+            let mut write_lock = self.write_socket.lock().await;
+            *write_lock = Some(write);
+        }
 
         self.running.store(true, Ordering::SeqCst);
-
-        // Subscribe channels
         self.subscribe_to_channels(&self.config.evm_wallet_address)
-            .await
-            .unwrap();
-        log::debug!("subscription is done");
+            .await?;
 
-        // Create a message recevie thread
-        let running_clone = self.running.clone();
-        let read_clone = self.read_socket.clone();
-        let write_clone = self.write_socket.clone();
-        let dynamic_market_info_clone = self.dynamic_market_info.clone();
-        let trade_results_clone = self.trade_results.clone();
-        let handle = tokio::spawn(async move {
-            log::debug!("WebSocket message handling task started");
+        let running = self.running.clone();
+        let read_sock = self.read_socket.clone();
+        let write_sock = self.write_socket.clone();
+        let dmi = self.dynamic_market_info.clone();
+        let trs = self.trade_results.clone();
+        let rev_map = self.spot_reverse_map.clone();
 
-            let mut message_counter = 0;
-            while running_clone.load(Ordering::SeqCst) {
-                let mut read_guard = read_clone.lock().await;
-                if let Some(read_stream) = read_guard.as_mut() {
+        let reader_handle = tokio::spawn(async move {
+            let mut idle_counter = 0;
+            while running.load(Ordering::SeqCst) {
+                if let Some(stream) = read_sock.lock().await.as_mut() {
                     tokio::select! {
-                        message = read_stream.next() => match message {
-                            Some(Ok(msg)) => {
-                                message_counter = 0;
-                                if msg == "{}".into() {
-                                    if let Some(write_socket) = write_clone.lock().await.as_mut() {
-                                        if let Err(e) = write_socket.send(Message::Text(msg.to_string())).await {
-                                            log::error!("Failed to send message: {}", e);
-                                            break;
-                                        }
-                                    } else {
-                                        log::error!("Write socket is not available");
-                                        break;
+                        msg = stream.next() => match msg {
+                            Some(Ok(Message::Text(txt))) => {
+                                idle_counter = 0;
+                                if txt == "{}" {
+                                    if let Some(w) = write_sock.lock().await.as_mut() {
+                                        let _ = w.send(Message::Text(txt)).await;
                                     }
-                                    log::trace!("Responsed to the ping")
                                 } else {
-                                    log::trace!("Received message: {:?}", msg);
-                                    if let Err(e) = Self::handle_websocket_message(
-                                        msg,
-                                        dynamic_market_info_clone.clone(),
-                                        trade_results_clone.clone(),
-                                    )
-                                    .await
-                                    {
-                                        log::error!("Error handling WebSocket message: {:?}", e);
+                                    if let Err(e) = HyperliquidConnector::handle_websocket_message(
+                                        Message::Text(txt),
+                                        dmi.clone(),
+                                        trs.clone(),
+                                        rev_map.clone(),
+                                    ).await {
+                                        log::error!("WebSocket handler error: {:?}", e);
                                         break;
                                     }
                                 }
                             }
-                            Some(Err(e)) => {
-                                log::error!("Failed to read: {:?}", e);
+                            Some(Ok(_)) => {
+                            }
+                            Some(Err(err)) => {
+                                log::error!("WebSocket read error: {:?}", err);
                                 break;
                             }
                             None => {
-                                log::info!("WebSocket stream ended");
+                                log::info!("WebSocket stream closed");
                                 break;
                             }
                         },
-                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
-                            if !running_clone.load(Ordering::SeqCst) {
-                                log::info!("Running flag changed, shutting down...");
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                            idle_counter += 1;
+                            if idle_counter >= 10 {
+                                log::error!("No WebSocket messages for 100s, shutting down reader");
                                 break;
                             }
-                            message_counter += 1;
-                            if message_counter >= 10 {
-                                log::error!("No message has been received for some time");
-                                break;
-                            }
-                        },
+                        }
                     }
                 }
             }
-
-            running_clone.store(false, Ordering::SeqCst);
-            log::info!("WebSocket message handling task ended");
+            running.store(false, Ordering::SeqCst);
+            log::info!("WebSocket reader task ended");
         });
-        let mut task_handle = self.task_handle_read_message.lock().await;
-        *task_handle = Some(handle);
+        *self.task_handle_read_message.lock().await = Some(reader_handle);
 
-        // Create a SITERM wait thread
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("Failed to create SIGTERM listener");
-        let running_clone = self.running.clone();
-        let handle = tokio::spawn(async move {
-            log::debug!("SIGTERM handling task started");
+        let running_for_sig = self.running.clone();
+        let sig_handle = tokio::spawn(async move {
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to bind SIGTERM handler");
             loop {
                 select! {
                     _ = sigterm.recv() => {
-                        log::info!("SIGTERM received, shutting down...");
-                        running_clone.store(false, Ordering::SeqCst);
+                        log::info!("SIGTERM received, stopping WebSocket");
+                        running_for_sig.store(false, Ordering::SeqCst);
                         break;
-                    },
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
-                        if !running_clone.load(Ordering::SeqCst) {
-                            log::info!("Running flag changed, shutting down...");
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if !running_for_sig.load(Ordering::SeqCst) {
                             break;
                         }
-                    },
+                    }
                 }
             }
         });
-        let mut task_handle = self.task_handle_read_sigterm.lock().await;
-        *task_handle = Some(handle);
+        *self.task_handle_read_sigterm.lock().await = Some(sig_handle);
 
         Ok(())
     }
@@ -492,11 +550,12 @@ impl HyperliquidConnector {
             }
 
             for symbol in &self.config.symbol_list {
+                let coin = resolve_coin(symbol, &self.spot_index_map);
                 let candle_subscription = serde_json::json!({
                     "method": "subscribe",
                     "subscription": {
                         "type": "candle",
-                        "coin": symbol,
+                        "coin": coin,
                         "interval": "1m"
                     }
                 })
@@ -513,7 +572,7 @@ impl HyperliquidConnector {
                     "method": "subscribe",
                     "subscription": {
                         "type": "activeAssetCtx",
-                        "coin": symbol,
+                        "coin": coin,
                     }
                 })
                 .to_string();
@@ -541,40 +600,44 @@ impl HyperliquidConnector {
         msg: Message,
         dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
         trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
+        spot_reverse_map: Arc<HashMap<usize, String>>,
     ) -> Result<(), DexError> {
-        match msg {
-            Message::Text(text) => {
-                for line in text.split('\n') {
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    if let Ok(message) = serde_json::from_str::<WebSocketMessage>(line) {
-                        match &message.data {
-                            WebSocketData::AllMidsData(data) => {
-                                Self::process_all_mids_message(data, dynamic_market_info.clone())
-                                    .await;
-                            }
-                            WebSocketData::CandleData(data) => {
-                                Self::process_candle_message(data, dynamic_market_info.clone())
-                                    .await;
-                            }
-                            WebSocketData::UserFillsData(data) => {
-                                Self::process_account_data(data, trade_results.clone()).await;
-                            }
-                            WebSocketData::ActiveAssetCtxData(data) => {
-                                Self::process_active_asset_ctx_message(
-                                    data,
-                                    dynamic_market_info.clone(),
-                                )
-                                .await;
-                            }
+        if let Message::Text(text) = msg {
+            for line in text.split('\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(message) = serde_json::from_str::<WebSocketMessage>(line) {
+                    match message.data {
+                        WebSocketData::AllMidsData(ref data) => {
+                            Self::process_all_mids_message(
+                                data,
+                                dynamic_market_info.clone(),
+                                spot_reverse_map.clone(),
+                            )
+                            .await;
+                        }
+                        WebSocketData::CandleData(ref data) => {
+                            Self::process_candle_message(
+                                data,
+                                dynamic_market_info.clone(),
+                                spot_reverse_map.clone(),
+                            )
+                            .await;
+                        }
+                        WebSocketData::UserFillsData(ref data) => {
+                            Self::process_account_data(data, trade_results.clone()).await;
+                        }
+                        WebSocketData::ActiveAssetCtxData(ref data) => {
+                            Self::process_active_asset_ctx_message(
+                                data,
+                                dynamic_market_info.clone(),
+                                spot_reverse_map.clone(),
+                            )
+                            .await;
                         }
                     }
                 }
-            }
-            _ => {
-                log::warn!("Message is empty");
             }
         }
         Ok(())
@@ -583,86 +646,116 @@ impl HyperliquidConnector {
     async fn process_all_mids_message(
         mids_data: &AllMidsData,
         dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
+        spot_reverse_map: Arc<HashMap<usize, String>>,
     ) {
-        for (symbol, mid_price_str) in mids_data.mids.iter() {
-            match string_to_decimal(Some(mid_price_str.to_string())) {
-                Ok(mid_price) => {
-                    let market_id = format!("{}-USD", symbol);
+        for (raw_coin, mid_price_str) in &mids_data.mids {
+            let coin = if let Some(stripped) = raw_coin.strip_prefix('@') {
+                stripped
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| spot_reverse_map.get(&idx).cloned())
+                    .unwrap_or_else(|| {
+                        log::info!(
+                            "in spot_reverse_map {} is missing (@{})",
+                            raw_coin,
+                            stripped
+                        );
+                        raw_coin.clone()
+                    })
+            } else {
+                raw_coin.clone()
+            };
 
-                    log::trace!("{} mid price = {:?}", market_id, mid_price);
+            let market_key = if coin.contains('/') || coin.contains('-') {
+                coin.clone() // Spot: UBTC/USDC,  etc.
+            } else {
+                format!("{}-USD", coin) // Perp: BTC-USD, etc.
+            };
 
-                    let mut dynamic_market_info_guard = dynamic_market_info.write().await;
-
-                    let market_info = dynamic_market_info_guard
-                        .entry(market_id.to_string())
-                        .or_insert_with(DynamicMarketInfo::default);
-
-                    if market_info.min_tick.is_none() {
-                        let min_tick = Self::calculate_min_tick(mid_price);
-                        market_info.min_tick = Some(min_tick);
-                    }
-
-                    market_info.market_price = Some(mid_price);
+            if let Ok(mid) = string_to_decimal(Some(mid_price_str.clone())) {
+                let mut guard = dynamic_market_info.write().await;
+                let info = guard.entry(market_key.clone()).or_default();
+                if info.min_tick.is_none() {
+                    info.min_tick = Some(Self::calculate_min_tick(mid));
                 }
-                Err(e) => log::error!("Failed to parse mid price for symbol: {}: {:?}", symbol, e),
+                info.market_price = Some(mid);
+
+                if market_key == "UBTC/USDC" {
+                    log::info!("mid update UBTC/USDC → {}", mid);
+                }
             }
         }
     }
 
     async fn process_candle_message(
-        candle_data: &CandleData,
+        candle: &CandleData,
         dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
+        spot_reverse_map: Arc<HashMap<usize, String>>,
     ) {
-        let symbol = &candle_data.s;
-        let volume = candle_data.v;
-        let num_trades = candle_data.n;
-        log::debug!(
-            "Candle update for {}: volume = {}, num_trades = {}",
-            symbol,
-            volume,
-            num_trades
-        );
+        let coin = if let Some(stripped) = candle.s.strip_prefix('@') {
+            stripped
+                .parse::<usize>()
+                .ok()
+                .and_then(|idx| spot_reverse_map.get(&idx).cloned())
+                .unwrap_or_else(|| {
+                    log::info!(
+                        "in spot_reverse_map: {} is missing (@{})",
+                        candle.s,
+                        stripped
+                    );
+                    candle.s.clone()
+                })
+        } else {
+            candle.s.clone()
+        };
 
-        let market_id = format!("{}-USD", symbol);
+        let market_key = if coin.contains('/') || coin.contains('-') {
+            coin.clone()
+        } else {
+            format!("{}-USD", coin)
+        };
 
-        let mut dynamic_market_info_guard = dynamic_market_info.write().await;
-
-        let market_info = dynamic_market_info_guard
-            .entry(market_id.to_string())
-            .or_insert_with(DynamicMarketInfo::default);
-
-        market_info.volume = Some(volume);
-        market_info.num_trades = Some(num_trades);
+        let mut guard = dynamic_market_info.write().await;
+        let info = guard.entry(market_key.clone()).or_default();
+        info.volume = Some(candle.v);
+        info.num_trades = Some(candle.n);
     }
 
     async fn process_active_asset_ctx_message(
         asset_data: &ActiveAssetCtxData,
         dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
+        spot_reverse_map: Arc<HashMap<usize, String>>,
     ) {
-        let symbol = &asset_data.coin;
-        let funding_rate = asset_data.ctx.funding;
-        let open_interest = asset_data.ctx.openInterest;
-        let oracle_price = asset_data.ctx.oraclePx;
+        let coin = if let Some(stripped) = asset_data.coin.strip_prefix('@') {
+            stripped
+                .parse::<usize>()
+                .ok()
+                .and_then(|idx| spot_reverse_map.get(&idx).cloned())
+                .unwrap_or_else(|| {
+                    log::info!(
+                        "in spot_reverse_map {} is missing (@{})",
+                        asset_data.coin,
+                        stripped
+                    );
+                    asset_data.coin.clone()
+                })
+        } else {
+            asset_data.coin.clone()
+        };
 
-        log::debug!(
-            "Asset CTX update for {}: funding_rate = {}, open_intereset = {}, oracle_price = {}",
-            symbol,
-            funding_rate,
-            open_interest,
-            oracle_price,
-        );
+        let market_key = if coin.contains('/') || coin.contains('-') {
+            coin.clone()
+        } else {
+            format!("{}-USD", coin)
+        };
 
-        let market_id = format!("{}-USD", symbol);
-
-        let mut dynamic_market_info_guard = dynamic_market_info.write().await;
-
-        let market_info = dynamic_market_info_guard
-            .entry(market_id.to_string())
+        let mut guard = dynamic_market_info.write().await;
+        let info = guard
+            .entry(market_key.clone())
             .or_insert_with(DynamicMarketInfo::default);
-
-        market_info.funding_rate = Some(funding_rate);
-        market_info.open_interest = Some(open_interest);
-        market_info.oracle_price = Some(oracle_price);
+        info.funding_rate = Some(asset_data.ctx.funding);
+        info.open_interest = Some(asset_data.ctx.openInterest);
+        info.oracle_price = Some(asset_data.ctx.oraclePx);
     }
 
     async fn process_account_data(
@@ -684,7 +777,12 @@ impl HyperliquidConnector {
             let filled_fee = fill.fee;
             let order_id = fill.oid;
             let trade_id = fill.tid;
-            let market_id = format!("{}-USD", fill.coin);
+
+            let market_id = if fill.coin.contains('/') || fill.coin.contains('-') {
+                fill.coin.clone()
+            } else {
+                format!("{}-USD", fill.coin)
+            };
 
             let trade_result = TradeResult {
                 filled_side,
@@ -755,6 +853,17 @@ struct HyperliquidRetriveMarketMetadata {
     decimals: u32,
     #[serde(rename = "maxLeverage")]
     max_leverage: u32,
+}
+
+#[derive(Deserialize, Debug)]
+struct HyperliquidSpotBalanceResponse {
+    balances: Vec<HyperliquidSpotBalance>,
+}
+
+#[derive(Deserialize, Debug)]
+struct HyperliquidSpotBalance {
+    coin: String,
+    total: String,
 }
 
 #[async_trait]
@@ -890,36 +999,59 @@ impl DexConnector for HyperliquidConnector {
         Ok(FilledOrdersResponse { orders: response })
     }
 
-    async fn get_balance(&self) -> Result<BalanceResponse, DexError> {
+    async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
+        if let Some(pair) = symbol {
+            // "UBTC/USDC" → "UBTC"
+            let base_coin = pair.split('/').next().unwrap_or(pair);
+
+            let spot_action = HyperliquidDefaultPayload {
+                r#type: "spotClearinghouseState".into(),
+                user: Some(self.config.evm_wallet_address.clone()),
+            };
+            let spot_res: HyperliquidSpotBalanceResponse = self
+                .handle_request_with_action("/info".into(), &spot_action)
+                .await?;
+
+            let mut usdc_total = Decimal::ZERO;
+            let mut base_total = Decimal::ZERO;
+            for b in &spot_res.balances {
+                match b.coin.as_str() {
+                    "USDC" => usdc_total = parse_to_decimal(&b.total)?,
+                    c if c == base_coin => base_total = parse_to_decimal(&b.total)?,
+                    _ => {}
+                }
+            }
+
+            let price_key = pair.to_string();
+            let px = self
+                .get_market_price(&price_key)
+                .await
+                .unwrap_or(Decimal::ZERO);
+
+            let equity = base_total * px + usdc_total;
+            let balance = usdc_total;
+
+            return Ok(BalanceResponse { equity, balance });
+        }
+
         let request_url = "/info";
         let action = HyperliquidDefaultPayload {
-            r#type: "clearinghouseState".to_owned(),
+            r#type: "clearinghouseState".into(),
             user: Some(self.config.evm_wallet_address.clone()),
         };
         let res = self
-            .handle_request_with_action::<HyperliquidRetrieveUserStateResponse, HyperliquidDefaultPayload>(
-                request_url.to_string(),
+            .handle_request_with_action::<HyperliquidRetrieveUserStateResponse, _>(
+                request_url.into(),
                 &action,
             )
             .await?;
 
         if let Some(summary) = res.margin_summary {
-            let equity = match parse_to_decimal(&summary.account_value) {
-                Ok(v) => v,
-                Err(e) => return Err(DexError::Other(format!("acount_equity: {:?}", e))),
-            };
-
-            let balance = match parse_to_decimal(&summary.total_rawusd) {
-                Ok(v) => v,
-                Err(e) => return Err(DexError::Other(format!("balance: {:?}", e))),
-            };
-
-            Ok(BalanceResponse {
-                equity: equity,
-                balance: balance,
-            })
+            let equity = parse_to_decimal(&summary.account_value)?;
+            let balance = parse_to_decimal(&summary.total_rawusd)?;
+            Ok(BalanceResponse { equity, balance })
         } else {
-            return Err(DexError::Other(String::from("Unknown error")));
+            Err(DexError::Other("Unknown error".into()))
         }
     }
 
@@ -980,7 +1112,7 @@ impl DexConnector for HyperliquidConnector {
 
         log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
 
-        let asset = Self::extract_asset_name(symbol).to_owned();
+        let asset = resolve_coin(symbol, &self.spot_index_map);
 
         let order = ClientOrderRequest {
             asset,
@@ -1027,7 +1159,7 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
-        let asset = Self::extract_asset_name(symbol).to_owned();
+        let asset = resolve_coin(symbol, &self.spot_index_map);
         let cancel = ClientCancelRequest {
             asset,
             oid: u64::from_str(order_id).unwrap_or_default(),
@@ -1273,5 +1405,23 @@ impl HyperliquidConnector {
 
     fn extract_asset_name(symbol: &str) -> &str {
         symbol.split('-').next().unwrap_or(symbol)
+    }
+}
+
+fn resolve_coin(sym: &str, map: &HashMap<String, usize>) -> String {
+    if sym.contains('/') {
+        // ---- Spot ----
+        match map.get(sym) {
+            Some(idx) => format!("@{}", idx),
+            None => {
+                log::warn!("resolve_coin: {} is not in spot_index_map", sym);
+                sym.to_string()
+            }
+        }
+    } else if let Some(base) = sym.strip_suffix("-USD") {
+        // ---- Perp ----
+        base.to_string()
+    } else {
+        sym.to_string()
     }
 }
