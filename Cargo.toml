@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "2.2.15"
+version = "2.2.16"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -10,12 +10,12 @@ repository = "https://github.com/shigeo-nakamura/dex-connector"
 license = "MIT"
 
 [dependencies]
-chrono = "0.4.26"
+chrono = { version = "0.4.26", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1.0.175", features = ["derive"] }
 serde_json = "1.0.103"
 rmp-serde = "1.0.0"
 log = "0.4.19"
-reqwest = { version = "0.11.18", features = ["blocking", "json", "cookies"] }
+reqwest = { version = "0.11.18", features = ["blocking", "json", "cookies", "rustls-tls"] }
 async-trait = "0.1.68"
 tokio-tungstenite = { version = "0.20.0", features = ["native-tls"] }
 tokio = { version = "1.29.1", features = ["full"] }

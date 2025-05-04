@@ -75,4 +75,6 @@ pub trait DexConnector: Send + Sync {
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError>;
 
     async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError>;
+
+    async fn check_upcoming_maintenance(&self) -> Result<(), DexError>;
 }

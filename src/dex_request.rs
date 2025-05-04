@@ -42,6 +42,7 @@ pub enum DexError {
     WebSocketError(String),
     Other(String),
     NoConnection,
+    UpcomingMaintenance,
 }
 
 impl From<ParseDecimalError> for DexError {
@@ -59,6 +60,7 @@ impl Display for DexError {
             DexError::Other(ref e) => write!(f, "Other error: {}", e),
             DexError::NoConnection => write!(f, "No running WebSocketConnection"),
             DexError::WebSocketError(ref e) => write!(f, "WebSocket error: {}", e),
+            DexError::UpcomingMaintenance => write!(f, "Network upgrade scheduled in < 2h"),
         }
     }
 }
@@ -72,6 +74,7 @@ impl StdError for DexError {
             DexError::Other(_) => None,
             DexError::NoConnection => None,
             DexError::WebSocketError(_) => None,
+            DexError::UpcomingMaintenance => None,
         }
     }
 }

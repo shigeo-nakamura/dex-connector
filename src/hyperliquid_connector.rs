@@ -38,6 +38,10 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use reqwest::Client;
+use serde_json::Value;
+
 struct Config {
     evm_wallet_address: String,
     symbol_list: Vec<String>,
@@ -107,6 +111,13 @@ struct StaticMarketInfo {
     pub _max_leverage: u32,
 }
 
+#[derive(Clone)]
+#[allow(dead_code)]
+struct MaintenanceInfo {
+    next_start: Option<DateTime<Utc>>,
+    fetched_at: DateTime<Utc>,
+}
+
 pub struct HyperliquidConnector {
     config: Config,
     request: DexRequest,
@@ -125,6 +136,7 @@ pub struct HyperliquidConnector {
     spot_index_map: HashMap<String, usize>,
     spot_reverse_map: Arc<HashMap<usize, String>>,
     exchange_client: ExchangeClient,
+    maintenance: Arc<RwLock<MaintenanceInfo>>,
 }
 
 #[derive(Debug)]
@@ -314,7 +326,13 @@ impl HyperliquidConnector {
             spot_index_map: HashMap::new(),
             spot_reverse_map: Arc::new(HashMap::new()),
             exchange_client,
+            maintenance: Arc::new(RwLock::new(MaintenanceInfo {
+                next_start: None,
+                fetched_at: Utc::now() - ChronoDuration::hours(1),
+            })),
         };
+
+        instance.spawn_maintenance_watcher();
 
         instance.retrive_market_metadata().await?;
 
@@ -370,6 +388,40 @@ impl HyperliquidConnector {
         instance.spot_reverse_map = Arc::new(pair_from_idx);
 
         Ok(instance)
+    }
+
+    fn spawn_maintenance_watcher(&self) {
+        let cache = self.maintenance.clone();
+        tokio::spawn(async move {
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .expect("reqwest client");
+
+            loop {
+                if let Ok(res) = client
+                    .get("https://hyperliquid.statuspage.io/api/v2/scheduled-maintenances/upcoming.json")
+                    .send()
+                    .await
+                {
+                    if let Ok(json) = res.json::<Value>().await {
+                        let next = json
+                            .get("scheduled_maintenances")
+                            .and_then(|v| v.get(0))
+                            .and_then(|v| v.get("scheduled_for"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.with_timezone(&Utc));
+
+                        *cache.write().await = MaintenanceInfo {
+                            next_start: next,
+                            fetched_at: Utc::now(),
+                        };
+                    }
+                }
+                sleep(Duration::from_secs(600)).await;
+            }
+        });
     }
 
     pub async fn start_web_socket(&self) -> Result<(), DexError> {
@@ -1244,6 +1296,16 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
+        Ok(())
+    }
+
+    async fn check_upcoming_maintenance(&self) -> Result<(), DexError> {
+        let info = self.maintenance.read().await;
+        if let Some(start) = info.next_start {
+            if start - Utc::now() <= ChronoDuration::hours(2) {
+                return Err(DexError::UpcomingMaintenance);
+            }
+        }
         Ok(())
     }
 }
