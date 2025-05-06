@@ -387,6 +387,43 @@ impl HyperliquidConnector {
         instance.spot_index_map = idx_from_pair;
         instance.spot_reverse_map = Arc::new(pair_from_idx);
 
+        {
+            let token_decimals: HashMap<String, u32> = spot_meta
+                ._tokens
+                .iter()
+                .map(|t| (t._name.clone(), t._sz_decimals))
+                .collect();
+
+            let mut sm = std::mem::take(&mut instance.static_market_info);
+
+            for uni in &spot_meta.universe {
+                let pair = if !uni.name.starts_with('@') {
+                    uni.name.clone()
+                } else if uni._tokens.len() == 2 {
+                    format!(
+                        "{}/{}",
+                        spot_meta._tokens[uni._tokens[0]]._name,
+                        spot_meta._tokens[uni._tokens[1]]._name
+                    )
+                } else {
+                    uni.name.clone()
+                };
+
+                let base = pair.split('/').next().unwrap();
+                let decimals = *token_decimals.get(base).unwrap_or(&0);
+
+                sm.insert(
+                    pair.clone(),
+                    StaticMarketInfo {
+                        decimals,
+                        _max_leverage: 0,
+                    },
+                );
+            }
+
+            instance.static_market_info = sm;
+        }
+
         Ok(instance)
     }
 
