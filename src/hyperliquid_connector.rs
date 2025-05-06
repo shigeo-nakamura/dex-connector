@@ -768,10 +768,6 @@ impl HyperliquidConnector {
                     info.min_tick = Some(Self::calculate_min_tick(mid));
                 }
                 info.market_price = Some(mid);
-
-                if market_key == "UBTC/USDC" {
-                    log::info!("mid update UBTC/USDC → {}", mid);
-                }
             }
         }
     }
