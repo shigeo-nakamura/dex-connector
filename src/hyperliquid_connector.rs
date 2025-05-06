@@ -744,7 +744,7 @@ impl HyperliquidConnector {
                     .ok()
                     .and_then(|idx| spot_reverse_map.get(&idx).cloned())
                     .unwrap_or_else(|| {
-                        log::info!(
+                        log::debug!(
                             "in spot_reverse_map {} is missing (@{})",
                             raw_coin,
                             stripped
@@ -787,7 +787,7 @@ impl HyperliquidConnector {
                 .ok()
                 .and_then(|idx| spot_reverse_map.get(&idx).cloned())
                 .unwrap_or_else(|| {
-                    log::info!(
+                    log::debug!(
                         "in spot_reverse_map: {} is missing (@{})",
                         candle.s,
                         stripped
@@ -821,7 +821,7 @@ impl HyperliquidConnector {
                 .ok()
                 .and_then(|idx| spot_reverse_map.get(&idx).cloned())
                 .unwrap_or_else(|| {
-                    log::info!(
+                    log::debug!(
                         "in spot_reverse_map {} is missing (@{})",
                         asset_data.coin,
                         stripped
@@ -1263,6 +1263,7 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
+        log::debug!("cancel_all_orders: {:?}", symbol);
         let open_orders = self.get_orders().await?;
         let order_ids = open_orders
             .iter()
@@ -1275,7 +1276,16 @@ impl DexConnector for HyperliquidConnector {
                 } else {
                     format!("{}-USD", order.coin)
                 };
+
+                log::debug!(
+                    "cancel_all_orders: raw coin = {}, external_sym = {}, target symbol = {:?}",
+                    order.coin,
+                    external_sym,
+                    symbol
+                );
+
                 if symbol.as_deref().map_or(true, |s| s == &external_sym) {
+                    log::debug!("  → include order_id={}", order.oid);
                     Some(order.oid.to_string())
                 } else {
                     None
@@ -1304,16 +1314,30 @@ impl DexConnector for HyperliquidConnector {
                 format!("{}-USD", order.coin)
             };
 
+            log::debug!(
+                "cancel_orders: raw coin = {}, external_sym = {}, requested_ids = {:?}",
+                order.coin,
+                external_sym,
+                order_ids
+            );
+
             if symbol.as_deref().map_or(true, |s| s == &external_sym)
                 && order_ids.contains(&order.oid.to_string())
             {
                 let asset = resolve_coin(&external_sym, &self.spot_index_map);
+                log::debug!(
+                    "  → pushing cancel for asset = {}, oid = {}",
+                    asset,
+                    order.oid
+                );
                 cancels.push(ClientCancelRequest {
                     asset,
                     oid: order.oid,
                 });
             }
         }
+
+        log::debug!("cancel_orders: total cancels = {:?}", cancels);
 
         if !cancels.is_empty() {
             self.exchange_client
