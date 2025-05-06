@@ -1264,12 +1264,23 @@ impl DexConnector for HyperliquidConnector {
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
         let open_orders = self.get_orders().await?;
-        let order_ids: Vec<String> = open_orders
+        let order_ids = open_orders
             .iter()
-            .filter(|order| {
-                symbol.as_deref() == Some(&format!("{}-USD", order.coin)) || symbol.is_none()
+            .filter_map(|order| {
+                let external_sym = if let Ok(idx) = order.coin.parse::<usize>() {
+                    self.spot_reverse_map
+                        .get(&idx)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{}-USD", order.coin))
+                } else {
+                    format!("{}-USD", order.coin)
+                };
+                if symbol.as_deref().map_or(true, |s| s == &external_sym) {
+                    Some(order.oid.to_string())
+                } else {
+                    None
+                }
             })
-            .map(|order| order.oid.to_string())
             .collect();
 
         self.cancel_orders(symbol, order_ids).await
@@ -1281,38 +1292,55 @@ impl DexConnector for HyperliquidConnector {
         order_ids: Vec<String>,
     ) -> Result<(), DexError> {
         let open_orders = self.get_orders().await?;
-
         let mut cancels = Vec::new();
+
         for order in open_orders {
-            let order_symbol = format!("{}-USD", order.coin);
-            if (symbol.as_deref() == Some(&order_symbol) || symbol.is_none())
+            let external_sym = if let Ok(idx) = order.coin.parse::<usize>() {
+                self.spot_reverse_map
+                    .get(&idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}-USD", order.coin))
+            } else {
+                format!("{}-USD", order.coin)
+            };
+
+            if symbol.as_deref().map_or(true, |s| s == &external_sym)
                 && order_ids.contains(&order.oid.to_string())
             {
+                let asset = resolve_coin(&external_sym, &self.spot_index_map);
                 cancels.push(ClientCancelRequest {
-                    asset: Self::extract_asset_name(&order_symbol).to_owned(),
+                    asset,
                     oid: order.oid,
                 });
             }
         }
 
         if !cancels.is_empty() {
-            if let Err(e) = self.exchange_client.bulk_cancel(cancels, None).await {
-                log::error!("cancel_orders: Failed to cancel orders: {:?}", e);
-            }
+            self.exchange_client
+                .bulk_cancel(cancels, None)
+                .await
+                .map_err(|e| DexError::Other(e.to_string()))?;
         }
-
         Ok(())
     }
 
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
         let open_positions = self.get_positions().await?;
-
         log::warn!("close_all_positions: symbol = {:?}", symbol);
 
         for p in open_positions {
             let position = p.position;
-            let order_symbol = format!("{}-USD", position.coin);
-            if symbol.as_deref() == Some(&order_symbol) || symbol.is_none() {
+
+            let external_sym = if let Ok(idx) = position.coin.parse::<usize>() {
+                self.spot_reverse_map
+                    .get(&idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}-USD", position.coin))
+            } else {
+                format!("{}-USD", position.coin)
+            };
+
+            if symbol.as_deref().map_or(true, |s| s == &external_sym) {
                 let reversed_side = if position.szi.is_sign_negative() {
                     OrderSide::Long
                 } else {
@@ -1321,7 +1349,7 @@ impl DexConnector for HyperliquidConnector {
                 let size = position.szi.abs();
 
                 if let Err(e) = self
-                    .create_order(&order_symbol, size, reversed_side, None, None)
+                    .create_order(&external_sym, size, reversed_side, None, None)
                     .await
                 {
                     log::error!("close_all_positions: {:?}", e);
