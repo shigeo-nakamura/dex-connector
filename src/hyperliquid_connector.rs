@@ -1263,36 +1263,27 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
-        log::debug!("cancel_all_orders: {:?}", symbol);
         let open_orders = self.get_orders().await?;
-        let order_ids = open_orders
+        let order_ids: Vec<String> = open_orders
             .iter()
             .filter_map(|order| {
-                let external_sym = if let Ok(idx) = order.coin.parse::<usize>() {
-                    self.spot_reverse_map
-                        .get(&idx)
-                        .cloned()
-                        .unwrap_or_else(|| format!("{}-USD", order.coin))
-                } else {
-                    format!("{}-USD", order.coin)
-                };
+                let idx_opt = order.coin.strip_prefix('@').and_then(|s| s.parse::<usize>().ok());
+                let external_sym = idx_opt
+                    .and_then(|idx| self.spot_reverse_map.get(&idx).cloned())
+                    .unwrap_or_else(|| format!("{}-USD", order.coin));
 
-                log::debug!(
-                    "cancel_all_orders: raw coin = {}, external_sym = {}, target symbol = {:?}",
-                    order.coin,
-                    external_sym,
-                    symbol
-                );
+                    log::debug!(
+                        "cancel_all_orders: raw coin = {}, idx = {:?}, external_sym = {:?}, target = {:?}",
+                        order.coin, idx_opt, external_sym, symbol
+                    );
 
                 if symbol.as_deref().map_or(true, |s| s == &external_sym) {
-                    log::debug!("  → include order_id={}", order.oid);
                     Some(order.oid.to_string())
                 } else {
                     None
                 }
             })
             .collect();
-
         self.cancel_orders(symbol, order_ids).await
     }
 
@@ -1305,39 +1296,29 @@ impl DexConnector for HyperliquidConnector {
         let mut cancels = Vec::new();
 
         for order in open_orders {
-            let external_sym = if let Ok(idx) = order.coin.parse::<usize>() {
-                self.spot_reverse_map
-                    .get(&idx)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}-USD", order.coin))
-            } else {
-                format!("{}-USD", order.coin)
-            };
+            let idx_opt = order
+                .coin
+                .strip_prefix('@')
+                .and_then(|s| s.parse::<usize>().ok());
+            let external_sym = idx_opt
+                .and_then(|idx| self.spot_reverse_map.get(&idx).cloned())
+                .unwrap_or_else(|| format!("{}-USD", order.coin));
 
             log::debug!(
-                "cancel_orders: raw coin = {}, external_sym = {}, requested_ids = {:?}",
-                order.coin,
-                external_sym,
-                order_ids
-            );
+                    "cancel_orders: raw coin = {}, idx = {:?}, external_sym = {:?}, requested_ids = {:?}",
+                    order.coin, idx_opt, external_sym, order_ids
+                );
 
             if symbol.as_deref().map_or(true, |s| s == &external_sym)
                 && order_ids.contains(&order.oid.to_string())
             {
                 let asset = resolve_coin(&external_sym, &self.spot_index_map);
-                log::debug!(
-                    "  → pushing cancel for asset = {}, oid = {}",
-                    asset,
-                    order.oid
-                );
                 cancels.push(ClientCancelRequest {
                     asset,
                     oid: order.oid,
                 });
             }
         }
-
-        log::debug!("cancel_orders: total cancels = {:?}", cancels);
 
         if !cancels.is_empty() {
             self.exchange_client
@@ -1350,20 +1331,15 @@ impl DexConnector for HyperliquidConnector {
 
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
         let open_positions = self.get_positions().await?;
-        log::warn!("close_all_positions: symbol = {:?}", symbol);
-
         for p in open_positions {
             let position = p.position;
-
-            let external_sym = if let Ok(idx) = position.coin.parse::<usize>() {
-                self.spot_reverse_map
-                    .get(&idx)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}-USD", position.coin))
-            } else {
-                format!("{}-USD", position.coin)
-            };
-
+            let idx_opt = position
+                .coin
+                .strip_prefix('@')
+                .and_then(|s| s.parse::<usize>().ok());
+            let external_sym = idx_opt
+                .and_then(|idx| self.spot_reverse_map.get(&idx).cloned())
+                .unwrap_or_else(|| format!("{}-USD", position.coin));
             if symbol.as_deref().map_or(true, |s| s == &external_sym) {
                 let reversed_side = if position.szi.is_sign_negative() {
                     OrderSide::Long
@@ -1371,16 +1347,11 @@ impl DexConnector for HyperliquidConnector {
                     OrderSide::Short
                 };
                 let size = position.szi.abs();
-
-                if let Err(e) = self
+                let _ = self
                     .create_order(&external_sym, size, reversed_side, None, None)
-                    .await
-                {
-                    log::error!("close_all_positions: {:?}", e);
-                }
+                    .await;
             }
         }
-
         Ok(())
     }
 
