@@ -2,11 +2,11 @@ use crate::{
     dex_connector::{slippage_price, string_to_decimal, DexConnector},
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
-    BalanceResponse, CreateOrderResponse, FilledOrder, FilledOrdersResponse, OrderSide,
-    TickerResponse,
+    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CreateOrderResponse, FilledOrder,
+    FilledOrdersResponse, OrderSide, TickerResponse,
 };
-use ::serde::{Deserialize, Serialize};
 use async_trait::async_trait;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use debot_utils::parse_to_decimal;
 use ethers::{signers::LocalWallet, types::H160};
 use futures::{
@@ -17,8 +17,11 @@ use hyperliquid_rust_sdk_fork::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
     ExchangeDataStatus, ExchangeResponseStatus,
 };
-use rust_decimal::prelude::*;
+use reqwest::Client;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -28,19 +31,15 @@ use std::{
     },
     time::Duration,
 };
-use tokio::signal::unix::SignalKind;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
-use tokio::time::sleep;
-use tokio::{net::TcpStream, task::JoinHandle};
-use tokio::{select, signal::unix::signal};
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
-
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use reqwest::Client;
-use serde_json::Value;
+use tokio::{
+    net::TcpStream,
+    select,
+    signal::unix::{signal, SignalKind},
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+    time::sleep,
+};
+use tokio_tungstenite::{tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 
 struct Config {
     evm_wallet_address: String,
@@ -95,6 +94,12 @@ struct TradeResult {
     order_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CancelEvent {
+    pub order_id: String,
+    pub timestamp: u64,
+}
+
 #[derive(Default)]
 struct DynamicMarketInfo {
     pub market_price: Option<Decimal>,
@@ -118,6 +123,21 @@ struct MaintenanceInfo {
     fetched_at: DateTime<Utc>,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct OrderUpdateDetail {
+    pub coin: String,
+    #[serde(rename = "oid")]
+    pub oid: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OrderUpdate {
+    pub order: OrderUpdateDetail,
+    pub status: String,
+    #[serde(rename = "statusTimestamp")]
+    pub status_timestamp: u64,
+}
+
 pub struct HyperliquidConnector {
     config: Config,
     request: DexRequest,
@@ -130,7 +150,7 @@ pub struct HyperliquidConnector {
     task_handle_read_sigterm: Arc<Mutex<Option<JoinHandle<()>>>>,
     // 1st key = symbol, 2nd key = order_id
     trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
-    // key = symbol
+    canceled_results: Arc<RwLock<HashMap<String, HashMap<String, CancelEvent>>>>,
     dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
     static_market_info: HashMap<String, StaticMarketInfo>,
     spot_index_map: HashMap<String, usize>,
@@ -151,6 +171,7 @@ enum WebSocketData {
     UserFillsData(UserFillsData),
     CandleData(CandleData),
     ActiveAssetCtxData(ActiveAssetCtxData),
+    OrderUpdatesData(Vec<OrderUpdate>),
 }
 
 #[derive(Deserialize, Debug)]
@@ -221,36 +242,25 @@ impl<'de> Deserialize<'de> for WebSocketMessage {
             channel: String,
             data: serde_json::Value,
         }
-
         let helper = Helper::deserialize(deserializer)?;
         let data = match helper.channel.as_str() {
-            "allMids" => {
-                let mids_data = AllMidsData::deserialize(helper.data)
-                    .map(WebSocketData::AllMidsData)
-                    .map_err(serde::de::Error::custom)?;
-                mids_data
-            }
-            "userFills" => {
-                let fills_data = UserFillsData::deserialize(helper.data)
-                    .map(WebSocketData::UserFillsData)
-                    .map_err(serde::de::Error::custom)?;
-                fills_data
-            }
-            "candle" => {
-                let candle_data = CandleData::deserialize(helper.data)
-                    .map(WebSocketData::CandleData)
-                    .map_err(serde::de::Error::custom)?;
-                candle_data
-            }
-            "activeAssetCtx" => {
-                let active_asset_ctx_data = ActiveAssetCtxData::deserialize(helper.data)
-                    .map(WebSocketData::ActiveAssetCtxData)
-                    .map_err(serde::de::Error::custom)?;
-                active_asset_ctx_data
-            }
+            "allMids" => AllMidsData::deserialize(helper.data)
+                .map(WebSocketData::AllMidsData)
+                .map_err(serde::de::Error::custom)?,
+            "userFills" => UserFillsData::deserialize(helper.data)
+                .map(WebSocketData::UserFillsData)
+                .map_err(serde::de::Error::custom)?,
+            "orderUpdates" => Vec::<OrderUpdate>::deserialize(helper.data)
+                .map(WebSocketData::OrderUpdatesData)
+                .map_err(serde::de::Error::custom)?,
+            "candle" => CandleData::deserialize(helper.data)
+                .map(WebSocketData::CandleData)
+                .map_err(serde::de::Error::custom)?,
+            "activeAssetCtx" => ActiveAssetCtxData::deserialize(helper.data)
+                .map(WebSocketData::ActiveAssetCtxData)
+                .map_err(serde::de::Error::custom)?,
             _ => return Err(serde::de::Error::custom("unknown channel type")),
         };
-
         Ok(WebSocketMessage {
             _channel: helper.channel,
             data,
@@ -316,6 +326,7 @@ impl HyperliquidConnector {
             request,
             web_socket,
             trade_results: Arc::new(RwLock::new(HashMap::new())),
+            canceled_results: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
             read_socket: Arc::new(Mutex::new(None)),
             write_socket: Arc::new(Mutex::new(None)),
@@ -490,6 +501,7 @@ impl HyperliquidConnector {
         let dmi = self.dynamic_market_info.clone();
         let trs = self.trade_results.clone();
         let rev_map = self.spot_reverse_map.clone();
+        let crs = self.canceled_results.clone();
 
         let reader_handle = tokio::spawn(async move {
             let mut idle_counter = 0;
@@ -509,6 +521,7 @@ impl HyperliquidConnector {
                                         dmi.clone(),
                                         trs.clone(),
                                         rev_map.clone(),
+                                        crs.clone(),
                                     ).await {
                                         log::error!("WebSocket handler error: {:?}", e);
                                         break;
@@ -615,6 +628,15 @@ impl HyperliquidConnector {
         })
         .to_string();
 
+        let order_updates_subscription = serde_json::json!({
+            "method": "subscribe",
+            "subscription": {
+                "type": "orderUpdates",
+                "user": user_address
+            }
+        })
+        .to_string();
+
         let mut write_socket_lock = self.write_socket.lock().await;
 
         if let Some(write_socket) = write_socket_lock.as_mut() {
@@ -624,6 +646,16 @@ impl HyperliquidConnector {
             {
                 return Err(DexError::WebSocketError(format!(
                     "Failed to subscribe to allMids: {}",
+                    e
+                )));
+            }
+
+            if let Err(e) = write_socket
+                .send(Message::Text(order_updates_subscription))
+                .await
+            {
+                return Err(DexError::WebSocketError(format!(
+                    "Failed to subscribe to userFills: {}",
                     e
                 )));
             }
@@ -690,6 +722,7 @@ impl HyperliquidConnector {
         dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
         trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
         spot_reverse_map: Arc<HashMap<usize, String>>,
+        canceled_results: Arc<RwLock<HashMap<String, HashMap<String, CancelEvent>>>>,
     ) -> Result<(), DexError> {
         if let Message::Text(text) = msg {
             for line in text.split('\n') {
@@ -725,11 +758,38 @@ impl HyperliquidConnector {
                             )
                             .await;
                         }
+                        WebSocketData::OrderUpdatesData(ref orders) => {
+                            Self::process_order_updates_message(orders, canceled_results.clone())
+                                .await;
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    async fn process_order_updates_message(
+        orders: &[OrderUpdate],
+        canceled_results: Arc<RwLock<HashMap<String, HashMap<String, CancelEvent>>>>,
+    ) {
+        for upd in orders.iter().filter(|o| o.status == "canceled") {
+            let symbol = if upd.order.coin.contains('/') || upd.order.coin.contains('-') {
+                upd.order.coin.clone()
+            } else {
+                format!("{}-USD", upd.order.coin)
+            };
+            let evt = CancelEvent {
+                order_id: upd.order.oid.to_string(),
+                timestamp: upd.status_timestamp,
+            };
+            canceled_results
+                .write()
+                .await
+                .entry(symbol)
+                .or_default()
+                .insert(evt.order_id.clone(), evt);
+        }
     }
 
     async fn process_all_mids_message(
@@ -1084,6 +1144,20 @@ impl DexConnector for HyperliquidConnector {
         Ok(FilledOrdersResponse { orders: response })
     }
 
+    async fn get_canceled_orders(&self, symbol: &str) -> Result<CanceledOrdersResponse, DexError> {
+        let mut resp = Vec::new();
+        let guard = self.canceled_results.read().await;
+        if let Some(map) = guard.get(symbol) {
+            for (_, evt) in map.iter() {
+                resp.push(CanceledOrder {
+                    order_id: evt.order_id.clone(),
+                    canceled_timestamp: evt.timestamp,
+                });
+            }
+        }
+        Ok(CanceledOrdersResponse { orders: resp })
+    }
+
     async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
         if let Some(pair) = symbol {
             // "UBTC/USDC" → "UBTC"
@@ -1162,9 +1236,27 @@ impl DexConnector for HyperliquidConnector {
         Ok(())
     }
 
-    async fn clear_all_filled_order(&self) -> Result<(), DexError> {
+    async fn clear_all_filled_orders(&self) -> Result<(), DexError> {
         let mut trade_results_guard = self.trade_results.write().await;
         trade_results_guard.clear();
+        Ok(())
+    }
+
+    async fn clear_canceled_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
+        let mut guard = self.canceled_results.write().await;
+        if let Some(map) = guard.get_mut(symbol) {
+            if map.remove(order_id).is_some() {
+                return Ok(());
+            }
+        }
+        Err(DexError::Other(format!(
+            "canceled order {} for {} not found",
+            order_id, symbol
+        )))
+    }
+
+    async fn clear_all_canceled_orders(&self) -> Result<(), DexError> {
+        self.canceled_results.write().await.clear();
         Ok(())
     }
 

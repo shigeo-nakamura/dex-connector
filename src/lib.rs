@@ -62,6 +62,17 @@ pub struct FilledOrdersResponse {
     pub orders: Vec<FilledOrder>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct CanceledOrder {
+    pub order_id: String,
+    pub canceled_timestamp: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CanceledOrdersResponse {
+    pub orders: Vec<CanceledOrder>,
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct BalanceResponse {
     pub equity: Decimal,
