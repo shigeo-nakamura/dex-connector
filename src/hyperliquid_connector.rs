@@ -1373,6 +1373,13 @@ impl DexConnector for HyperliquidConnector {
                         .min_tick
                         .ok_or_else(|| DexError::Other("No min_tick".into()))?;
                     let spread = Decimal::from(spread.unwrap_or(1));
+                    log::debug!(
+                        "bid = {}, ask = {}, tick = {}, spread = {}",
+                        bid,
+                        ask,
+                        tick,
+                        spread
+                    );
                     let calc = if side == OrderSide::Long {
                         bid - tick * spread
                     } else {
