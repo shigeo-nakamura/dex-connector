@@ -102,6 +102,8 @@ pub struct CancelEvent {
 
 #[derive(Default)]
 struct DynamicMarketInfo {
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
     pub market_price: Option<Decimal>,
     pub min_tick: Option<Decimal>,
     pub volume: Option<Decimal>,
@@ -138,6 +140,30 @@ pub struct OrderUpdate {
     pub status_timestamp: u64,
 }
 
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+struct WsLevel {
+    px: String,
+    sz: String,
+    n: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+struct WsBbo {
+    coin: String,
+    time: u64,
+    bbo: [Option<WsLevel>; 2], // [bestBid?, bestAsk?]
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+struct WsBook {
+    coin: String,
+    time: u64,
+    levels: [Vec<WsLevel>; 2], // [bids, asks]
+}
+
 pub struct HyperliquidConnector {
     config: Config,
     request: DexRequest,
@@ -172,6 +198,8 @@ enum WebSocketData {
     CandleData(CandleData),
     ActiveAssetCtxData(ActiveAssetCtxData),
     OrderUpdatesData(Vec<OrderUpdate>),
+    Bbo(WsBbo),
+    L2Book(WsBook),
 }
 
 #[derive(Deserialize, Debug)]
@@ -258,6 +286,12 @@ impl<'de> Deserialize<'de> for WebSocketMessage {
                 .map_err(serde::de::Error::custom)?,
             "activeAssetCtx" => ActiveAssetCtxData::deserialize(helper.data)
                 .map(WebSocketData::ActiveAssetCtxData)
+                .map_err(serde::de::Error::custom)?,
+            "bbo" => WsBbo::deserialize(helper.data)
+                .map(WebSocketData::Bbo)
+                .map_err(serde::de::Error::custom)?,
+            "l2Book" => WsBook::deserialize(helper.data)
+                .map(WebSocketData::L2Book)
                 .map_err(serde::de::Error::custom)?,
             _ => return Err(serde::de::Error::custom("unknown channel type")),
         };
@@ -681,7 +715,6 @@ impl HyperliquidConnector {
                     }
                 })
                 .to_string();
-
                 if let Err(e) = write_socket.send(Message::Text(candle_subscription)).await {
                     return Err(DexError::WebSocketError(format!(
                         "Failed to subscribe to candle for {}: {}",
@@ -697,13 +730,42 @@ impl HyperliquidConnector {
                     }
                 })
                 .to_string();
-
                 if let Err(e) = write_socket
                     .send(Message::Text(active_asset_ctx_subscription))
                     .await
                 {
                     return Err(DexError::WebSocketError(format!(
                         "Failed to subscribe to activeAssetCtx: {}",
+                        e
+                    )));
+                }
+
+                let bbo_subscription = serde_json::json!({
+                    "method": "subscribe",
+                    "subscription": {
+                        "type": "bbo",
+                        "coin": coin
+                    }
+                })
+                .to_string();
+                if let Err(e) = write_socket.send(Message::Text(bbo_subscription)).await {
+                    return Err(DexError::WebSocketError(format!(
+                        "Failed to subscribe to bbo: {}",
+                        e
+                    )));
+                }
+
+                let l2_subscription = serde_json::json!({
+                    "method": "subscribe",
+                    "subscription": {
+                        "type": "l2Book",
+                        "coin": coin
+                    }
+                })
+                .to_string();
+                if let Err(e) = write_socket.send(Message::Text(l2_subscription)).await {
+                    return Err(DexError::WebSocketError(format!(
+                        "Failed to subscribe to l2: {}",
                         e
                     )));
                 }
@@ -761,6 +823,32 @@ impl HyperliquidConnector {
                         WebSocketData::OrderUpdatesData(ref orders) => {
                             Self::process_order_updates_message(orders, canceled_results.clone())
                                 .await;
+                        }
+                        WebSocketData::Bbo(bbo) => {
+                            let key = format!("{}-USD", bbo.coin);
+                            let mut info_map = dynamic_market_info.write().await;
+                            let info = info_map.entry(key).or_default();
+                            info.best_bid = bbo
+                                .bbo
+                                .get(0)
+                                .and_then(|lvl| lvl.as_ref())
+                                .map(|l| Decimal::from_str(&l.px).unwrap());
+                            info.best_ask = bbo
+                                .bbo
+                                .get(1)
+                                .and_then(|lvl| lvl.as_ref())
+                                .map(|l| Decimal::from_str(&l.px).unwrap());
+                        }
+                        WebSocketData::L2Book(book) => {
+                            let key = format!("{}-USD", book.coin);
+                            let mut info_map = dynamic_market_info.write().await;
+                            let info = info_map.entry(key).or_default();
+                            info.best_bid = book.levels[0]
+                                .get(0)
+                                .map(|lvl| Decimal::from_str(&lvl.px).unwrap());
+                            info.best_ask = book.levels[1]
+                                .get(0)
+                                .map(|lvl| Decimal::from_str(&lvl.px).unwrap());
                         }
                     }
                 }
@@ -1269,7 +1357,32 @@ impl DexConnector for HyperliquidConnector {
         spread: Option<i64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let (price, time_in_force) = match price {
-            Some(v) => (v, "Alo"),
+            Some(v) => {
+                if v.is_zero() {
+                    let map = self.dynamic_market_info.read().await;
+                    let info = map
+                        .get(symbol)
+                        .ok_or_else(|| DexError::Other(format!("No market info for {}", symbol)))?;
+                    let bid = info
+                        .best_bid
+                        .ok_or_else(|| DexError::Other("No best_bid".into()))?;
+                    let ask = info
+                        .best_ask
+                        .ok_or_else(|| DexError::Other("No best_ask".into()))?;
+                    let tick = info
+                        .min_tick
+                        .ok_or_else(|| DexError::Other("No min_tick".into()))?;
+                    let spread = Decimal::from(spread.unwrap_or(1));
+                    let calc = if side == OrderSide::Long {
+                        bid - tick * spread
+                    } else {
+                        ask + tick * spread
+                    };
+                    (calc, "Alo")
+                } else {
+                    (v, "Alo")
+                }
+            }
             None => {
                 let price = self.get_worst_price(symbol, &side).await?;
                 (price, "Ioc")
