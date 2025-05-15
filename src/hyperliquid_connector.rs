@@ -1358,7 +1358,7 @@ impl DexConnector for HyperliquidConnector {
     ) -> Result<CreateOrderResponse, DexError> {
         let (price, time_in_force) = match price {
             Some(v) => {
-                if v.is_zero() {
+                if spread.is_some() {
                     let map = self.dynamic_market_info.read().await;
                     let info = map
                         .get(symbol)
@@ -1372,7 +1372,7 @@ impl DexConnector for HyperliquidConnector {
                     let tick = info
                         .min_tick
                         .ok_or_else(|| DexError::Other("No min_tick".into()))?;
-                    let spread = Decimal::from(spread.unwrap_or(1));
+                    let spread = Decimal::from(spread.unwrap());
                     log::debug!(
                         "bid = {}, ask = {}, tick = {}, spread = {}",
                         bid,
@@ -1404,7 +1404,7 @@ impl DexConnector for HyperliquidConnector {
             .min_tick
             .ok_or_else(|| DexError::Other("Min tick not set for market".to_string()))?;
 
-        let rounded_price = Self::round_price(price, min_tick, side.clone(), spread);
+        let rounded_price = Self::round_price(price, min_tick, side.clone());
         let rounded_size = self.floor_size(size, symbol);
 
         log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
@@ -1700,24 +1700,15 @@ impl HyperliquidConnector {
         Decimal::new(1, scale as u32)
     }
 
-    fn round_price(
-        price: Decimal,
-        min_tick: Decimal,
-        order_side: OrderSide,
-        spread: Option<i64>,
-    ) -> Decimal {
+    fn round_price(price: Decimal, min_tick: Decimal, order_side: OrderSide) -> Decimal {
         if min_tick.is_zero() {
             log::error!("round_price: min_tick is zero");
             return price;
         }
-        let spread = match spread {
-            Some(v) => Decimal::new(v, 0),
-            None => Decimal::ZERO,
-        };
 
         match order_side {
-            OrderSide::Long => (price / min_tick - spread).floor() * min_tick,
-            OrderSide::Short => (price / min_tick + spread).ceil() * min_tick,
+            OrderSide::Long => (price / min_tick).floor() * min_tick,
+            OrderSide::Short => (price / min_tick).ceil() * min_tick,
         }
     }
 
