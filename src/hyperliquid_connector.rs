@@ -1369,21 +1369,23 @@ impl DexConnector for HyperliquidConnector {
                     let ask = info
                         .best_ask
                         .ok_or_else(|| DexError::Other("No best_ask".into()))?;
+                    let mid = (bid + ask) * Decimal::new(5, 1);
                     let tick = info
                         .min_tick
                         .ok_or_else(|| DexError::Other("No min_tick".into()))?;
                     let spread = Decimal::from(spread.unwrap());
                     log::debug!(
-                        "bid = {}, ask = {}, tick = {}, spread = {}",
+                        "bid = {}, min = {}, ask = {}, tick = {}, spread = {}",
                         bid,
+                        mid,
                         ask,
                         tick,
                         spread
                     );
                     let calc = if side == OrderSide::Long {
-                        bid - tick * spread
+                        mid - tick * spread
                     } else {
-                        ask + tick * spread
+                        mid + tick * spread
                     };
                     (calc, "Alo")
                 } else {
