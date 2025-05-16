@@ -892,7 +892,7 @@ impl HyperliquidConnector {
                     .ok()
                     .and_then(|idx| spot_reverse_map.get(&idx).cloned())
                     .unwrap_or_else(|| {
-                        log::debug!(
+                        log::trace!(
                             "in spot_reverse_map {} is missing (@{})",
                             raw_coin,
                             stripped
@@ -931,7 +931,7 @@ impl HyperliquidConnector {
                 .ok()
                 .and_then(|idx| spot_reverse_map.get(&idx).cloned())
                 .unwrap_or_else(|| {
-                    log::debug!(
+                    log::trace!(
                         "in spot_reverse_map: {} is missing (@{})",
                         candle.s,
                         stripped
@@ -965,7 +965,7 @@ impl HyperliquidConnector {
                 .ok()
                 .and_then(|idx| spot_reverse_map.get(&idx).cloned())
                 .unwrap_or_else(|| {
-                    log::debug!(
+                    log::trace!(
                         "in spot_reverse_map {} is missing (@{})",
                         asset_data.coin,
                         stripped
