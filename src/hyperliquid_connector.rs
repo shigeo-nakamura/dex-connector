@@ -113,6 +113,7 @@ struct DynamicMarketInfo {
     pub oracle_price: Option<Decimal>,
 }
 
+#[derive(Clone)]
 struct StaticMarketInfo {
     pub decimals: u32,
     pub _max_leverage: u32,
@@ -536,6 +537,7 @@ impl HyperliquidConnector {
         let trs = self.trade_results.clone();
         let rev_map = self.spot_reverse_map.clone();
         let crs = self.canceled_results.clone();
+        let static_info = self.static_market_info.clone();
 
         let reader_handle = tokio::spawn(async move {
             let mut idle_counter = 0;
@@ -556,6 +558,7 @@ impl HyperliquidConnector {
                                         trs.clone(),
                                         rev_map.clone(),
                                         crs.clone(),
+                                        static_info.clone(),
                                     ).await {
                                         log::error!("WebSocket handler error: {:?}", e);
                                         break;
@@ -785,6 +788,7 @@ impl HyperliquidConnector {
         trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
         spot_reverse_map: Arc<HashMap<usize, String>>,
         canceled_results: Arc<RwLock<HashMap<String, HashMap<String, CancelEvent>>>>,
+        static_market_info: HashMap<String, StaticMarketInfo>,
     ) -> Result<(), DexError> {
         if let Message::Text(text) = msg {
             for line in text.split('\n') {
@@ -798,6 +802,7 @@ impl HyperliquidConnector {
                                 data,
                                 dynamic_market_info.clone(),
                                 spot_reverse_map.clone(),
+                                &static_market_info,
                             )
                             .await;
                         }
@@ -884,6 +889,7 @@ impl HyperliquidConnector {
         mids_data: &AllMidsData,
         dynamic_market_info: Arc<RwLock<HashMap<String, DynamicMarketInfo>>>,
         spot_reverse_map: Arc<HashMap<usize, String>>,
+        static_market_info: &HashMap<String, StaticMarketInfo>,
     ) {
         for (raw_coin, mid_price_str) in &mids_data.mids {
             let coin = if let Some(stripped) = raw_coin.strip_prefix('@') {
@@ -913,7 +919,12 @@ impl HyperliquidConnector {
                 let mut guard = dynamic_market_info.write().await;
                 let info = guard.entry(market_key.clone()).or_default();
                 if info.min_tick.is_none() {
-                    info.min_tick = Some(Self::calculate_min_tick(mid));
+                    let sz = static_market_info
+                        .get(&market_key)
+                        .map(|m| m.decimals)
+                        .unwrap_or(0);
+                    let is_spot = market_key.contains('/');
+                    info.min_tick = Some(Self::calculate_min_tick(sz, is_spot));
                 }
                 info.market_price = Some(mid);
             }
@@ -1688,18 +1699,10 @@ impl HyperliquidConnector {
         }
     }
 
-    fn calculate_min_tick(price: Decimal) -> Decimal {
-        let price_str = price.to_string();
-        let parts: Vec<&str> = price_str.split('.').collect();
-        let integer_part = parts[0];
-
-        if integer_part.len() >= 5 {
-            return Decimal::ONE;
-        }
-
-        let scale = 5 - integer_part.len();
-
-        Decimal::new(1, scale as u32)
+    fn calculate_min_tick(sz_decimals: u32, is_spot: bool) -> Decimal {
+        let max_decimals: u32 = if is_spot { 8 } else { 6 };
+        let price_decimals = max_decimals.saturating_sub(sz_decimals);
+        Decimal::new(1, price_decimals)
     }
 
     fn round_price(price: Decimal, min_tick: Decimal, order_side: OrderSide) -> Decimal {
