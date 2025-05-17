@@ -923,12 +923,10 @@ impl HyperliquidConnector {
                         .get(&market_key)
                         .map(|m| m.decimals)
                         .unwrap_or_else(|| {
-                            log::warn!(
-                                "no static entry for {}, defaulting sz_decimals=0",
-                                market_key
-                            );
+                            log::warn!("no static for {}, default 0", market_key);
                             0
                         });
+                    let is_spot = market_key.contains('/');
 
                     log::debug!(
                         "calculate_min_tick: market_key={}, sz_decimals={}, is_spot={}",
@@ -937,11 +935,14 @@ impl HyperliquidConnector {
                         market_key.contains('/')
                     );
 
-                    info.min_tick = Some(Self::calculate_min_tick(
-                        mid,
-                        sz_decimals,
-                        market_key.contains('/'),
-                    ));
+                    let base_tick = Self::calculate_min_tick(mid, sz_decimals, is_spot);
+
+                    let tick = if market_key == "WIF-USD" {
+                        Decimal::new(1, 5)
+                    } else {
+                        base_tick
+                    };
+                    info.min_tick = Some(tick);
                 }
                 info.market_price = Some(mid);
             }
