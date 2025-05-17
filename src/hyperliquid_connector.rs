@@ -938,6 +938,7 @@ impl HyperliquidConnector {
                     );
 
                     info.min_tick = Some(Self::calculate_min_tick(
+                        mid,
                         sz_decimals,
                         market_key.contains('/'),
                     ));
@@ -1715,9 +1716,22 @@ impl HyperliquidConnector {
         }
     }
 
-    fn calculate_min_tick(sz_decimals: u32, is_spot: bool) -> Decimal {
+    fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decimal {
+        let price_str = price.to_string();
+        let integer_part = price_str.split('.').next().unwrap_or("");
+
+        let scale_by_sig: u32 = if integer_part.len() >= 5 {
+            0
+        } else {
+            (5 - integer_part.len()) as u32
+        };
+
         let max_decimals: u32 = if is_spot { 8 } else { 6 };
-        let scale = max_decimals.saturating_sub(sz_decimals);
+        let scale_by_dec = max_decimals.saturating_sub(sz_decimals);
+
+        let scale = scale_by_sig.min(scale_by_dec);
+
+        // 10^(-scale)
         Decimal::new(1, scale)
     }
 
