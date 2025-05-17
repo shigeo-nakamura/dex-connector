@@ -919,12 +919,28 @@ impl HyperliquidConnector {
                 let mut guard = dynamic_market_info.write().await;
                 let info = guard.entry(market_key.clone()).or_default();
                 if info.min_tick.is_none() {
-                    let sz = static_market_info
+                    let sz_decimals = static_market_info
                         .get(&market_key)
                         .map(|m| m.decimals)
-                        .unwrap_or(0);
-                    let is_spot = market_key.contains('/');
-                    info.min_tick = Some(Self::calculate_min_tick(mid, sz, is_spot));
+                        .unwrap_or_else(|| {
+                            log::warn!(
+                                "no static entry for {}, defaulting sz_decimals=0",
+                                market_key
+                            );
+                            0
+                        });
+
+                    log::debug!(
+                        "calculate_min_tick: market_key={}, sz_decimals={}, is_spot={}",
+                        market_key,
+                        sz_decimals,
+                        market_key.contains('/')
+                    );
+
+                    info.min_tick = Some(Self::calculate_min_tick(
+                        sz_decimals,
+                        market_key.contains('/'),
+                    ));
                 }
                 info.market_price = Some(mid);
             }
@@ -1699,20 +1715,9 @@ impl HyperliquidConnector {
         }
     }
 
-    fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decimal {
-        let price_str = price.to_string();
-        let integer_part = price_str.split('.').next().unwrap_or("");
-        let scale_by_sig: u32 = if integer_part.len() >= 5 {
-            0
-        } else {
-            (5 - integer_part.len()) as u32
-        };
-
+    fn calculate_min_tick(sz_decimals: u32, is_spot: bool) -> Decimal {
         let max_decimals: u32 = if is_spot { 8 } else { 6 };
-        let scale_by_dec: u32 = max_decimals.saturating_sub(sz_decimals);
-
-        let scale: u32 = scale_by_sig.min(scale_by_dec);
-
+        let scale = max_decimals.saturating_sub(sz_decimals);
         Decimal::new(1, scale)
     }
 
