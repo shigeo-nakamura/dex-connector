@@ -92,6 +92,7 @@ struct TradeResult {
     pub filled_value: Decimal,
     pub filled_fee: Decimal,
     order_id: String,
+    pub is_rejected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -826,8 +827,12 @@ impl HyperliquidConnector {
                             .await;
                         }
                         WebSocketData::OrderUpdatesData(ref orders) => {
-                            Self::process_order_updates_message(orders, canceled_results.clone())
-                                .await;
+                            Self::process_order_updates_message(
+                                orders,
+                                canceled_results.clone(),
+                                trade_results.clone(),
+                            )
+                            .await;
                         }
                         WebSocketData::Bbo(bbo) => {
                             let key = format!("{}-USD", bbo.coin);
@@ -865,23 +870,45 @@ impl HyperliquidConnector {
     async fn process_order_updates_message(
         orders: &[OrderUpdate],
         canceled_results: Arc<RwLock<HashMap<String, HashMap<String, CancelEvent>>>>,
+        trade_results: Arc<RwLock<HashMap<String, HashMap<String, TradeResult>>>>,
     ) {
-        for upd in orders.iter().filter(|o| o.status == "canceled") {
+        for upd in orders.iter() {
             let symbol = if upd.order.coin.contains('/') || upd.order.coin.contains('-') {
                 upd.order.coin.clone()
             } else {
                 format!("{}-USD", upd.order.coin)
             };
-            let evt = CancelEvent {
-                order_id: upd.order.oid.to_string(),
-                timestamp: upd.status_timestamp,
-            };
-            canceled_results
-                .write()
-                .await
-                .entry(symbol)
-                .or_default()
-                .insert(evt.order_id.clone(), evt);
+
+            match upd.status.as_str() {
+                "canceled" => {
+                    let evt = CancelEvent {
+                        order_id: upd.order.oid.to_string(),
+                        timestamp: upd.status_timestamp,
+                    };
+                    canceled_results
+                        .write()
+                        .await
+                        .entry(symbol)
+                        .or_default()
+                        .insert(evt.order_id.clone(), evt);
+                }
+                "rejected" => {
+                    let mut trs = trade_results.write().await;
+                    let entry = trs.entry(symbol).or_default();
+                    entry.insert(
+                        upd.order.oid.to_string(),
+                        TradeResult {
+                            filled_side: OrderSide::Long,
+                            filled_size: Decimal::ZERO,
+                            filled_value: Decimal::ZERO,
+                            filled_fee: Decimal::ZERO,
+                            order_id: upd.order.oid.to_string(),
+                            is_rejected: true,
+                        },
+                    );
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1052,6 +1079,7 @@ impl HyperliquidConnector {
                 filled_value,
                 filled_fee,
                 order_id: order_id.to_string(),
+                is_rejected: false,
             };
 
             let mut trade_results_guard = trade_results.write().await;
@@ -1249,7 +1277,7 @@ impl DexConnector for HyperliquidConnector {
             let filled_order = FilledOrder {
                 order_id: order.order_id.clone(),
                 trade_id: trade_id.clone(),
-                is_rejected: false,
+                is_rejected: order.is_rejected,
                 filled_side: Some(order.filled_side.clone()),
                 filled_size: Some(order.filled_size),
                 filled_fee: Some(order.filled_fee),
