@@ -1734,7 +1734,7 @@ impl HyperliquidConnector {
     /// 最小ティックサイズを決定します
     fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decimal {
         // まずは引数をログ出力
-        log::debug!(
+        log::trace!(
             "calculate_min_tick called: price={}, sz_decimals={}, is_spot={}",
             price,
             sz_decimals,
@@ -1765,7 +1765,7 @@ impl HyperliquidConnector {
         let scale: u32 = scale_by_sig.min(scale_by_dec);
 
         // 中間値をログ出力
-        log::debug!(
+        log::trace!(
             "calculate_min_tick internals: integer_digits={}, scale_by_sig={}, max_decimals={}, scale_by_dec={}, scale={}",
             integer_digits,
             scale_by_sig,
@@ -1778,7 +1778,7 @@ impl HyperliquidConnector {
         let min_tick = Decimal::new(1, scale);
 
         // 結果をログ出力
-        log::debug!(
+        log::trace!(
             "calculate_min_tick result: min_tick={}, (1e-{})",
             min_tick,
             scale
