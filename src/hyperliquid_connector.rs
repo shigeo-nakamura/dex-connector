@@ -955,13 +955,6 @@ impl HyperliquidConnector {
                         });
                     let is_spot = market_key.contains('/');
 
-                    log::debug!(
-                        "calculate_min_tick: market_key={}, sz_decimals={}, is_spot={}",
-                        market_key,
-                        sz_decimals,
-                        market_key.contains('/')
-                    );
-
                     let base_tick = Self::calculate_min_tick(mid, sz_decimals, is_spot);
                     info.min_tick = Some(base_tick);
                 }
@@ -1739,38 +1732,61 @@ impl HyperliquidConnector {
         }
     }
 
-    /// price: 例 0.9, 1.23, 123.45 など
-    /// sz_decimals: サイズの小数桁数 (トークン固有)
-    /// is_spot: スポット市場なら true、先物なら false
+    /// 価格 price, サイズ小数点数 sz_decimals, スポットかどうか is_spot から
+    /// 最小ティックサイズを決定します
     fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decimal {
-        // 文字列にして小数点前部分を取り出す
+        // まずは引数をログ出力
+        log::debug!(
+            "calculate_min_tick called: price={}, sz_decimals={}, is_spot={}",
+            price,
+            sz_decimals,
+            is_spot
+        );
+
+        // 文字列化して小数点前の桁数を数える
         let price_str = price.to_string();
         let integer_part = price_str.split('.').next().unwrap_or("");
-
-        // ここで "0" は長さ 0 とみなす
         let integer_digits = if integer_part == "0" {
             0
         } else {
             integer_part.len()
         };
 
-        // 価格の桁幅に応じて、最大 5 桁まで有効数字を残す
-        // 5桁以上なら 0、未満なら (5 - 桁数)
+        // 有効数字5桁ルール
         let scale_by_sig: u32 = if integer_digits >= 5 {
             0
         } else {
             (5 - integer_digits) as u32
         };
 
-        // 最大小数桁 (スポット:8、先物:6) からトークンのサイズ小数桁を引く
-        let max_decimals: u32 = if is_spot { 8 } else { 6 };
+        // スポットなら最大8桁、先物(perp)なら最大6桁
+        let max_decimals: u32 = if is_spot { 8u32 } else { 6u32 };
+        // sz_decimals を引く（オーバーフローしない saturating_sub）
         let scale_by_dec: u32 = max_decimals.saturating_sub(sz_decimals);
+        // 最終的な桁数は両方の最小
+        let scale: u32 = scale_by_sig.min(scale_by_dec);
 
-        // 実際に使う小数桁は両者のうち小さい方
-        let scale = scale_by_sig.min(scale_by_dec);
+        // 中間値をログ出力
+        log::debug!(
+            "calculate_min_tick internals: integer_digits={}, scale_by_sig={}, max_decimals={}, scale_by_dec={}, scale={}",
+            integer_digits,
+            scale_by_sig,
+            max_decimals,
+            scale_by_dec,
+            scale
+        );
 
-        // 10^-scale
-        Decimal::new(1, scale)
+        // 10^(-scale)
+        let min_tick = Decimal::new(1, scale);
+
+        // 結果をログ出力
+        log::debug!(
+            "calculate_min_tick result: min_tick={}, (1e-{})",
+            min_tick,
+            scale
+        );
+
+        min_tick
     }
 
     fn round_price(price: Decimal, min_tick: Decimal, order_side: OrderSide) -> Decimal {
