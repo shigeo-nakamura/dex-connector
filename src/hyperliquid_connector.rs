@@ -945,19 +945,17 @@ impl HyperliquidConnector {
             if let Ok(mid) = string_to_decimal(Some(mid_price_str.clone())) {
                 let mut guard = dynamic_market_info.write().await;
                 let info = guard.entry(market_key.clone()).or_default();
-                if info.min_tick.is_none() {
-                    let sz_decimals = static_market_info
-                        .get(&market_key)
-                        .map(|m| m.decimals)
-                        .unwrap_or_else(|| {
-                            log::warn!("no static for {}, default 0", market_key);
-                            0
-                        });
-                    let is_spot = market_key.contains('/');
+                let sz_decimals = static_market_info
+                    .get(&market_key)
+                    .map(|m| m.decimals)
+                    .unwrap_or_else(|| {
+                        log::warn!("no static for {}, default 0", market_key);
+                        0
+                    });
+                let is_spot = market_key.contains('/');
 
-                    let base_tick = Self::calculate_min_tick(mid, sz_decimals, is_spot);
-                    info.min_tick = Some(base_tick);
-                }
+                let base_tick = Self::calculate_min_tick(mid, sz_decimals, is_spot);
+                info.min_tick = Some(base_tick);
                 info.market_price = Some(mid);
             }
         }
