@@ -949,7 +949,7 @@ impl HyperliquidConnector {
                     .get(&market_key)
                     .map(|m| m.decimals)
                     .unwrap_or_else(|| {
-                        log::warn!("no static for {}, default 0", market_key);
+                        log::trace!("no static for {}, default 0", market_key);
                         0
                     });
                 let is_spot = market_key.contains('/');
