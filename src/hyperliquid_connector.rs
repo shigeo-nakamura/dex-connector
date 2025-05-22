@@ -185,6 +185,7 @@ pub struct HyperliquidConnector {
     spot_reverse_map: Arc<HashMap<usize, String>>,
     exchange_client: ExchangeClient,
     maintenance: Arc<RwLock<MaintenanceInfo>>,
+    last_volumes: Arc<Mutex<HashMap<String, Decimal>>>,
 }
 
 #[derive(Debug)]
@@ -377,6 +378,7 @@ impl HyperliquidConnector {
                 next_start: None,
                 fetched_at: Utc::now() - ChronoDuration::hours(1),
             })),
+            last_volumes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         instance.spawn_maintenance_watcher();
@@ -1232,18 +1234,29 @@ impl DexConnector for HyperliquidConnector {
             .market_price
             .ok_or_else(|| DexError::Other("No price available".to_string()))?;
         let min_tick = dynamic_info.min_tick;
-        let volume = dynamic_info.volume;
         let num_trades = dynamic_info.num_trades;
         let funding_rate = dynamic_info.funding_rate;
         let open_interest = dynamic_info.open_interest;
         let oracle_price = dynamic_info.oracle_price;
+
+        let cur_vol = dynamic_info.volume.unwrap_or(Decimal::ZERO);
+        let mut lv = self.last_volumes.lock().await;
+        let prev_vol = lv.get(symbol).cloned().unwrap_or(Decimal::ZERO);
+        // make sure we never return a negative delta if cur_vol resets each candle
+        let delta_vol = if cur_vol >= prev_vol {
+            cur_vol - prev_vol
+        } else {
+            // volume counter has rolled over/reset at candle boundary
+            cur_vol
+        };
+        lv.insert(symbol.to_string(), cur_vol);
 
         Ok(TickerResponse {
             symbol: symbol.to_owned(),
             price,
             min_tick,
             min_order: None,
-            volume,
+            volume: Some(delta_vol),
             num_trades,
             funding_rate,
             open_interest,
@@ -1730,10 +1743,7 @@ impl HyperliquidConnector {
         }
     }
 
-    /// 価格 price, サイズ小数点数 sz_decimals, スポットかどうか is_spot から
-    /// 最小ティックサイズを決定します
     fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decimal {
-        // まずは引数をログ出力
         log::trace!(
             "calculate_min_tick called: price={}, sz_decimals={}, is_spot={}",
             price,
@@ -1741,7 +1751,6 @@ impl HyperliquidConnector {
             is_spot
         );
 
-        // 文字列化して小数点前の桁数を数える
         let price_str = price.to_string();
         let integer_part = price_str.split('.').next().unwrap_or("");
         let integer_digits = if integer_part == "0" {
@@ -1750,21 +1759,16 @@ impl HyperliquidConnector {
             integer_part.len()
         };
 
-        // 有効数字5桁ルール
         let scale_by_sig: u32 = if integer_digits >= 5 {
             0
         } else {
             (5 - integer_digits) as u32
         };
 
-        // スポットなら最大8桁、先物(perp)なら最大6桁
         let max_decimals: u32 = if is_spot { 8u32 } else { 6u32 };
-        // sz_decimals を引く（オーバーフローしない saturating_sub）
         let scale_by_dec: u32 = max_decimals.saturating_sub(sz_decimals);
-        // 最終的な桁数は両方の最小
         let scale: u32 = scale_by_sig.min(scale_by_dec);
 
-        // 中間値をログ出力
         log::trace!(
             "calculate_min_tick internals: integer_digits={}, scale_by_sig={}, max_decimals={}, scale_by_dec={}, scale={}",
             integer_digits,
@@ -1774,10 +1778,8 @@ impl HyperliquidConnector {
             scale
         );
 
-        // 10^(-scale)
         let min_tick = Decimal::new(1, scale);
 
-        // 結果をログ出力
         log::trace!(
             "calculate_min_tick result: min_tick={}, (1e-{})",
             min_tick,
