@@ -39,7 +39,11 @@ pub trait DexConnector: Send + Sync {
 
     async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), DexError>;
 
-    async fn get_ticker(&self, symbol: &str) -> Result<TickerResponse, DexError>;
+    async fn get_ticker(
+        &self,
+        symbol: &str,
+        test_price: Option<Decimal>,
+    ) -> Result<TickerResponse, DexError>;
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError>;
 
