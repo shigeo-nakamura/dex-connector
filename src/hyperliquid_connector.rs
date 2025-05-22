@@ -1217,11 +1217,7 @@ impl DexConnector for HyperliquidConnector {
         Ok(())
     }
 
-    async fn get_ticker(
-        &self,
-        symbol: &str,
-        _test_price: Option<Decimal>,
-    ) -> Result<TickerResponse, DexError> {
+    async fn get_ticker(&self, symbol: &str) -> Result<TickerResponse, DexError> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(DexError::NoConnection);
         }
