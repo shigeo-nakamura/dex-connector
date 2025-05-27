@@ -1147,7 +1147,7 @@ struct HyperliquidSpotBalance {
 impl DexConnector for HyperliquidConnector {
     async fn start(&self) -> Result<(), DexError> {
         self.start_web_socket().await?;
-        sleep(Duration::from_secs(5)).await;
+        self.wait_for_market_ready(60).await?;
         Ok(())
     }
 
@@ -1815,6 +1815,46 @@ impl HyperliquidConnector {
 
     fn extract_asset_name(symbol: &str) -> &str {
         symbol.split('-').next().unwrap_or(symbol)
+    }
+
+    /// Wait until best_bid and best_ask are available for all configured symbols
+    async fn wait_for_market_ready(&self, timeout_secs: u64) -> Result<(), DexError> {
+        use tokio::time::{sleep, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+        loop {
+            let mut all_ready = true;
+            {
+                let map = self.dynamic_market_info.read().await;
+                for symbol in &self.config.symbol_list {
+                    if let Some(info) = map.get(symbol) {
+                        if info.best_bid.is_none() || info.best_ask.is_none() {
+                            log::info!("Waiting for best_bid/best_ask for symbol: {}", symbol);
+                            all_ready = false;
+                            break;
+                        }
+                    } else {
+                        log::info!("Market info not found yet for symbol: {}", symbol);
+                        all_ready = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_ready {
+                log::info!("All symbols are market-ready.");
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(DexError::Other(
+                    "Timed out waiting for market data".to_string(),
+                ));
+            }
+
+            sleep(Duration::from_millis(200)).await;
+        }
     }
 }
 
