@@ -799,6 +799,21 @@ impl HyperliquidConnector {
                     continue;
                 }
                 if let Ok(message) = serde_json::from_str::<WebSocketMessage>(line) {
+                    log::trace!("[WebSocketMessage] channel = {}", message._channel);
+
+                    match &message.data {
+                        WebSocketData::Bbo(bbo) => {
+                            log::trace!("[WebSocketMessage] BBO coin = {}", bbo.coin);
+                        }
+                        WebSocketData::L2Book(book) => {
+                            log::trace!("[WebSocketMessage] L2Book coin = {}", book.coin);
+                        }
+                        WebSocketData::AllMidsData(data) => {
+                            log::trace!("[WebSocketMessage] allMids keys = {:?}", data.mids.keys());
+                        }
+                        _ => {}
+                    }
+
                     match message.data {
                         WebSocketData::AllMidsData(ref data) => {
                             Self::process_all_mids_message(
@@ -836,10 +851,22 @@ impl HyperliquidConnector {
                             )
                             .await;
                         }
-                        WebSocketData::Bbo(bbo) => {
-                            let key = format!("{}-USD", bbo.coin);
+                        WebSocketData::Bbo(ref bbo) => {
+                            // "@123" → 123 → "UBTC/USDC"
+                            let idx = bbo
+                                .coin
+                                .strip_prefix('@')
+                                .and_then(|s| s.parse::<usize>().ok());
+                            let coin = idx
+                                .and_then(|i| spot_reverse_map.get(&i).cloned())
+                                .unwrap_or_else(|| bbo.coin.clone());
+                            let market_key = if coin.contains('/') {
+                                coin.clone()
+                            } else {
+                                format!("{}-USD", coin)
+                            };
                             let mut info_map = dynamic_market_info.write().await;
-                            let info = info_map.entry(key).or_default();
+                            let info = info_map.entry(market_key).or_default();
                             info.best_bid = bbo
                                 .bbo
                                 .get(0)
@@ -851,10 +878,21 @@ impl HyperliquidConnector {
                                 .and_then(|lvl| lvl.as_ref())
                                 .map(|l| Decimal::from_str(&l.px).unwrap());
                         }
-                        WebSocketData::L2Book(book) => {
-                            let key = format!("{}-USD", book.coin);
+                        WebSocketData::L2Book(ref book) => {
+                            let idx = book
+                                .coin
+                                .strip_prefix('@')
+                                .and_then(|s| s.parse::<usize>().ok());
+                            let coin = idx
+                                .and_then(|i| spot_reverse_map.get(&i).cloned())
+                                .unwrap_or_else(|| book.coin.clone());
+                            let market_key = if coin.contains('/') {
+                                coin.clone()
+                            } else {
+                                format!("{}-USD", coin)
+                            };
                             let mut info_map = dynamic_market_info.write().await;
-                            let info = info_map.entry(key).or_default();
+                            let info = info_map.entry(market_key).or_default();
                             info.best_bid = book.levels[0]
                                 .get(0)
                                 .map(|lvl| Decimal::from_str(&lvl.px).unwrap());
@@ -922,18 +960,23 @@ impl HyperliquidConnector {
     ) {
         for (raw_coin, mid_price_str) in &mids_data.mids {
             let coin = if let Some(stripped) = raw_coin.strip_prefix('@') {
-                stripped
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|idx| spot_reverse_map.get(&idx).cloned())
-                    .unwrap_or_else(|| {
+                let idx = stripped.parse::<usize>().unwrap_or_else(|_| {
+                    log::warn!("[resolve_coin] invalid @index: {}", stripped);
+                    0
+                });
+
+                let mapped = spot_reverse_map.get(&idx).cloned();
+                match mapped {
+                    Some(mapped) => mapped,
+                    None => {
                         log::trace!(
-                            "in spot_reverse_map {} is missing (@{})",
+                            "[resolve_coin] spot_reverse_map missing: {} (index: {})",
                             raw_coin,
-                            stripped
+                            idx
                         );
                         raw_coin.clone()
-                    })
+                    }
+                }
             } else {
                 raw_coin.clone()
             };
@@ -1829,6 +1872,12 @@ impl HyperliquidConnector {
                 let map = self.dynamic_market_info.read().await;
                 for symbol in &self.config.symbol_list {
                     if let Some(info) = map.get(symbol) {
+                        log::warn!(
+                            "[wait_for_market_ready] symbol = {}, best_bid = {:?}, best_ask = {:?}",
+                            symbol,
+                            info.best_bid,
+                            info.best_ask
+                        );
                         if info.best_bid.is_none() || info.best_ask.is_none() {
                             log::info!("Waiting for best_bid/best_ask for symbol: {}", symbol);
                             all_ready = false;
