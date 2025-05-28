@@ -12,7 +12,7 @@ pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
 pub use hyperliquid_connector::*;
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
 pub enum OrderSide {
     #[default]
     Long,
