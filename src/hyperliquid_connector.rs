@@ -1190,6 +1190,7 @@ struct HyperliquidSpotBalance {
 impl DexConnector for HyperliquidConnector {
     async fn start(&self) -> Result<(), DexError> {
         self.start_web_socket().await?;
+        sleep(Duration::from_secs(5)).await;
         self.wait_for_market_ready(60).await?;
         Ok(())
     }
