@@ -1454,59 +1454,47 @@ impl DexConnector for HyperliquidConnector {
         side: OrderSide,
         price: Option<Decimal>,
         spread: Option<i64>,
-        maker_worst: Option<bool>,
     ) -> Result<CreateOrderResponse, DexError> {
-        let (price, time_in_force) = if maker_worst.unwrap_or(false) {
-            let map = self.dynamic_market_info.read().await;
-            let info = map
-                .get(symbol)
-                .ok_or_else(|| DexError::Other(format!("No market info for {}", symbol)))?;
-            let bid = info
-                .best_bid
-                .ok_or_else(|| DexError::Other("No best_bid".into()))?;
-            let ask = info
-                .best_ask
-                .ok_or_else(|| DexError::Other("No best_ask".into()))?;
-            let tick = info
-                .min_tick
-                .ok_or_else(|| DexError::Other("No min_tick".into()))?;
-
-            let calc_price = if side == OrderSide::Long {
-                ask - tick
-            } else {
-                bid + tick
-            };
-
-            (calc_price, "Alo")
-        } else if let Some(v) = price {
-            if let Some(spread_ticks) = spread {
-                let map = self.dynamic_market_info.read().await;
-                let info = map
-                    .get(symbol)
-                    .ok_or_else(|| DexError::Other(format!("No market info for {}", symbol)))?;
-                let bid = info
-                    .best_bid
-                    .ok_or_else(|| DexError::Other("No best_bid".into()))?;
-                let ask = info
-                    .best_ask
-                    .ok_or_else(|| DexError::Other("No best_ask".into()))?;
-                let tick = info
-                    .min_tick
-                    .ok_or_else(|| DexError::Other("No min_tick".into()))?;
-                let mid = (bid + ask) * Decimal::new(5, 1);
-                let spread_dec = Decimal::from(spread_ticks);
-                let calc_price = if side == OrderSide::Long {
-                    mid - tick * spread_dec
+        let (price, time_in_force) = match price {
+            Some(v) => {
+                if spread.is_some() {
+                    let map = self.dynamic_market_info.read().await;
+                    let info = map
+                        .get(symbol)
+                        .ok_or_else(|| DexError::Other(format!("No market info for {}", symbol)))?;
+                    let bid = info
+                        .best_bid
+                        .ok_or_else(|| DexError::Other("No best_bid".into()))?;
+                    let ask = info
+                        .best_ask
+                        .ok_or_else(|| DexError::Other("No best_ask".into()))?;
+                    let mid = (bid + ask) * Decimal::new(5, 1);
+                    let tick = info
+                        .min_tick
+                        .ok_or_else(|| DexError::Other("No min_tick".into()))?;
+                    let spread = Decimal::from(spread.unwrap());
+                    log::debug!(
+                        "bid = {}, min = {}, ask = {}, tick = {}, spread = {}",
+                        bid,
+                        mid,
+                        ask,
+                        tick,
+                        spread
+                    );
+                    let calc = if side == OrderSide::Long {
+                        mid - tick * spread
+                    } else {
+                        mid + tick * spread
+                    };
+                    (calc, "Alo")
                 } else {
-                    mid + tick * spread_dec
-                };
-                (calc_price, "Alo")
-            } else {
-                (v, "Alo")
+                    (v, "Alo")
+                }
             }
-        } else {
-            let price = self.get_worst_price(symbol, &side).await?;
-            (price, "Ioc")
+            None => {
+                let price = self.get_worst_price(symbol, &side).await?;
+                (price, "Ioc")
+            }
         };
 
         let dynamic_market_info_guard = self.dynamic_market_info.read().await;
@@ -1669,7 +1657,7 @@ impl DexConnector for HyperliquidConnector {
                 };
                 let size = position.szi.abs();
                 let _ = self
-                    .create_order(&external_sym, size, reversed_side, None, None, None)
+                    .create_order(&external_sym, size, reversed_side, None, None)
                     .await;
             }
         }

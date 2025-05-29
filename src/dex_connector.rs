@@ -64,7 +64,6 @@ pub trait DexConnector: Send + Sync {
         side: OrderSide,
         price: Option<Decimal>,
         spread: Option<i64>,
-        maker_worst: Option<bool>,
     ) -> Result<CreateOrderResponse, DexError>;
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
