@@ -1,7 +1,7 @@
 use std::fmt;
 
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 mod dex_connector;
 mod dex_request;
@@ -89,4 +89,24 @@ pub struct CreateOrderResponse {
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct LastTrade {
     pub price: Decimal,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Trigger {
+    /// If true, executes as a market order once triggered; otherwise limit.
+    pub is_market: bool,
+    /// The price at which the trigger fires.
+    pub trigger_px: String,
+    /// “tp” for take‐profit or “sl” for stop‐loss.
+    pub tpsl: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TpSl {
+    /// Take‐Profit
+    Tp,
+    /// Stop‐Loss
+    Sl,
 }

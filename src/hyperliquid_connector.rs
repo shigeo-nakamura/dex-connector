@@ -3,7 +3,7 @@ use crate::{
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CreateOrderResponse, FilledOrder,
-    FilledOrdersResponse, OrderSide, TickerResponse,
+    FilledOrdersResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -14,8 +14,8 @@ use futures::{
     SinkExt, StreamExt,
 };
 use hyperliquid_rust_sdk_fork::{
-    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
-    ExchangeDataStatus, ExchangeResponseStatus,
+    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
+    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus,
 };
 use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
@@ -1553,6 +1553,83 @@ impl DexConnector for HyperliquidConnector {
             order_id: order_id.to_string(),
             ordered_price: rounded_price,
             ordered_size: rounded_size,
+        })
+    }
+
+    async fn create_trigger_order(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        trigger_px: Decimal,
+        is_market: bool,
+        tpsl: TpSl,
+    ) -> Result<CreateOrderResponse, DexError> {
+        // Resolve the exchange asset code
+        let asset = resolve_coin(symbol, &self.spot_index_map);
+
+        // Convert Decimal to f64, failing if out of range
+        let limit_px = trigger_px
+            .to_f64()
+            .ok_or_else(|| DexError::Other("Failed to convert trigger_px to f64".into()))?;
+        let sz = size
+            .to_f64()
+            .ok_or_else(|| DexError::Other("Failed to convert size to f64".into()))?;
+
+        // Build the ClientOrderRequest with a Trigger type
+        let request = ClientOrderRequest {
+            asset,
+            is_buy: side == OrderSide::Long,
+            reduce_only: false,
+            limit_px,
+            sz,
+            cloid: None,
+            order_type: ClientOrder::Trigger(ClientTrigger {
+                is_market,
+                trigger_px: limit_px,
+                // TpSl enum serialized lowercase: "tp" or "sl"
+                tpsl: format!("{:?}", tpsl).to_lowercase(),
+            }),
+        };
+
+        // Send the order through the exchange client
+        let resp_status = self
+            .exchange_client
+            .order(request, None)
+            .await
+            .map_err(|e| DexError::Other(format!("Order request failed: {}", e)))?;
+
+        // Unwrap the response status
+        let exchange_response = match resp_status {
+            ExchangeResponseStatus::Ok(x) => x,
+            ExchangeResponseStatus::Err(e) => return Err(DexError::ServerResponse(e.to_string())),
+        };
+
+        // Expect at least one status entry
+        let status = exchange_response
+            .data
+            .unwrap()
+            .statuses
+            .into_iter()
+            .next()
+            .ok_or_else(|| DexError::Other("No order status returned".into()))?;
+
+        // Extract the order ID from either Filled or Resting
+        let oid = match status {
+            ExchangeDataStatus::Filled(o) => o.oid,
+            ExchangeDataStatus::Resting(o) => o.oid,
+            _ => {
+                return Err(DexError::ServerResponse(
+                    "Unrecognized exchange status".into(),
+                ))
+            }
+        };
+
+        // Return the CreateOrderResponse
+        Ok(CreateOrderResponse {
+            order_id: oid.to_string(),
+            ordered_price: trigger_px,
+            ordered_size: size,
         })
     }
 
