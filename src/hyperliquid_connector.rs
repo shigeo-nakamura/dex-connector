@@ -1508,7 +1508,7 @@ impl DexConnector for HyperliquidConnector {
         let rounded_price = Self::round_price(price, min_tick, side.clone());
         let rounded_size = self.floor_size(size, symbol);
 
-        log::debug!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
+        log::info!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
 
         let asset = resolve_coin(symbol, &self.spot_index_map);
 
@@ -1528,11 +1528,15 @@ impl DexConnector for HyperliquidConnector {
             }),
         };
 
-        let res = self
-            .exchange_client
-            .order(order, None)
-            .await
-            .map_err(|e| DexError::Other(e.to_string()))?;
+        let res = self.exchange_client.order(order, None).await.map_err(|e| {
+            log::error!(
+                "[create_order] order failed: symbol = {}, size = {}, error = {}",
+                symbol,
+                rounded_size,
+                e
+            );
+            DexError::Other(e.to_string())
+        })?;
 
         let res = match res {
             ExchangeResponseStatus::Ok(exchange_response) => exchange_response,
