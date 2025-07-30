@@ -339,13 +339,23 @@ impl HyperliquidConnector {
                     .await
                     .map_err(|e| DexError::Other(e.to_string()))?;
 
-            let (pk, resp) = ec_tmp
-                .approve_agent(None, agent_name)
+            let (pk, status) = ec_tmp
+                .approve_agent(None, agent_name.clone())
                 .await
                 .map_err(|e| DexError::Other(e.to_string()))?;
-            log::info!("Agent approved: {resp:?}");
 
-            local_wallet = pk.parse().unwrap();
+            match status {
+                ExchangeResponseStatus::Ok(_) => {
+                    log::info!("approve_agent succeeded for {:?}", agent_name);
+                    local_wallet = pk
+                        .parse()
+                        .map_err(|e| DexError::Other(format!("Failed to parse agent pk: {e}")))?;
+                }
+                ExchangeResponseStatus::Err(e) => {
+                    log::error!("approve_agent failed: {e}");
+                    return Err(DexError::Other(format!("approve_agent failed: {e}")));
+                }
+            }
         }
 
         let exchange_client = ExchangeClient::new(
@@ -1508,8 +1518,19 @@ impl DexConnector for HyperliquidConnector {
         let rounded_price = Self::round_price(price, min_tick, side.clone());
         let rounded_size = self.floor_size(size, symbol);
 
-        log::info!("{}, {}({}), {}", symbol, rounded_price, price, rounded_size,);
-
+        log::info!(
+            "[create_order] sym={} tif={} px={} size={} notional={} min_tick={} sz_decimals={}",
+            symbol,
+            time_in_force,
+            rounded_price,
+            rounded_size,
+            rounded_price * rounded_size,
+            min_tick,
+            self.static_market_info
+                .get(symbol)
+                .map(|m| m.decimals)
+                .unwrap_or(0),
+        );
         let asset = resolve_coin(symbol, &self.spot_index_map);
 
         let order = ClientOrderRequest {
