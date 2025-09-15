@@ -1773,7 +1773,8 @@ impl DexConnector for HyperliquidConnector {
     async fn check_upcoming_maintenance(&self) -> Result<(), DexError> {
         let info = self.maintenance.read().await;
         if let Some(start) = info.next_start {
-            if start - Utc::now() <= ChronoDuration::hours(2) {
+            let now = Utc::now();
+            if now < start && (start - now) <= ChronoDuration::hours(2) {
                 return Err(DexError::UpcomingMaintenance);
             }
         }
