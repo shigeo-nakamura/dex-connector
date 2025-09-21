@@ -90,5 +90,5 @@ pub trait DexConnector: Send + Sync {
 
     async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError>;
 
-    async fn check_upcoming_maintenance(&self) -> Result<(), DexError>;
+    async fn is_upcoming_maintenance(&self) -> bool;
 }
