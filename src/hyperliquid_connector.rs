@@ -1411,26 +1411,23 @@ impl DexConnector for HyperliquidConnector {
         }
     }
 
-    async fn clear_filled_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
-        let mut trade_results_guard = self.trade_results.write().await;
-
-        if let Some(orders) = trade_results_guard.get_mut(symbol) {
-            if orders.contains_key(order_id) {
-                orders.remove(order_id);
+    async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
+        let mut m = self.trade_results.write().await;
+        if let Some(map) = m.get_mut(symbol) {
+            if map.remove(trade_id).is_some() {
+                Ok(())
             } else {
-                return Err(DexError::Other(format!(
-                    "filled order(order_id:{}({})) does not exist",
-                    order_id, symbol
-                )));
+                Err(DexError::Other(format!(
+                    "filled trade(trade_id:{}({})) does not exist",
+                    trade_id, symbol
+                )))
             }
         } else {
-            return Err(DexError::Other(format!(
-                "filled order(symbol:{}({})) does not exist",
-                symbol, order_id
-            )));
+            Err(DexError::Other(format!(
+                "filled trade(symbol:{}({})) does not exist",
+                symbol, trade_id
+            )))
         }
-
-        Ok(())
     }
 
     async fn clear_all_filled_orders(&self) -> Result<(), DexError> {
