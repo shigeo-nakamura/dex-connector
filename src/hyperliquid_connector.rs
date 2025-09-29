@@ -1123,10 +1123,16 @@ impl HyperliquidConnector {
             };
 
             let mut trade_results_guard = trade_results.write().await;
-            trade_results_guard
-                .entry(market_id.clone())
-                .or_default()
-                .insert(trade_id.to_string(), trade_result);
+            let market_map = trade_results_guard.entry(market_id.clone()).or_default();
+            let key = trade_id.to_string();
+
+            if let Some(existing) = market_map.get_mut(&key) {
+                existing.filled_size += trade_result.filled_size;
+                existing.filled_value += trade_result.filled_value;
+                existing.filled_fee += trade_result.filled_fee;
+            } else {
+                market_map.insert(key, trade_result);
+            }
         }
     }
 }
