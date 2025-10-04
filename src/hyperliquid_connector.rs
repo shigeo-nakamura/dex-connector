@@ -1374,12 +1374,24 @@ impl DexConnector for HyperliquidConnector {
                 .handle_request_with_action("/info".into(), &spot_action)
                 .await?;
 
+            log::debug!(
+                "base_coin = {}, balances = {:?}",
+                base_coin,
+                spot_res.balances
+            );
+
             let mut usdc_total = Decimal::ZERO;
             let mut base_total = Decimal::ZERO;
             for b in &spot_res.balances {
                 match b.coin.as_str() {
-                    "USDC" => usdc_total = parse_to_decimal(&b.total)?,
-                    c if c == base_coin => base_total = parse_to_decimal(&b.total)?,
+                    "USDC" => {
+                        usdc_total = parse_to_decimal(&b.total)?;
+                        log::debug!("USDC total = {}", usdc_total);
+                    }
+                    c if c == base_coin => {
+                        base_total = parse_to_decimal(&b.total)?;
+                        log::debug!("{} total = {}", c, base_total);
+                    }
                     _ => {}
                 }
             }
@@ -1390,8 +1402,12 @@ impl DexConnector for HyperliquidConnector {
                 .await
                 .unwrap_or(Decimal::ZERO);
 
+            log::debug!("price_key = {}, px = {}", price_key, px);
+
             let equity = base_total * px + usdc_total;
             let balance = usdc_total;
+
+            log::debug!("final equity = {}, balance = {}", equity, balance);
 
             return Ok(BalanceResponse { equity, balance });
         }
