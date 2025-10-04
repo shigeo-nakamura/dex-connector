@@ -1362,23 +1362,32 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
+        // Always get both spot and perp balances
+        let spot_action = HyperliquidDefaultPayload {
+            r#type: "spotClearinghouseState".into(),
+            user: Some(self.config.evm_wallet_address.clone()),
+        };
+        let spot_res: HyperliquidSpotBalanceResponse = self
+            .handle_request_with_action("/info".into(), &spot_action)
+            .await?;
+
+        let perp_action = HyperliquidDefaultPayload {
+            r#type: "clearinghouseState".into(),
+            user: Some(self.config.evm_wallet_address.clone()),
+        };
+        let perp_res = self
+            .handle_request_with_action::<HyperliquidRetrieveUserStateResponse, _>(
+                "/info".into(),
+                &perp_action,
+            )
+            .await?;
+
+        log::debug!("spot balances = {:?}", spot_res.balances);
+        log::debug!("perp margin summary = {:?}", perp_res.margin_summary);
+
         if let Some(pair) = symbol {
             // "UBTC/USDC" → "UBTC"
             let base_coin = pair.split('/').next().unwrap_or(pair);
-
-            let spot_action = HyperliquidDefaultPayload {
-                r#type: "spotClearinghouseState".into(),
-                user: Some(self.config.evm_wallet_address.clone()),
-            };
-            let spot_res: HyperliquidSpotBalanceResponse = self
-                .handle_request_with_action("/info".into(), &spot_action)
-                .await?;
-
-            log::debug!(
-                "base_coin = {}, balances = {:?}",
-                base_coin,
-                spot_res.balances
-            );
 
             let mut usdc_total = Decimal::ZERO;
             let mut base_total = Decimal::ZERO;
@@ -1404,33 +1413,78 @@ impl DexConnector for HyperliquidConnector {
 
             log::debug!("price_key = {}, px = {}", price_key, px);
 
-            let equity = base_total * px + usdc_total;
-            let balance = usdc_total;
+            // Get perp balance as well
+            let (perp_equity, perp_balance) = if let Some(summary) = &perp_res.margin_summary {
+                let equity = parse_to_decimal(&summary.account_value)?;
+                let balance = parse_to_decimal(&summary.total_rawusd)?;
+                log::debug!("perp equity = {}, perp balance = {}", equity, balance);
+                (equity, balance)
+            } else {
+                (Decimal::ZERO, Decimal::ZERO)
+            };
 
-            log::debug!("final equity = {}, balance = {}", equity, balance);
+            // Combine spot and perp balances
+            let spot_equity = base_total * px + usdc_total;
+            let total_equity = spot_equity + perp_equity;
+            let total_balance = usdc_total + perp_balance;
 
-            return Ok(BalanceResponse { equity, balance });
+            log::debug!(
+                "final equity = {} (spot: {} + perp: {}), balance = {} (spot: {} + perp: {})",
+                total_equity,
+                spot_equity,
+                perp_equity,
+                total_balance,
+                usdc_total,
+                perp_balance
+            );
+
+            return Ok(BalanceResponse {
+                equity: total_equity,
+                balance: total_balance,
+            });
         }
 
-        let request_url = "/info";
-        let action = HyperliquidDefaultPayload {
-            r#type: "clearinghouseState".into(),
-            user: Some(self.config.evm_wallet_address.clone()),
-        };
-        let res = self
-            .handle_request_with_action::<HyperliquidRetrieveUserStateResponse, _>(
-                request_url.into(),
-                &action,
-            )
-            .await?;
+        // When no symbol is specified, return total balance from both spot and perp
+        let mut total_equity = Decimal::ZERO;
+        let mut total_balance = Decimal::ZERO;
 
-        if let Some(summary) = res.margin_summary {
-            let equity = parse_to_decimal(&summary.account_value)?;
-            let balance = parse_to_decimal(&summary.total_rawusd)?;
-            Ok(BalanceResponse { equity, balance })
-        } else {
-            Err(DexError::Other("Unknown error".into()))
+        // Add spot balances
+        for b in &spot_res.balances {
+            let balance = parse_to_decimal(&b.total)?;
+            if b.coin == "USDC" {
+                total_balance += balance;
+                total_equity += balance;
+            } else {
+                // For non-USDC tokens, try to get their price and add to equity
+                let symbol_key = format!("{}/USDC", b.coin);
+                if let Ok(px) = self.get_market_price(&symbol_key).await {
+                    total_equity += balance * px;
+                }
+            }
         }
+
+        // Add perp balances
+        if let Some(summary) = perp_res.margin_summary {
+            let perp_equity = parse_to_decimal(&summary.account_value)?;
+            let perp_balance = parse_to_decimal(&summary.total_rawusd)?;
+            total_equity += perp_equity;
+            total_balance += perp_balance;
+            log::debug!(
+                "perp equity = {}, perp balance = {}",
+                perp_equity,
+                perp_balance
+            );
+        }
+
+        log::debug!(
+            "final total equity = {}, total balance = {}",
+            total_equity,
+            total_balance
+        );
+        Ok(BalanceResponse {
+            equity: total_equity,
+            balance: total_balance,
+        })
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
