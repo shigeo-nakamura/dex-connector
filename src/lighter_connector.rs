@@ -301,16 +301,13 @@ impl DexConnector for LighterConnector {
     }
 
     async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), DexError> {
-        let payload = serde_json::json!({
-            "ticker": symbol,
-            "leverage": leverage
-        })
-        .to_string();
-
-        let _: Value = self
-            .make_request("/v1/set-leverage", HttpMethod::Post, Some(&payload))
-            .await?;
-        log::info!("Set leverage for {} to {}", symbol, leverage);
+        // Note: Lighter does not currently support dynamic leverage setting via API
+        // Leverage is typically set at the account level or per order
+        log::warn!(
+            "Set leverage API not available for Lighter - leverage for {} requested: {}",
+            symbol,
+            leverage
+        );
         Ok(())
     }
 
