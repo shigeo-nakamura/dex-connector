@@ -12,7 +12,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_testnet = env::var("LIGHTER_TESTNET").unwrap_or_default() == "true";
 
     // Create Lighter connector
-    let connector = create_lighter_connector(api_key, private_key, is_testnet)?;
+    let base_url = if is_testnet {
+        "https://testnet.zklighter.elliot.ai".to_string()
+    } else {
+        "https://mainnet.zklighter.elliot.ai".to_string()
+    };
+    let websocket_url = if is_testnet {
+        "wss://testnet.zklighter.elliot.ai/ws".to_string()
+    } else {
+        "wss://mainnet.zklighter.elliot.ai/ws".to_string()
+    };
+
+    let connector = create_lighter_connector(api_key, private_key, base_url, websocket_url)?;
 
     // Start the connector
     connector.start().await?;

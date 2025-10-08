@@ -96,6 +96,43 @@ struct LighterTradeResponse {
     _timestamp: u64,
 }
 
+#[derive(Serialize, Debug)]
+struct LighterSignedTx {
+    sig: String,
+    nonce: u64,
+    tx: LighterTransaction,
+}
+
+#[derive(Serialize, Debug)]
+struct LighterSignedTxBatch {
+    sig: String,
+    nonce: u64,
+    txs: Vec<LighterTransaction>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum LighterTransaction {
+    CreateOrder {
+        ticker: String,
+        amount: String,
+        price: Option<String>,
+        #[serde(rename = "orderType")]
+        order_type: String,
+        #[serde(rename = "timeInForce")]
+        time_in_force: String,
+    },
+    CancelOrder {
+        #[serde(rename = "orderId")]
+        order_id: String,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+struct LighterNonceResponse {
+    nonce: u64,
+}
+
 impl LighterConnector {
     pub fn new(
         api_key: String,
@@ -119,6 +156,13 @@ impl LighterConnector {
             is_running: Arc::new(AtomicBool::new(false)),
             ws: Some(DexWebSocket::new(websocket_url)),
         })
+    }
+
+    async fn get_nonce(&self) -> Result<u64, DexError> {
+        let response: LighterNonceResponse = self
+            .make_request("/api/v1/nextNonce", HttpMethod::Get, None)
+            .await?;
+        Ok(response.nonce)
     }
 
     async fn sign_request(&self, payload: &str, timestamp: u64) -> Result<String, DexError> {
@@ -330,7 +374,7 @@ impl DexConnector for LighterConnector {
             });
         }
 
-        let endpoint = format!("/v1/orderbook/{}", symbol);
+        let endpoint = format!("/api/v1/orderBooks/{}", symbol);
         let orderbook: LighterOrderbookResponse =
             self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
@@ -360,7 +404,7 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
-        let endpoint = format!("/v1/trades/{}", symbol);
+        let endpoint = format!("/api/v1/orderBookOrders");
         let trades: Vec<LighterTradeResponse> =
             self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
@@ -397,7 +441,7 @@ impl DexConnector for LighterConnector {
 
     async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
         let account: LighterAccountResponse = self
-            .make_request("/v1/account", HttpMethod::Get, None)
+            .make_request("/api/v1/account", HttpMethod::Get, None)
             .await?;
 
         let equity = string_to_decimal(Some(account.total_equity))?;
@@ -450,7 +494,8 @@ impl DexConnector for LighterConnector {
         }
         .to_string();
 
-        let order_request = LighterOrderRequest {
+        let nonce = self.get_nonce().await?;
+        let tx = LighterTransaction::CreateOrder {
             ticker: symbol.to_string(),
             amount,
             price: price.map(|p| p.to_string()),
@@ -458,11 +503,22 @@ impl DexConnector for LighterConnector {
             time_in_force: "GTC".to_string(),
         };
 
-        let payload = serde_json::to_string(&order_request)
-            .map_err(|e| DexError::Other(format!("Failed to serialize order: {}", e)))?;
+        let tx_json = serde_json::to_string(&tx)
+            .map_err(|e| DexError::Other(format!("Failed to serialize tx: {}", e)))?;
+
+        let signature = self.sign_request(&tx_json, nonce).await?;
+
+        let signed_tx = LighterSignedTx {
+            sig: signature,
+            nonce,
+            tx,
+        };
+
+        let payload = serde_json::to_string(&signed_tx)
+            .map_err(|e| DexError::Other(format!("Failed to serialize signed tx: {}", e)))?;
 
         let response: LighterOrderResponse = self
-            .make_request("/v1/order", HttpMethod::Post, Some(&payload))
+            .make_request("/api/v1/sendTx", HttpMethod::Post, Some(&payload))
             .await?;
 
         Ok(CreateOrderResponse {
@@ -495,17 +551,34 @@ impl DexConnector for LighterConnector {
         }
         .to_string();
 
-        let payload = serde_json::json!({
-            "ticker": symbol,
-            "amount": amount,
-            "triggerPrice": trigger_px.to_string(),
-            "orderType": order_type,
-            "timeInForce": "GTC"
-        })
-        .to_string();
+        let nonce = self.get_nonce().await?;
+
+        // Note: For trigger orders, we might need a different transaction type
+        // For now, using CreateOrder with trigger price info
+        let tx = LighterTransaction::CreateOrder {
+            ticker: symbol.to_string(),
+            amount,
+            price: Some(trigger_px.to_string()),
+            order_type: order_type.to_string(),
+            time_in_force: "GTC".to_string(),
+        };
+
+        let tx_json = serde_json::to_string(&tx)
+            .map_err(|e| DexError::Other(format!("Failed to serialize tx: {}", e)))?;
+
+        let signature = self.sign_request(&tx_json, nonce).await?;
+
+        let signed_tx = LighterSignedTx {
+            sig: signature,
+            nonce,
+            tx,
+        };
+
+        let payload = serde_json::to_string(&signed_tx)
+            .map_err(|e| DexError::Other(format!("Failed to serialize signed tx: {}", e)))?;
 
         let response: LighterOrderResponse = self
-            .make_request("/v1/trigger-order", HttpMethod::Post, Some(&payload))
+            .make_request("/api/v1/sendTx", HttpMethod::Post, Some(&payload))
             .await?;
 
         Ok(CreateOrderResponse {
@@ -516,14 +589,27 @@ impl DexConnector for LighterConnector {
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
-        let payload = serde_json::json!({
-            "ticker": symbol,
-            "orderId": order_id
-        })
-        .to_string();
+        let nonce = self.get_nonce().await?;
+        let tx = LighterTransaction::CancelOrder {
+            order_id: order_id.to_string(),
+        };
+
+        let tx_json = serde_json::to_string(&tx)
+            .map_err(|e| DexError::Other(format!("Failed to serialize tx: {}", e)))?;
+
+        let signature = self.sign_request(&tx_json, nonce).await?;
+
+        let signed_tx = LighterSignedTx {
+            sig: signature,
+            nonce,
+            tx,
+        };
+
+        let payload = serde_json::to_string(&signed_tx)
+            .map_err(|e| DexError::Other(format!("Failed to serialize signed tx: {}", e)))?;
 
         let _: Value = self
-            .make_request("/v1/cancel-order", HttpMethod::Delete, Some(&payload))
+            .make_request("/api/v1/sendTx", HttpMethod::Post, Some(&payload))
             .await?;
 
         let mut canceled_orders = self.canceled_orders.write().await;
@@ -539,15 +625,53 @@ impl DexConnector for LighterConnector {
     }
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
-        let payload = if let Some(sym) = symbol {
-            serde_json::json!({ "ticker": sym }).to_string()
+        // First, get all open orders for the account
+        let endpoint = if let Some(sym) = &symbol {
+            format!("/api/v1/orderBookOrders?ticker={}", sym)
         } else {
-            "{}".to_string()
+            "/api/v1/orderBookOrders".to_string()
         };
 
+        let orders: Vec<Value> = self.make_request(&endpoint, HttpMethod::Get, None).await?;
+
+        if orders.is_empty() {
+            return Ok(());
+        }
+
+        // Create cancel transactions for each order
+        let mut cancel_txs = Vec::new();
+        for order in orders {
+            if let Some(order_id) = order.get("orderId").and_then(|v| v.as_str()) {
+                cancel_txs.push(LighterTransaction::CancelOrder {
+                    order_id: order_id.to_string(),
+                });
+            }
+        }
+
+        if cancel_txs.is_empty() {
+            return Ok(());
+        }
+
+        // Get nonce and sign the batch
+        let nonce = self.get_nonce().await?;
+        let txs_json = serde_json::to_string(&cancel_txs)
+            .map_err(|e| DexError::Other(format!("Failed to serialize txs: {}", e)))?;
+
+        let signature = self.sign_request(&txs_json, nonce).await?;
+
+        let signed_tx_batch = LighterSignedTxBatch {
+            sig: signature,
+            nonce,
+            txs: cancel_txs,
+        };
+
+        let payload = serde_json::to_string(&signed_tx_batch)
+            .map_err(|e| DexError::Other(format!("Failed to serialize signed tx batch: {}", e)))?;
+
         let _: Value = self
-            .make_request("/v1/cancel-all-orders", HttpMethod::Delete, Some(&payload))
+            .make_request("/api/v1/sendTxBatch", HttpMethod::Post, Some(&payload))
             .await?;
+
         Ok(())
     }
 
@@ -565,6 +689,9 @@ impl DexConnector for LighterConnector {
     }
 
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
+        // Note: Lighter may not have a direct close-all-positions endpoint
+        // This might need to be implemented as getting positions and creating market orders
+        // For now, updating the endpoint to use the correct API path
         let payload = if let Some(sym) = symbol {
             serde_json::json!({ "ticker": sym }).to_string()
         } else {
@@ -572,7 +699,11 @@ impl DexConnector for LighterConnector {
         };
 
         let _: Value = self
-            .make_request("/v1/close-all-positions", HttpMethod::Post, Some(&payload))
+            .make_request(
+                "/api/v1/close-all-positions",
+                HttpMethod::Post,
+                Some(&payload),
+            )
             .await?;
         Ok(())
     }
