@@ -16,6 +16,10 @@ impl DexWebSocket {
         DexWebSocket { endpoint }
     }
 
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub async fn connect(
         &self,
     ) -> Result<

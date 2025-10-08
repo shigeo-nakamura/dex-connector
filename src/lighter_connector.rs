@@ -217,24 +217,61 @@ impl LighterConnector {
             request = request.body(body.to_string());
         }
 
+        // Log the request details
+        log::debug!(
+            "Lighter HTTP {} {} body={}",
+            match method {
+                HttpMethod::Get => "GET",
+                HttpMethod::Post => "POST",
+                HttpMethod::Delete => "DELETE",
+                HttpMethod::Put => "PUT",
+            },
+            url,
+            payload.unwrap_or("")
+        );
+
         let response = request
             .send()
             .await
             .map_err(|e| DexError::Other(format!("HTTP request failed: {}", e)))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(DexError::Other(format!(
-                "API request failed with status {}: {}",
-                status, text
-            )));
-        }
-
+        let status = response.status();
         let response_text = response
             .text()
             .await
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+        if !status.is_success() {
+            log::error!(
+                "Lighter HTTP ERROR {} {} -> {} body: {}",
+                match method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Post => "POST",
+                    HttpMethod::Delete => "DELETE",
+                    HttpMethod::Put => "PUT",
+                },
+                url,
+                status,
+                response_text
+            );
+            return Err(DexError::Other(format!(
+                "API request failed with status {}: {}",
+                status, response_text
+            )));
+        } else {
+            log::trace!(
+                "Lighter HTTP OK {} {} -> {} body: {}",
+                match method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Post => "POST",
+                    HttpMethod::Delete => "DELETE",
+                    HttpMethod::Put => "PUT",
+                },
+                url,
+                status,
+                response_text
+            );
+        }
 
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))
@@ -258,6 +295,7 @@ impl DexConnector for LighterConnector {
                         break;
                     }
 
+                    log::debug!("Connecting Lighter WS: {}", ws_clone.endpoint());
                     match ws_clone.connect().await {
                         Ok((mut ws_sender, mut ws_receiver)) => {
                             log::info!("Connected to Lighter WebSocket");
@@ -404,7 +442,8 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
-        let endpoint = format!("/api/v1/orderBookOrders");
+        // Get recent trades for the symbol
+        let endpoint = format!("/api/v1/trades?ticker={}", symbol);
         let trades: Vec<LighterTradeResponse> =
             self.make_request(&endpoint, HttpMethod::Get, None).await?;
 

@@ -18,9 +18,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "https://mainnet.zklighter.elliot.ai".to_string()
     };
     let websocket_url = if is_testnet {
-        "wss://testnet.zklighter.elliot.ai/ws".to_string()
+        "wss://testnet.zklighter.elliot.ai/stream".to_string()
     } else {
-        "wss://mainnet.zklighter.elliot.ai/ws".to_string()
+        "wss://mainnet.zklighter.elliot.ai/stream".to_string()
     };
 
     let connector = create_lighter_connector(api_key, private_key, base_url, websocket_url)?;
