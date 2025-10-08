@@ -23,7 +23,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example: Get account balance
     let balance = connector.get_balance(None).await?;
-    println!("Account Equity: {}, Available Balance: {}", balance.equity, balance.balance);
+    println!(
+        "Account Equity: {}, Available Balance: {}",
+        balance.equity, balance.balance
+    );
 
     // Example: Create a limit order (uncomment to test)
     /*

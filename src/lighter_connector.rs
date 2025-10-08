@@ -1,11 +1,13 @@
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
     dex_request::{DexError, HttpMethod},
+    dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CreateOrderResponse, FilledOrder,
     FilledOrdersResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -18,20 +20,20 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    sync::RwLock,
-    time::sleep,
-};
+use tokio::{sync::RwLock, time::sleep};
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[derive(Clone)]
 pub struct LighterConnector {
     api_key: String,
     private_key: String,
     base_url: String,
+    websocket_url: String,
     client: Client,
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
     is_running: Arc<AtomicBool>,
+    ws: Option<DexWebSocket>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -98,14 +100,9 @@ impl LighterConnector {
     pub fn new(
         api_key: String,
         private_key: String,
-        is_testnet: bool,
+        base_url: String,
+        websocket_url: String,
     ) -> Result<Self, DexError> {
-        let base_url = if is_testnet {
-            "https://api.testnet.lighter.xyz".to_string()
-        } else {
-            "https://api.lighter.xyz".to_string()
-        };
-
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -115,10 +112,12 @@ impl LighterConnector {
             api_key,
             private_key,
             base_url,
+            websocket_url: websocket_url.clone(),
             client,
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
+            ws: Some(DexWebSocket::new(websocket_url)),
         })
     }
 
@@ -127,9 +126,10 @@ impl LighterConnector {
         use sha3::{Digest, Keccak256};
 
         let secp = Secp256k1::new();
-        let secret_key = SecretKey::from_slice(&hex::decode(&self.private_key).map_err(|e| {
-            DexError::Other(format!("Invalid private key format: {}", e))
-        })?)
+        let secret_key = SecretKey::from_slice(
+            &hex::decode(&self.private_key)
+                .map_err(|e| DexError::Other(format!("Invalid private key format: {}", e)))?,
+        )
         .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
 
         let message_string = format!("{}{}", payload, timestamp);
@@ -173,9 +173,10 @@ impl LighterConnector {
             request = request.body(body.to_string());
         }
 
-        let response = request.send().await.map_err(|e| {
-            DexError::Other(format!("HTTP request failed: {}", e))
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -186,13 +187,13 @@ impl LighterConnector {
             )));
         }
 
-        let response_text = response.text().await.map_err(|e| {
-            DexError::Other(format!("Failed to read response: {}", e))
-        })?;
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-        serde_json::from_str(&response_text).map_err(|e| {
-            DexError::Other(format!("Failed to parse response: {}", e))
-        })
+        serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))
     }
 }
 
@@ -200,6 +201,89 @@ impl LighterConnector {
 impl DexConnector for LighterConnector {
     async fn start(&self) -> Result<(), DexError> {
         self.is_running.store(true, Ordering::SeqCst);
+
+        if let Some(ws) = &self.ws {
+            let ws_clone = ws.clone();
+            let filled_orders = self.filled_orders.clone();
+            let canceled_orders = self.canceled_orders.clone();
+            let is_running = self.is_running.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    if !is_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    match ws_clone.connect().await {
+                        Ok((mut ws_sender, mut ws_receiver)) => {
+                            log::info!("Connected to Lighter WebSocket");
+
+                            // Subscribe to user data stream
+                            let subscribe_msg = serde_json::json!({
+                                "id": 1,
+                                "method": "subscribe",
+                                "params": ["user.orders", "user.trades"]
+                            });
+
+                            if let Err(e) = ws_sender
+                                .send(Message::Text(subscribe_msg.to_string()))
+                                .await
+                            {
+                                log::error!("Failed to send subscription message: {}", e);
+                                sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+
+                            // Listen for messages
+                            while is_running.load(Ordering::SeqCst) {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(30),
+                                    ws_receiver.next(),
+                                )
+                                .await
+                                {
+                                    Ok(Some(Ok(message))) => {
+                                        if let Err(e) = LighterConnector::handle_websocket_message(
+                                            message,
+                                            filled_orders.clone(),
+                                            canceled_orders.clone(),
+                                        )
+                                        .await
+                                        {
+                                            log::error!("Error handling WebSocket message: {}", e);
+                                        }
+                                    }
+                                    Ok(Some(Err(e))) => {
+                                        log::error!("WebSocket error: {}", e);
+                                        break;
+                                    }
+                                    Ok(None) => {
+                                        log::warn!("WebSocket stream ended");
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        log::warn!("WebSocket timeout, sending ping");
+                                        if let Err(e) = ws_sender.send(Message::Ping(vec![])).await
+                                        {
+                                            log::error!("Failed to send ping: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            log::error!(
+                                "Failed to connect to Lighter WebSocket, retrying in 5 seconds"
+                            );
+                            sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+                log::info!("Lighter WebSocket task ended");
+            });
+        }
+
         log::info!("Lighter connector started");
         Ok(())
     }
@@ -220,9 +304,12 @@ impl DexConnector for LighterConnector {
         let payload = serde_json::json!({
             "ticker": symbol,
             "leverage": leverage
-        }).to_string();
+        })
+        .to_string();
 
-        let _: Value = self.make_request("/v1/set-leverage", HttpMethod::Post, Some(&payload)).await?;
+        let _: Value = self
+            .make_request("/v1/set-leverage", HttpMethod::Post, Some(&payload))
+            .await?;
         log::info!("Set leverage for {} to {}", symbol, leverage);
         Ok(())
     }
@@ -247,7 +334,8 @@ impl DexConnector for LighterConnector {
         }
 
         let endpoint = format!("/v1/orderbook/{}", symbol);
-        let orderbook: LighterOrderbookResponse = self.make_request(&endpoint, HttpMethod::Get, None).await?;
+        let orderbook: LighterOrderbookResponse =
+            self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
         let price = if let Some(last_price) = orderbook.last_price {
             string_to_decimal(Some(last_price))?
@@ -276,7 +364,8 @@ impl DexConnector for LighterConnector {
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
         let endpoint = format!("/v1/trades/{}", symbol);
-        let trades: Vec<LighterTradeResponse> = self.make_request(&endpoint, HttpMethod::Get, None).await?;
+        let trades: Vec<LighterTradeResponse> =
+            self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
         let mut orders = Vec::new();
         for trade in trades {
@@ -310,7 +399,9 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
-        let account: LighterAccountResponse = self.make_request("/v1/account", HttpMethod::Get, None).await?;
+        let account: LighterAccountResponse = self
+            .make_request("/v1/account", HttpMethod::Get, None)
+            .await?;
 
         let equity = string_to_decimal(Some(account.total_equity))?;
         let balance = string_to_decimal(Some(account.available_balance))?;
@@ -359,7 +450,8 @@ impl DexConnector for LighterConnector {
             -size
         } else {
             size
-        }.to_string();
+        }
+        .to_string();
 
         let order_request = LighterOrderRequest {
             ticker: symbol.to_string(),
@@ -372,7 +464,9 @@ impl DexConnector for LighterConnector {
         let payload = serde_json::to_string(&order_request)
             .map_err(|e| DexError::Other(format!("Failed to serialize order: {}", e)))?;
 
-        let response: LighterOrderResponse = self.make_request("/v1/order", HttpMethod::Post, Some(&payload)).await?;
+        let response: LighterOrderResponse = self
+            .make_request("/v1/order", HttpMethod::Post, Some(&payload))
+            .await?;
 
         Ok(CreateOrderResponse {
             order_id: response.order_id,
@@ -401,7 +495,8 @@ impl DexConnector for LighterConnector {
             -size
         } else {
             size
-        }.to_string();
+        }
+        .to_string();
 
         let payload = serde_json::json!({
             "ticker": symbol,
@@ -409,9 +504,12 @@ impl DexConnector for LighterConnector {
             "triggerPrice": trigger_px.to_string(),
             "orderType": order_type,
             "timeInForce": "GTC"
-        }).to_string();
+        })
+        .to_string();
 
-        let response: LighterOrderResponse = self.make_request("/v1/trigger-order", HttpMethod::Post, Some(&payload)).await?;
+        let response: LighterOrderResponse = self
+            .make_request("/v1/trigger-order", HttpMethod::Post, Some(&payload))
+            .await?;
 
         Ok(CreateOrderResponse {
             order_id: response.order_id,
@@ -424,12 +522,17 @@ impl DexConnector for LighterConnector {
         let payload = serde_json::json!({
             "ticker": symbol,
             "orderId": order_id
-        }).to_string();
+        })
+        .to_string();
 
-        let _: Value = self.make_request("/v1/cancel-order", HttpMethod::Delete, Some(&payload)).await?;
+        let _: Value = self
+            .make_request("/v1/cancel-order", HttpMethod::Delete, Some(&payload))
+            .await?;
 
         let mut canceled_orders = self.canceled_orders.write().await;
-        let orders = canceled_orders.entry(symbol.to_string()).or_insert_with(Vec::new);
+        let orders = canceled_orders
+            .entry(symbol.to_string())
+            .or_insert_with(Vec::new);
         orders.push(CanceledOrder {
             order_id: order_id.to_string(),
             canceled_timestamp: Utc::now().timestamp_millis() as u64,
@@ -445,7 +548,9 @@ impl DexConnector for LighterConnector {
             "{}".to_string()
         };
 
-        let _: Value = self.make_request("/v1/cancel-all-orders", HttpMethod::Delete, Some(&payload)).await?;
+        let _: Value = self
+            .make_request("/v1/cancel-all-orders", HttpMethod::Delete, Some(&payload))
+            .await?;
         Ok(())
     }
 
@@ -469,7 +574,9 @@ impl DexConnector for LighterConnector {
             "{}".to_string()
         };
 
-        let _: Value = self.make_request("/v1/close-all-positions", HttpMethod::Post, Some(&payload)).await?;
+        let _: Value = self
+            .make_request("/v1/close-all-positions", HttpMethod::Post, Some(&payload))
+            .await?;
         Ok(())
     }
 
@@ -484,11 +591,126 @@ impl DexConnector for LighterConnector {
     }
 }
 
+impl LighterConnector {
+    async fn handle_websocket_message(
+        message: Message,
+        filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
+        canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+    ) -> Result<(), DexError> {
+        if let Message::Text(text) = message {
+            if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                log::debug!("Received WebSocket message: {}", text);
+
+                // Handle different message types based on Lighter's WebSocket format
+                if let Some(msg_type) = data.get("type").and_then(|v| v.as_str()) {
+                    match msg_type {
+                        "trade" => {
+                            if let Some(trade_data) = data.get("data") {
+                                Self::process_trade_message(trade_data, filled_orders).await?;
+                            }
+                        }
+                        "order" => {
+                            if let Some(order_data) = data.get("data") {
+                                Self::process_order_message(order_data, canceled_orders).await?;
+                            }
+                        }
+                        _ => {
+                            log::debug!("Unknown message type: {}", msg_type);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_trade_message(
+        trade_data: &Value,
+        filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
+    ) -> Result<(), DexError> {
+        if let (Some(symbol), Some(price), Some(quantity), Some(side)) = (
+            trade_data.get("symbol").and_then(|v| v.as_str()),
+            trade_data.get("price").and_then(|v| v.as_str()),
+            trade_data.get("quantity").and_then(|v| v.as_str()),
+            trade_data.get("side").and_then(|v| v.as_str()),
+        ) {
+            let filled_order = FilledOrder {
+                order_id: trade_data
+                    .get("orderId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                is_rejected: false,
+                trade_id: trade_data
+                    .get("tradeId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                filled_side: Some(if side == "buy" {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                }),
+                filled_size: string_to_decimal(Some(quantity.to_string())).ok(),
+                filled_value: trade_data
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| string_to_decimal(Some(s.to_string())).ok()),
+                filled_fee: string_to_decimal(Some(
+                    trade_data
+                        .get("fee")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0")
+                        .to_string(),
+                ))
+                .ok(),
+            };
+
+            let mut orders = filled_orders.write().await;
+            orders
+                .entry(symbol.to_string())
+                .or_insert_with(Vec::new)
+                .push(filled_order);
+        }
+        Ok(())
+    }
+
+    async fn process_order_message(
+        order_data: &Value,
+        canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+    ) -> Result<(), DexError> {
+        if let Some(status) = order_data.get("status").and_then(|v| v.as_str()) {
+            if status == "cancelled" {
+                if let (Some(order_id), Some(symbol)) = (
+                    order_data.get("orderId").and_then(|v| v.as_str()),
+                    order_data.get("symbol").and_then(|v| v.as_str()),
+                ) {
+                    let canceled_order = CanceledOrder {
+                        order_id: order_id.to_string(),
+                        canceled_timestamp: order_data
+                            .get("timestamp")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    };
+
+                    let mut orders = canceled_orders.write().await;
+                    orders
+                        .entry(symbol.to_string())
+                        .or_insert_with(Vec::new)
+                        .push(canceled_order);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn create_lighter_connector(
     api_key: String,
     private_key: String,
-    is_testnet: bool,
+    base_url: String,
+    websocket_url: String,
 ) -> Result<Box<dyn DexConnector>, DexError> {
-    let connector = LighterConnector::new(api_key, private_key, is_testnet)?;
+    let connector = LighterConnector::new(api_key, private_key, base_url, websocket_url)?;
     Ok(Box::new(connector))
 }
