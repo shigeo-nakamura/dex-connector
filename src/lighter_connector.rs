@@ -134,6 +134,16 @@ struct LighterNonceResponse {
 }
 
 impl LighterConnector {
+    // Recommended defaults (adjust as needed)
+    const DEFAULT_TRADES_LIMIT: usize = 100;
+    const CANCEL_SCAN_LIMIT: usize = 1000;
+
+    fn join_url(base: &str, path: &str) -> String {
+        let b = base.trim_end_matches('/');
+        let p = path.trim_start_matches('/');
+        format!("{}/{}", b, p)
+    }
+
     pub fn new(
         api_key: String,
         private_key: String,
@@ -194,7 +204,13 @@ impl LighterConnector {
         method: HttpMethod,
         payload: Option<&str>,
     ) -> Result<T, DexError> {
-        let url = format!("{}{}", self.base_url, endpoint);
+        let url = Self::join_url(&self.base_url, endpoint);
+
+        // Defensive: warn if /ws is found; Lighter uses /stream
+        if url.contains("://") && url.ends_with("/ws") {
+            log::warn!("WebSocket URL ends with /ws; Lighter uses /stream. Please update the caller. url={}", url);
+        }
+
         let timestamp = Utc::now().timestamp_millis() as u64;
 
         let payload_str = payload.unwrap_or("");
@@ -412,20 +428,18 @@ impl DexConnector for LighterConnector {
             });
         }
 
-        let endpoint = format!("/api/v1/orderBooks/{}", symbol);
-        let orderbook: LighterOrderbookResponse =
+        // trades requires sort_by and limit. Get latest 1 trade
+        let endpoint = format!(
+            "/api/v1/trades?ticker={}&sort_by=block_height&order=desc&limit=1",
+            symbol
+        );
+        let trades: Vec<LighterTradeResponse> =
             self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
-        let price = if let Some(last_price) = orderbook.last_price {
-            string_to_decimal(Some(last_price))?
-        } else if let Some(mark_price) = orderbook.mark_price {
-            string_to_decimal(Some(mark_price))?
-        } else if !orderbook.bids.is_empty() && !orderbook.asks.is_empty() {
-            let bid = string_to_decimal(Some(orderbook.bids[0][0].clone()))?;
-            let ask = string_to_decimal(Some(orderbook.asks[0][0].clone()))?;
-            (bid + ask) / Decimal::new(2, 0)
+        let price = if let Some(latest) = trades.first() {
+            string_to_decimal(Some(latest.price.clone()))?
         } else {
-            return Err(DexError::Other("No price data available".to_string()));
+            return Err(DexError::Other(format!("No recent trades found for {}", symbol)));
         };
 
         Ok(TickerResponse {
@@ -434,7 +448,7 @@ impl DexConnector for LighterConnector {
             min_tick: Some(Decimal::new(1, 4)),
             min_order: Some(Decimal::new(1, 1)),
             volume: None,
-            num_trades: None,
+            num_trades: Some(trades.len() as u64), // Should be 1
             open_interest: None,
             funding_rate: None,
             oracle_price: None,
@@ -442,8 +456,12 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
-        // Get recent trades for the symbol
-        let endpoint = format!("/api/v1/trades?ticker={}", symbol);
+        // Get recent fills for the symbol. Required parameters included
+        let endpoint = format!(
+            "/api/v1/trades?ticker={}&sort_by=block_height&order=desc&limit={}",
+            symbol,
+            Self::DEFAULT_TRADES_LIMIT
+        );
         let trades: Vec<LighterTradeResponse> =
             self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
@@ -664,18 +682,30 @@ impl DexConnector for LighterConnector {
     }
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
-        // First, get all open orders for the account
-        let endpoint = if let Some(sym) = &symbol {
-            format!("/api/v1/orderBookOrders?ticker={}", sym)
-        } else {
-            "/api/v1/orderBookOrders".to_string()
+        // First, get all open orders for the account (limit/sort_by required)
+        let endpoint = match &symbol {
+            Some(sym) => format!(
+                "/api/v1/orderBookOrders?ticker={}&sort_by=block_height&order=desc&limit={}",
+                sym,
+                Self::CANCEL_SCAN_LIMIT
+            ),
+            None => format!(
+                "/api/v1/orderBookOrders?sort_by=block_height&order=desc&limit={}",
+                Self::CANCEL_SCAN_LIMIT
+            ),
         };
 
         let orders: Vec<Value> = self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
         if orders.is_empty() {
+            log::debug!("cancel_all_orders: no open orders (symbol={:?})", symbol);
             return Ok(());
         }
+
+        log::debug!(
+            "cancel_all_orders: fetched {} open orders (symbol={:?})",
+            orders.len(), symbol
+        );
 
         // Create cancel transactions for each order
         let mut cancel_txs = Vec::new();
