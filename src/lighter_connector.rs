@@ -29,6 +29,7 @@ pub struct LighterConnector {
     private_key: String,
     base_url: String,
     websocket_url: String,
+    l1_address: String,
     client: Client,
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
@@ -144,12 +145,40 @@ impl LighterConnector {
         format!("{}/{}", b, p)
     }
 
+    fn eth_address_from_privkey(pk_hex: &str) -> Result<String, DexError> {
+        use k256::{ecdsa::SigningKey, elliptic_curve::sec1::ToEncodedPoint};
+        use tiny_keccak::{Hasher, Keccak};
+
+        let pk_bytes = hex::decode(pk_hex.trim_start_matches("0x"))
+            .map_err(|e| DexError::Other(format!("invalid private key hex: {}", e)))?;
+
+        // Convert Vec<u8> to fixed-size array
+        if pk_bytes.len() != 32 {
+            return Err(DexError::Other("Private key must be 32 bytes".to_string()));
+        }
+        let mut pk_array = [0u8; 32];
+        pk_array.copy_from_slice(&pk_bytes);
+
+        let sk = SigningKey::from_bytes(&pk_array.into())
+            .map_err(|e| DexError::Other(format!("invalid private key: {}", e)))?;
+        let vk = sk.verifying_key();
+        let uncompressed = vk.to_encoded_point(false);
+        let pubkey = &uncompressed.as_bytes()[1..]; // drop 0x04
+        let mut keccak = Keccak::v256();
+        let mut out = [0u8; 32];
+        keccak.update(pubkey);
+        keccak.finalize(&mut out);
+        let addr = &out[12..]; // last 20 bytes
+        Ok(format!("0x{}", hex::encode(addr)))
+    }
+
     pub fn new(
         api_key: String,
         private_key: String,
         base_url: String,
         websocket_url: String,
     ) -> Result<Self, DexError> {
+        let l1_address = Self::eth_address_from_privkey(&private_key)?;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -160,6 +189,7 @@ impl LighterConnector {
             private_key,
             base_url,
             websocket_url: websocket_url.clone(),
+            l1_address,
             client,
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
@@ -196,6 +226,90 @@ impl LighterConnector {
 
         let signature = secp.sign_ecdsa(&message, &secret_key);
         Ok(hex::encode(signature.serialize_compact()))
+    }
+
+    async fn make_public_request<T: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &str,
+        method: HttpMethod,
+    ) -> Result<T, DexError> {
+        let url = Self::join_url(&self.base_url, endpoint);
+
+        let mut request = match method {
+            HttpMethod::Get => self.client.get(&url),
+            HttpMethod::Post => self.client.post(&url),
+            HttpMethod::Delete => self.client.delete(&url),
+            HttpMethod::Put => self.client.put(&url),
+        };
+
+        request = request.header("Content-Type", "application/json");
+
+        // Log the request details
+        log::debug!(
+            "Lighter HTTP {} {} (public)",
+            match method {
+                HttpMethod::Get => "GET",
+                HttpMethod::Post => "POST",
+                HttpMethod::Delete => "DELETE",
+                HttpMethod::Put => "PUT",
+            },
+            url
+        );
+
+        let response = request.send().await.map_err(|e| {
+            DexError::Other(format!("HTTP request failed: {}", e))
+        })?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            DexError::Other(format!("Failed to read response: {}", e))
+        })?;
+
+        if !status.is_success() {
+            log::error!(
+                "Lighter HTTP ERROR {} {} -> {} body: {}",
+                match method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Post => "POST",
+                    HttpMethod::Delete => "DELETE",
+                    HttpMethod::Put => "PUT",
+                },
+                url,
+                status,
+                response_text
+            );
+            return Err(DexError::Other(format!(
+                "HTTP {} request failed with status {}: {}",
+                match method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Post => "POST",
+                    HttpMethod::Delete => "DELETE",
+                    HttpMethod::Put => "PUT",
+                },
+                status,
+                response_text
+            )));
+        } else {
+            log::trace!(
+                "Lighter HTTP OK {} {} -> {} body: {}",
+                match method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Post => "POST",
+                    HttpMethod::Delete => "DELETE",
+                    HttpMethod::Put => "PUT",
+                },
+                url,
+                status,
+                response_text
+            );
+        }
+
+        serde_json::from_str(&response_text).map_err(|e| {
+            DexError::Other(format!(
+                "Failed to parse JSON response: {} (response: {})",
+                e, response_text
+            ))
+        })
     }
 
     async fn make_request<T: for<'de> Deserialize<'de>>(
@@ -428,19 +542,73 @@ impl DexConnector for LighterConnector {
             });
         }
 
-        // trades requires sort_by and limit. Get latest 1 trade
-        let endpoint = format!(
-            "/api/v1/trades?ticker={}&sort_by=block_height&order=desc&limit=1",
-            symbol
-        );
-        let trades: Vec<LighterTradeResponse> =
-            self.make_request(&endpoint, HttpMethod::Get, None).await?;
-
-        let price = if let Some(latest) = trades.first() {
-            string_to_decimal(Some(latest.price.clone()))?
-        } else {
-            return Err(DexError::Other(format!("No recent trades found for {}", symbol)));
+        // 1st: Public orderBooks endpoint (account-independent)
+        let ob_endpoint = format!("/api/v1/orderBooks?ticker={}", symbol);
+        log::debug!("[get_ticker] GET {} (public)", ob_endpoint);
+        let ob: Value = match self.make_public_request(&ob_endpoint, HttpMethod::Get).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[get_ticker] orderBooks failed: {} — fallback to trades", e);
+                Value::Null
+            }
         };
+
+        // Extract price from orderBooks
+        let mut price_opt: Option<Decimal> = None;
+        if !ob.is_null() {
+            // Format: { bids:[[price,qty],...], asks:[[price,qty],...], last_price:"", mark_price:"" }
+            if let Some(s) = ob.get("last_price").and_then(|v| v.as_str()) {
+                if let Ok(px) = string_to_decimal(Some(s.to_string())) {
+                    price_opt = Some(px);
+                }
+            }
+            if price_opt.is_none() {
+                if let (Some(b0), Some(a0)) = (
+                    ob.pointer("/bids/0/0").and_then(|v| v.as_str()),
+                    ob.pointer("/asks/0/0").and_then(|v| v.as_str()),
+                ) {
+                    if let (Ok(b), Ok(a)) = (
+                        string_to_decimal(Some(b0.to_string())),
+                        string_to_decimal(Some(a0.to_string())),
+                    ) {
+                        price_opt = Some((b + a) / Decimal::new(2, 0));
+                    }
+                }
+            }
+        }
+
+        // 2nd: Fallback to trades (public first, then authenticated if needed)
+        if price_opt.is_none() {
+            let endpoint = format!(
+                "/api/v1/trades?ticker={}&sort_by=block_height&order=desc&limit=1",
+                symbol
+            );
+            log::debug!("[get_ticker] GET {} (public)", endpoint);
+            match self.make_public_request::<Vec<LighterTradeResponse>>(&endpoint, HttpMethod::Get).await {
+                Ok(trades) => {
+                    if let Some(latest) = trades.first() {
+                        price_opt = Some(string_to_decimal(Some(latest.price.clone()))?);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[get_ticker] trades(public) failed: {} — try auth + l1_address", e);
+                    // 3rd: Last resort - server routes to account-based endpoint
+                    let endpoint = format!(
+                        "/api/v1/trades?ticker={}&l1_address={}&sort_by=block_height&order=desc&limit=1",
+                        symbol, self.l1_address
+                    );
+                    let trades_auth: Vec<LighterTradeResponse> =
+                        self.make_request(&endpoint, HttpMethod::Get, None).await?;
+                    if let Some(latest) = trades_auth.first() {
+                        price_opt = Some(string_to_decimal(Some(latest.price.clone()))?);
+                    }
+                }
+            }
+        }
+
+        let price = price_opt.ok_or_else(|| {
+            DexError::Other(format!("No price data available for {}", symbol))
+        })?;
 
         Ok(TickerResponse {
             symbol: symbol.to_string(),
@@ -448,7 +616,7 @@ impl DexConnector for LighterConnector {
             min_tick: Some(Decimal::new(1, 4)),
             min_order: Some(Decimal::new(1, 1)),
             volume: None,
-            num_trades: Some(trades.len() as u64), // Should be 1
+            num_trades: None,
             open_interest: None,
             funding_rate: None,
             oracle_price: None,
@@ -456,12 +624,12 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
-        // Get recent fills for the symbol. Required parameters included
+        // Get account-specific filled orders (requires authentication + l1_address)
         let endpoint = format!(
-            "/api/v1/trades?ticker={}&sort_by=block_height&order=desc&limit={}",
-            symbol,
-            Self::DEFAULT_TRADES_LIMIT
+            "/api/v1/orders/trades?ticker={}&l1_address={}&sort_by=block_height&order=desc&limit={}",
+            symbol, self.l1_address, Self::DEFAULT_TRADES_LIMIT
         );
+        log::debug!("[get_filled_orders] GET {} (authenticated)", endpoint);
         let trades: Vec<LighterTradeResponse> =
             self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
@@ -496,10 +664,14 @@ impl DexConnector for LighterConnector {
         Ok(CanceledOrdersResponse { orders })
     }
 
+
     async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
-        let account: LighterAccountResponse = self
-            .make_request("/api/v1/account", HttpMethod::Get, None)
-            .await?;
+        // Check if account is initialized first
+        self.ensure_account_initialized().await?;
+
+        let path = format!("/api/v1/account?l1_address={}", self.l1_address);
+        let account: LighterAccountResponse =
+            self.make_request(&path, HttpMethod::Get, None).await?;
 
         let equity = string_to_decimal(Some(account.total_equity))?;
         let balance = string_to_decimal(Some(account.available_balance))?;
@@ -682,19 +854,19 @@ impl DexConnector for LighterConnector {
     }
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
-        // First, get all open orders for the account (limit/sort_by required)
+        // Get authenticated orders for the account with l1_address (required for account-specific data)
         let endpoint = match &symbol {
             Some(sym) => format!(
-                "/api/v1/orderBookOrders?ticker={}&sort_by=block_height&order=desc&limit={}",
-                sym,
-                Self::CANCEL_SCAN_LIMIT
+                "/api/v1/orderBookOrders?ticker={}&l1_address={}&status=open&sort_by=block_height&order=desc&limit={}",
+                sym, self.l1_address, Self::CANCEL_SCAN_LIMIT
             ),
             None => format!(
-                "/api/v1/orderBookOrders?sort_by=block_height&order=desc&limit={}",
-                Self::CANCEL_SCAN_LIMIT
+                "/api/v1/orderBookOrders?l1_address={}&status=open&sort_by=block_height&order=desc&limit={}",
+                self.l1_address, Self::CANCEL_SCAN_LIMIT
             ),
         };
 
+        log::debug!("[cancel_all_orders] GET {} (authenticated)", endpoint);
         let orders: Vec<Value> = self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
         if orders.is_empty() {
@@ -789,6 +961,24 @@ impl DexConnector for LighterConnector {
 }
 
 impl LighterConnector {
+    async fn ensure_account_initialized(&self) -> Result<(), DexError> {
+        let path = format!("/api/v1/account?l1_address={}", self.l1_address);
+        match self.make_request::<LighterAccountResponse>(&path, HttpMethod::Get, None).await {
+            Ok(_) => {
+                log::debug!("Account is already initialized");
+                Ok(())
+            }
+            Err(DexError::Other(msg)) if msg.contains("account not found") => {
+                log::warn!("Account not found for {}. Initialize the account (deposit / onboarding) on Lighter first.", self.l1_address);
+                Err(DexError::Other(format!(
+                    "Account not initialized for {}. Please initialize on Lighter UI.",
+                    self.l1_address
+                )))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     async fn handle_websocket_message(
         message: Message,
         filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
