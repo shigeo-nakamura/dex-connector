@@ -26,11 +26,13 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[derive(Clone)]
 pub struct LighterConnector {
-    api_key: String,
-    private_key: String,
+    api_key_public: String,     // X-API-KEY header (from Lighter UI)
+    api_key_index: u32,         // api_key_index query param
+    l1_private_key_hex: String, // L1 EVM private key for signing (0x-prefixed hex)
+    account_index: u32,         // account_index query param
     base_url: String,
     websocket_url: String,
-    l1_address: String,
+    l1_address: String, // derived from l1_private_key_hex
     client: Client,
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
@@ -206,10 +208,12 @@ impl LighterConnector {
 
         // 2) account_index / api_key_index を 0 起点に固定
         log::error!(
-            "📋 ACCOUNT INDICES: Using account_index=0, api_key_index=0 (0-based indexing)"
+            "📋 ACCOUNT INDICES: Using account_index={}, api_key_index={} (0-based indexing)",
+            self.account_index,
+            self.api_key_index
         );
-        let account_index = 0;
-        let api_key_index = 0;
+        let account_index = self.account_index;
+        let api_key_index = self.api_key_index;
 
         // 3) 資産と口座状態の確認
         log::error!(
@@ -515,7 +519,7 @@ impl LighterConnector {
         let response = self
             .client
             .post(&sendtx_batch_url)
-            .header("X-API-KEY", &self.api_key)
+            .header("X-API-KEY", &self.api_key_public)
             .header("X-TIMESTAMP", timestamp.to_string())
             .header("X-SIGNATURE", &signature_65b)
             .header("Content-Type", "application/json")
@@ -632,7 +636,7 @@ impl LighterConnector {
         let envelope_response = self
             .client
             .post(&Self::join_url(&self.base_url, "/api/v1/sendTx"))
-            .header("X-API-KEY", &self.api_key)
+            .header("X-API-KEY", &self.api_key_public)
             .header("X-TIMESTAMP", timestamp.to_string())
             .header("X-SIGNATURE", &signature_65b)
             .header("Content-Type", "application/json")
@@ -1031,7 +1035,7 @@ impl LighterConnector {
                         .client
                         .post(&test_url)
                         .header("Content-Type", "application/json")
-                        .header("X-API-KEY", &self.api_key)
+                        .header("X-API-KEY", &self.api_key_public)
                         .header("X-TIMESTAMP", timestamp_ms.to_string())
                         .header("X-SIGNATURE", signature_65b_raw)
                         .body("{}")
@@ -1066,7 +1070,7 @@ impl LighterConnector {
                         .client
                         .post(&test_url)
                         .header("Content-Type", "application/json")
-                        .header("X-API-KEY", &self.api_key)
+                        .header("X-API-KEY", &self.api_key_public)
                         .header("X-TIMESTAMP", timestamp_ms.to_string())
                         .header("X-SIGNATURE", signature_65b_eip191)
                         .body("{}")
@@ -1234,7 +1238,7 @@ impl LighterConnector {
                 .client
                 .post(&url)
                 .header("Content-Type", content_type)
-                .header("X-API-KEY", &self.api_key)
+                .header("X-API-KEY", &self.api_key_public)
                 .header("X-TIMESTAMP", timestamp.to_string());
 
             // Prepare payload for signing and sending
@@ -1388,20 +1392,24 @@ impl LighterConnector {
     }
 
     pub fn new(
-        api_key: String,
-        private_key: String,
+        api_key_public: String,
+        api_key_index: u32,
+        l1_private_key_hex: String,
+        account_index: u32,
         base_url: String,
         websocket_url: String,
     ) -> Result<Self, DexError> {
-        let l1_address = Self::eth_address_from_privkey(&private_key)?;
+        let l1_address = Self::eth_address_from_privkey(&l1_private_key_hex)?;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| DexError::Other(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(LighterConnector {
-            api_key,
-            private_key,
+            api_key_public,
+            api_key_index,
+            l1_private_key_hex,
+            account_index,
             base_url,
             websocket_url: websocket_url.clone(),
             l1_address,
@@ -1415,8 +1423,8 @@ impl LighterConnector {
 
     async fn get_nonce(&self) -> Result<u64, DexError> {
         let endpoint = format!(
-            "/api/v1/nextNonce?l1_address={}&account_index=1&api_key_index=0",
-            self.l1_address
+            "/api/v1/nextNonce?l1_address={}&account_index={}&api_key_index={}",
+            self.l1_address, self.account_index, self.api_key_index
         );
         match self
             .make_request::<LighterNonceResponse>(&endpoint, HttpMethod::Get, None)
@@ -1486,7 +1494,7 @@ impl LighterConnector {
 
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(
-            &hex::decode(&self.private_key)
+            &hex::decode(&self.l1_private_key_hex.trim_start_matches("0x"))
                 .map_err(|e| DexError::Other(format!("Invalid private key format: {}", e)))?,
         )
         .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
@@ -1635,7 +1643,7 @@ impl LighterConnector {
         };
 
         request = request
-            .header("X-API-KEY", &self.api_key)
+            .header("X-API-KEY", &self.api_key_public)
             .header("X-TIMESTAMP", timestamp.to_string())
             .header("X-SIGNATURE", signature)
             .header("Content-Type", "application/json");
@@ -2305,7 +2313,7 @@ impl DexConnector for LighterConnector {
 
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(
-            &hex::decode(self.private_key.trim_start_matches("0x"))
+            &hex::decode(self.l1_private_key_hex.trim_start_matches("0x"))
                 .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))?,
         )
         .map_err(|e| DexError::Other(format!("Invalid secret key: {}", e)))?;
@@ -2344,7 +2352,7 @@ impl DexConnector for LighterConnector {
 
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(
-            &hex::decode(self.private_key.trim_start_matches("0x"))
+            &hex::decode(self.l1_private_key_hex.trim_start_matches("0x"))
                 .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))?,
         )
         .map_err(|e| DexError::Other(format!("Invalid secret key: {}", e)))?;
@@ -2516,13 +2524,41 @@ impl LighterConnector {
     }
 }
 
+// Legacy function for backward compatibility
 pub fn create_lighter_connector(
     api_key: String,
     private_key: String,
     base_url: String,
     websocket_url: String,
 ) -> Result<Box<dyn DexConnector>, DexError> {
-    let connector = LighterConnector::new(api_key, private_key, base_url, websocket_url)?;
+    // For backward compatibility, treat api_key as api_key_public and private_key as l1_private_key_hex
+    create_lighter_connector_detailed(
+        api_key,     // api_key_public
+        0,           // api_key_index (default)
+        private_key, // l1_private_key_hex
+        0,           // account_index (default)
+        base_url,
+        websocket_url,
+    )
+}
+
+// New detailed function with proper key separation
+pub fn create_lighter_connector_detailed(
+    api_key_public: String,
+    api_key_index: u32,
+    l1_private_key_hex: String,
+    account_index: u32,
+    base_url: String,
+    websocket_url: String,
+) -> Result<Box<dyn DexConnector>, DexError> {
+    let connector = LighterConnector::new(
+        api_key_public,
+        api_key_index,
+        l1_private_key_hex,
+        account_index,
+        base_url,
+        websocket_url,
+    )?;
     Ok(Box::new(connector))
 }
 
@@ -2545,8 +2581,15 @@ mod tests {
         let websocket_url = std::env::var("WEB_SOCKET_ENDPOINT")
             .unwrap_or_else(|_| "wss://mainnet.zklighter.elliot.ai/stream".to_string());
 
-        let connector = LighterConnector::new(api_key, private_key, base_url, websocket_url)
-            .expect("Failed to create connector");
+        let connector = LighterConnector::new(
+            api_key,     // api_key_public
+            0,           // api_key_index
+            private_key, // l1_private_key_hex
+            0,           // account_index
+            base_url,
+            websocket_url,
+        )
+        .expect("Failed to create connector");
 
         // Test the create_order function which should trigger our comprehensive fact-check + attack sequence
         let result = connector
