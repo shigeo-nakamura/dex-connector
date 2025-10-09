@@ -1853,6 +1853,18 @@ impl DexConnector for HyperliquidConnector {
         }
         false
     }
+
+    async fn sign_evm_65b(&self, _message: &str) -> Result<String, DexError> {
+        Err(DexError::Other(
+            "65B EVM signature not supported for Hyperliquid".to_string(),
+        ))
+    }
+
+    async fn sign_evm_65b_with_eip191(&self, _message: &str) -> Result<String, DexError> {
+        Err(DexError::Other(
+            "65B EIP-191 signature not supported for Hyperliquid".to_string(),
+        ))
+    }
 }
 
 impl HyperliquidConnector {
