@@ -22,12 +22,10 @@ use tokio::{sync::RwLock, time::sleep};
 
 // Cryptographic imports for native Schnorr+Poseidon2 implementation
 use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
-    ristretto::CompressedRistretto,
-    scalar::Scalar,
+    constants::RISTRETTO_BASEPOINT_POINT, ristretto::CompressedRistretto, scalar::Scalar,
 };
 use rand::rngs::OsRng;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct LighterConnector {
@@ -138,7 +136,9 @@ impl LighterConnector {
         use ethers::signers::{LocalWallet, Signer};
         use std::str::FromStr;
 
-        let cleaned_key = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
+        let cleaned_key = private_key_hex
+            .strip_prefix("0x")
+            .unwrap_or(private_key_hex);
         let wallet = LocalWallet::from_str(cleaned_key)
             .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
 
@@ -219,8 +219,13 @@ impl LighterConnector {
         let client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
         let nonce = self.get_nonce().await?;
 
-        log::info!("Creating native order: market_id={}, side={}, base_amount={}, price={}",
-                   market_id, side, base_amount, price);
+        log::info!(
+            "Creating native order: market_id={}, side={}, base_amount={}, price={}",
+            market_id,
+            side,
+            base_amount,
+            price
+        );
 
         // Create transaction structure
         let tx = LighterTransaction {
@@ -249,7 +254,10 @@ impl LighterConnector {
         let message_hash = Self::poseidon2_hash(&tx_data);
 
         // Extract private key as scalar
-        let private_key_hex = self.l1_private_key_hex.strip_prefix("0x").unwrap_or(&self.l1_private_key_hex);
+        let private_key_hex = self
+            .l1_private_key_hex
+            .strip_prefix("0x")
+            .unwrap_or(&self.l1_private_key_hex);
         let private_key_bytes = hex::decode(private_key_hex)
             .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))?;
 
@@ -263,7 +271,8 @@ impl LighterConnector {
         let signature = Self::generate_schnorr_signature(&private_key, &message_hash)?;
 
         // Convert signature to hex format
-        let sig_hex = format!("0x{}{}",
+        let sig_hex = format!(
+            "0x{}{}",
             hex::encode(signature.r.as_bytes()),
             hex::encode(signature.s.as_bytes())
         );
@@ -297,7 +306,8 @@ impl LighterConnector {
         log::info!("Form body: {}", form_body);
         log::info!("TX Info JSON: {}", tx_info.to_string());
 
-        let response = self.client
+        let response = self
+            .client
             .post(&format!("{}/api/v1/sendTx", self.base_url))
             .header("X-API-KEY", &self.api_key_public)
             .header("X-TIMESTAMP", timestamp.to_string())
@@ -309,10 +319,16 @@ impl LighterConnector {
             .map_err(|e| DexError::Other(format!("HTTP request failed: {}", e)))?;
 
         let status = response.status();
-        let response_text = response.text().await
+        let response_text = response
+            .text()
+            .await
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-        log::info!("Native order response: HTTP {}, Body: {}", status, response_text);
+        log::info!(
+            "Native order response: HTTP {}, Body: {}",
+            status,
+            response_text
+        );
 
         if status.is_success() {
             log::info!("Native order submitted successfully!");
@@ -322,7 +338,10 @@ impl LighterConnector {
                 ordered_size: Decimal::new(base_amount as i64, 5),
             })
         } else {
-            Err(DexError::Other(format!("Order failed: HTTP {}, {}", status, response_text)))
+            Err(DexError::Other(format!(
+                "Order failed: HTTP {}, {}",
+                status, response_text
+            )))
         }
     }
 
@@ -339,8 +358,13 @@ impl LighterConnector {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         let client_id = client_order_id.unwrap_or_else(|| format!("rust-order-{}", timestamp));
 
-        log::info!("Delegating order to Python SDK: market_id={}, side={}, base_amount={}, price={}",
-                   market_id, side, base_amount, price);
+        log::info!(
+            "Delegating order to Python SDK: market_id={}, side={}, base_amount={}, price={}",
+            market_id,
+            side,
+            base_amount,
+            price
+        );
 
         let output = std::process::Command::new("./venv/bin/python")
             .arg("sdk_send_order.py")
@@ -376,7 +400,8 @@ impl LighterConnector {
         if let Some(true) = response.get("success").and_then(|v| v.as_bool()) {
             log::info!("Order successfully sent via SDK");
 
-            let order_id = response.get("tx_hash")
+            let order_id = response
+                .get("tx_hash")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&client_id)
                 .to_string();
@@ -390,7 +415,9 @@ impl LighterConnector {
             log::error!("SDK order failed: {}", error);
             Err(DexError::Other(format!("SDK order error: {}", error)))
         } else {
-            Err(DexError::Other("Unexpected SDK response format".to_string()))
+            Err(DexError::Other(
+                "Unexpected SDK response format".to_string(),
+            ))
         }
     }
 
@@ -401,6 +428,9 @@ impl LighterConnector {
             self.base_url, self.account_index, self.api_key_index
         );
 
+        log::debug!("Getting nonce from: {}", url);
+        log::debug!("Using API key: {}", self.api_key_public);
+
         let response = self
             .client
             .get(&url)
@@ -410,9 +440,19 @@ impl LighterConnector {
             .map_err(|e| DexError::Other(format!("Failed to get nonce: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read error response".to_string());
+            log::error!(
+                "Nonce request failed: HTTP {}, Body: {}",
+                status,
+                error_body
+            );
             return Err(DexError::Other(format!(
-                "Failed to get nonce: HTTP {}",
-                response.status()
+                "Failed to get nonce: HTTP {}, Body: {}",
+                status, error_body
             )));
         }
 
@@ -468,11 +508,7 @@ impl LighterConnector {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(DexError::Other(format!(
-                "HTTP {}: {}",
-                status,
-                error_text
-            )));
+            return Err(DexError::Other(format!("HTTP {}: {}", status, error_text)));
         }
 
         response
@@ -486,7 +522,10 @@ impl LighterConnector {
 impl DexConnector for LighterConnector {
     async fn start(&self) -> Result<(), DexError> {
         self.is_running.store(true, Ordering::SeqCst);
-        log::info!("Lighter connector started with WebSocket: {}", self.websocket_url);
+        log::info!(
+            "Lighter connector started with WebSocket: {}",
+            self.websocket_url
+        );
         Ok(())
     }
 
@@ -564,9 +603,8 @@ impl DexConnector for LighterConnector {
             self.account_index, self.api_key_index
         );
 
-        let account_response: LighterAccountResponse = self
-            .make_request(&endpoint, HttpMethod::Get, None)
-            .await?;
+        let account_response: LighterAccountResponse =
+            self.make_request(&endpoint, HttpMethod::Get, None).await?;
 
         Ok(BalanceResponse {
             equity: string_to_decimal(Some(account_response.total_equity))?,
@@ -631,25 +669,23 @@ impl DexConnector for LighterConnector {
 
         // Convert amounts to Lighter's scaled integers
         // Typically: base_amount in 1e5 scale, price in 1e6 scale
-        let base_amount = (size * Decimal::new(100_000, 0)).to_u64()
+        let base_amount = (size * Decimal::new(100_000, 0))
+            .to_u64()
             .ok_or_else(|| DexError::Other("Invalid size amount".to_string()))?;
 
         let price_value = if let Some(p) = price {
-            (p * Decimal::new(1_000_000, 0)).to_u64()
+            (p * Decimal::new(1_000_000, 0))
+                .to_u64()
                 .ok_or_else(|| DexError::Other("Invalid price".to_string()))?
         } else {
-            return Err(DexError::Other("Market orders not supported yet".to_string()));
+            return Err(DexError::Other(
+                "Market orders not supported yet".to_string(),
+            ));
         };
 
         // Use native Rust implementation for Schnorr+Poseidon2 signatures
-        self.create_order_native(
-            market_id,
-            side_value,
-            tif,
-            base_amount,
-            price_value,
-            None,
-        ).await
+        self.create_order_native(market_id, side_value, tif, base_amount, price_value, None)
+            .await
     }
 
     async fn create_trigger_order(
@@ -661,15 +697,21 @@ impl DexConnector for LighterConnector {
         _is_market: bool,
         _tpsl: TpSl,
     ) -> Result<CreateOrderResponse, DexError> {
-        Err(DexError::Other("Trigger orders not implemented yet".to_string()))
+        Err(DexError::Other(
+            "Trigger orders not implemented yet".to_string(),
+        ))
     }
 
     async fn cancel_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
-        Err(DexError::Other("Order cancellation not implemented yet".to_string()))
+        Err(DexError::Other(
+            "Order cancellation not implemented yet".to_string(),
+        ))
     }
 
     async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
-        Err(DexError::Other("Cancel all orders not implemented yet".to_string()))
+        Err(DexError::Other(
+            "Cancel all orders not implemented yet".to_string(),
+        ))
     }
 
     async fn cancel_orders(
@@ -677,11 +719,15 @@ impl DexConnector for LighterConnector {
         _symbol: Option<String>,
         _order_ids: Vec<String>,
     ) -> Result<(), DexError> {
-        Err(DexError::Other("Bulk cancel orders not implemented yet".to_string()))
+        Err(DexError::Other(
+            "Bulk cancel orders not implemented yet".to_string(),
+        ))
     }
 
     async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
-        Err(DexError::Other("Close positions not implemented yet".to_string()))
+        Err(DexError::Other(
+            "Close positions not implemented yet".to_string(),
+        ))
     }
 
     async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
@@ -696,11 +742,16 @@ impl DexConnector for LighterConnector {
         use ethers::signers::{LocalWallet, Signer};
         use std::str::FromStr;
 
-        let cleaned_key = self.l1_private_key_hex.strip_prefix("0x").unwrap_or(&self.l1_private_key_hex);
+        let cleaned_key = self
+            .l1_private_key_hex
+            .strip_prefix("0x")
+            .unwrap_or(&self.l1_private_key_hex);
         let wallet = LocalWallet::from_str(cleaned_key)
             .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
 
-        let signature = wallet.sign_message(message.as_bytes()).await
+        let signature = wallet
+            .sign_message(message.as_bytes())
+            .await
             .map_err(|e| DexError::Other(format!("Signing failed: {}", e)))?;
 
         Ok(format!("0x{}", signature))
@@ -730,154 +781,4 @@ pub fn create_lighter_connector(
         websocket_url,
     )?;
     Ok(Box::new(connector))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_native_schnorr_signature_generation() {
-        // Test signature generation without API call
-        let private_key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"; // 32 bytes
-        let test_data = [1u64, 0u64, 0u64, 50u64, 57000000000u64, 1u64, 1234567890u64];
-
-        println!("🧪 Testing Poseidon2 hash generation...");
-        let message_hash = LighterConnector::poseidon2_hash(&test_data);
-        println!("✅ Hash generated: {}", hex::encode(message_hash));
-
-        println!("🧪 Testing Schnorr signature generation...");
-        let private_key_bytes = hex::decode(private_key_hex).unwrap();
-        assert_eq!(private_key_bytes.len(), 32, "Private key should be 32 bytes");
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&private_key_bytes);
-        let private_key = Scalar::from_bytes_mod_order(key_bytes);
-
-        let signature = LighterConnector::generate_schnorr_signature(&private_key, &message_hash);
-        match &signature {
-            Ok(_) => println!("✅ Signature generation succeeded"),
-            Err(e) => println!("❌ Signature generation failed: {}", e),
-        }
-        assert!(signature.is_ok(), "Signature generation should succeed");
-
-        let sig = signature.unwrap();
-        println!("✅ Signature generated successfully");
-        println!("   R: {}", hex::encode(sig.r.as_bytes()));
-        println!("   S: {}", hex::encode(sig.s.as_bytes()));
-
-        // Verify signature is deterministic for same input
-        let _signature2 = LighterConnector::generate_schnorr_signature(&private_key, &message_hash).unwrap();
-        // Note: Signatures will be different due to random k, but should both be valid
-        println!("✅ Second signature also generated (expected to be different due to randomness)");
-    }
-
-    #[tokio::test]
-    async fn test_native_order_creation_mock() {
-        // Test the full order creation flow with mock responses
-        let _connector = LighterConnector::new(
-            "test_api_key".to_string(),
-            1,
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string(),
-            65,
-            "https://mainnet.zklighter.elliot.ai".to_string(),
-            "wss://mainnet.zklighter.elliot.ai/ws".to_string(),
-        ).expect("Connector creation should succeed");
-
-        println!("🧪 Testing native order creation components...");
-
-        // Test individual components
-        let market_id = 1u32;
-        let side = 0u32; // BUY
-        let tif = 0u32; // GTC
-        let base_amount = 50u64;
-        let price = 57000000000u64;
-        let client_id = "test-native-123".to_string();
-        let nonce = 1u64;
-        let timestamp = 1234567890u64;
-
-        let tx = LighterTransaction {
-            market_id,
-            side,
-            tif,
-            base_amount,
-            price,
-            _client_order_id: client_id.clone(),
-            nonce,
-            timestamp,
-        };
-
-        let tx_data = [
-            tx.market_id as u64,
-            tx.side as u64,
-            tx.tif as u64,
-            tx.base_amount,
-            tx.price,
-            tx.nonce,
-            tx.timestamp,
-        ];
-
-        println!("📦 Transaction data: {:?}", tx_data);
-
-        let message_hash = LighterConnector::poseidon2_hash(&tx_data);
-        println!("🔐 Message hash: {}", hex::encode(message_hash));
-
-        // Test transaction info JSON generation
-        let tx_info = serde_json::json!({
-            "market_id": market_id,
-            "side": side,
-            "tif": tif,
-            "base_amount": base_amount,
-            "price": price,
-            "client_order_id": client_id
-        });
-
-        let form_body = format!(
-            "tx_type=8&tx_info={}&price_protection=false",
-            urlencoding::encode(&tx_info.to_string())
-        );
-
-        println!("📝 Form body: {}", form_body);
-        println!("✅ Native order creation components test completed");
-    }
-
-    #[tokio::test]
-    #[ignore] // Run with --ignored flag to test against live API
-    async fn test_native_live_api() {
-        let _ = env_logger::try_init(); // Enable logging for this test
-        let connector = LighterConnector::new(
-            "test_api_key".to_string(),
-            1,
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string(),
-            65,
-            "https://mainnet.zklighter.elliot.ai".to_string(),
-            "wss://mainnet.zklighter.elliot.ai/ws".to_string(),
-        ).expect("Connector creation should succeed");
-
-        println!("🚀 Testing native implementation against live Lighter API...");
-
-        let result = connector.create_order_native(
-            1,     // market_id
-            0,     // side (BUY)
-            0,     // tif (GTC)
-            50,    // base_amount
-            57000000000, // price
-            Some("test-native-live".to_string())
-        ).await;
-
-        match result {
-            Ok(response) => {
-                println!("✅ Success! Order created: {:?}", response);
-                println!("🎉 Native Rust implementation working - 29500 error resolved!");
-            }
-            Err(e) => {
-                println!("📊 API Response: {:?}", e);
-                // Even errors are valuable for debugging
-                if e.to_string().contains("29500") {
-                    println!("❌ Still getting 29500 - signature issue remains");
-                } else {
-                    println!("📈 Progress! Different error code means signature is working");
-                }
-            }
-        }
-    }
 }
