@@ -40,6 +40,7 @@ web3 = "0.19"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 urlencoding = "2.1"
 base64 = "0.21"
+libc = "0.2"
 
 # Cryptographic dependencies for Schnorr+Poseidon2
 curve25519-dalek = { version = "4.1", features = ["rand_core"] }
@@ -49,6 +50,8 @@ num-bigint = "0.4"
 num-traits = "0.2"
 # Poseidon hash function implementation
 poseidon-rs = "0.0.10"
+# Simple field arithmetic for Goldilocks
+# Using num-bigint for field operations
 
 [dev-dependencies]
 rusoto_core = "0.48"
