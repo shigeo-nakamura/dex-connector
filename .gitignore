@@ -1,2 +1,9 @@
 /target
 /Cargo.lock
+
+# Python virtual environment and temporary files
+venv/
+*.pyc
+__pycache__/
+*.py
+test_output.log

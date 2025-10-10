@@ -16,6 +16,7 @@ impl DexWebSocket {
         DexWebSocket { endpoint }
     }
 
+    #[allow(dead_code)]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
