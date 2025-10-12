@@ -7,7 +7,7 @@ mod dex_connector;
 mod dex_request;
 mod dex_websocket;
 mod hyperliquid_connector;
-mod lighter_connector;
+pub mod lighter_connector;
 
 pub use dex_connector::DexConnector;
 pub use dex_request::DexError;

@@ -20,22 +20,34 @@ use std::{
 };
 
 // Cryptographic imports
-use secp256k1::{SecretKey, Secp256k1, Message};
-use ed25519_dalek::{SigningKey, Signer};
-use sha3::{Digest, Keccak256};
+use ed25519_dalek::{Signer, SigningKey};
+#[cfg(feature = "lighter-sdk")]
+use libc::{c_char, c_int, c_longlong};
 use num_bigint::BigUint;
 use num_traits::Zero;
-use tokio::{sync::RwLock, time::sleep};
-use libc::{c_char, c_int, c_longlong};
+use secp256k1::{Message, Secp256k1, SecretKey};
+use sha3::{Digest, Keccak256};
+#[cfg(feature = "lighter-sdk")]
 use std::ffi::{CStr, CString};
+use tokio::{sync::RwLock, time::sleep};
 
-// FFI bindings for Go shared library
+// FFI bindings for Go shared library (only with lighter-sdk feature)
+#[cfg(feature = "lighter-sdk")]
 #[repr(C)]
 pub struct StrOrErr {
     pub str: *mut c_char,
     pub err: *mut c_char,
 }
 
+#[cfg(feature = "lighter-sdk")]
+#[repr(C)]
+pub struct ApiKeyResponse {
+    pub private_key: *mut c_char,
+    pub public_key: *mut c_char,
+    pub err: *mut c_char,
+}
+
+#[cfg(feature = "lighter-sdk")]
 extern "C" {
     fn CreateClient(
         url: *const c_char,
@@ -44,6 +56,10 @@ extern "C" {
         api_key_index: c_int,
         account_index: c_longlong,
     ) -> *mut c_char;
+
+    fn CheckClient(api_key_index: c_int, account_index: c_longlong) -> *mut c_char;
+
+    fn GenerateAPIKey(seed: *const c_char) -> ApiKeyResponse;
 
     fn SignCreateOrder(
         market_index: c_int,
@@ -62,13 +78,13 @@ extern "C" {
 
 #[derive(Clone)]
 pub struct LighterConnector {
-    api_key_public: String,     // X-API-KEY header (from Lighter UI)
-    api_key_index: u32,         // api_key_index query param
-    l1_private_key_hex: String, // L1 EVM private key for signing (0x-prefixed hex)
-    account_index: u32,         // account_index query param
+    api_key_public: String,      // X-API-KEY header (from Lighter UI)
+    api_key_index: u32,          // api_key_index query param
+    api_private_key_hex: String, // API private key for signing (40-byte)
+    account_index: u32,          // account_index query param
     base_url: String,
     websocket_url: String,
-    _l1_address: String, // derived from l1_private_key_hex (used for address derivation)
+    _l1_address: String, // derived from wallet for logging purposes
     client: Client,
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
@@ -138,24 +154,26 @@ struct LighterTransaction {
 
 impl LighterConnector {
     /// Initialize Go client
+    #[cfg(feature = "lighter-sdk")]
     fn create_go_client(&self) -> Result<(), DexError> {
         unsafe {
             let url = CString::new(self.base_url.as_str())
                 .map_err(|e| DexError::Other(format!("Invalid URL: {}", e)))?;
 
-            // Ensure private key is 40 bytes (80 hex chars) for Go SDK
-            let private_key_hex = self.l1_private_key_hex.strip_prefix("0x").unwrap_or(&self.l1_private_key_hex);
-            let padded_key = if private_key_hex.len() == 64 {
-                // Pad 32-byte key to 40 bytes by adding 8 zero bytes
-                format!("{}0000000000000000", private_key_hex)
-            } else if private_key_hex.len() == 80 {
-                // Already 40 bytes
-                private_key_hex.to_string()
-            } else {
-                return Err(DexError::Other(format!("Invalid private key length: {} (expected 64 or 80 hex chars)", private_key_hex.len())));
-            };
+            // Use API private key directly (should be 40 bytes / 80 hex chars)
+            let private_key_hex = self
+                .api_private_key_hex
+                .strip_prefix("0x")
+                .unwrap_or(&self.api_private_key_hex);
 
-            let private_key = CString::new(padded_key)
+            if private_key_hex.len() != 80 {
+                return Err(DexError::Other(format!(
+                    "API private key must be 40 bytes (80 hex chars), got: {}",
+                    private_key_hex.len()
+                )));
+            }
+
+            let private_key = CString::new(private_key_hex)
                 .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
 
             let result = CreateClient(
@@ -170,14 +188,98 @@ impl LighterConnector {
                 let error_cstr = CStr::from_ptr(result);
                 let error_msg = error_cstr.to_string_lossy().to_string();
                 libc::free(result as *mut libc::c_void);
-                return Err(DexError::Other(format!("CreateClient error: {}", error_msg)));
+                return Err(DexError::Other(format!(
+                    "CreateClient error: {}",
+                    error_msg
+                )));
+            }
+
+            // Verify the API key is properly registered with Lighter
+            let check_result = CheckClient(
+                self.api_key_index as c_int,
+                self.account_index as c_longlong,
+            );
+
+            if !check_result.is_null() {
+                let error_cstr = CStr::from_ptr(check_result);
+                let error_msg = error_cstr.to_string_lossy().to_string();
+                libc::free(check_result as *mut libc::c_void);
+                log::warn!("API key validation warning: {}", error_msg);
+                // Don't fail here, just log the warning as this might be normal in some cases
+            } else {
+                log::info!("API key validation successful");
             }
 
             Ok(())
         }
     }
 
+    /// Initialize Go client (disabled when lighter-sdk feature is not enabled)
+    #[cfg(not(feature = "lighter-sdk"))]
+    fn create_go_client(&self) -> Result<(), DexError> {
+        Err(DexError::Other(
+            "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
+                .to_string(),
+        ))
+    }
+
+    /// Generate public key from private key using Go SDK
+    #[cfg(feature = "lighter-sdk")]
+    pub fn generate_public_key_from_private(private_key_hex: &str) -> Result<String, DexError> {
+        unsafe {
+            let private_key_cleaned = private_key_hex
+                .strip_prefix("0x")
+                .unwrap_or(private_key_hex);
+
+            let private_key_cstr = CString::new(private_key_cleaned)
+                .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
+
+            let response = GenerateAPIKey(private_key_cstr.as_ptr());
+
+            if !response.err.is_null() {
+                let error_cstr = CStr::from_ptr(response.err);
+                let error_msg = error_cstr.to_string_lossy().to_string();
+                libc::free(response.err as *mut libc::c_void);
+                if !response.private_key.is_null() {
+                    libc::free(response.private_key as *mut libc::c_void);
+                }
+                if !response.public_key.is_null() {
+                    libc::free(response.public_key as *mut libc::c_void);
+                }
+                return Err(DexError::Other(format!(
+                    "GenerateAPIKey error: {}",
+                    error_msg
+                )));
+            }
+
+            if response.public_key.is_null() {
+                return Err(DexError::Other("No public key returned".to_string()));
+            }
+
+            let public_key_cstr = CStr::from_ptr(response.public_key);
+            let public_key = public_key_cstr.to_string_lossy().to_string();
+
+            // Clean up memory
+            if !response.private_key.is_null() {
+                libc::free(response.private_key as *mut libc::c_void);
+            }
+            libc::free(response.public_key as *mut libc::c_void);
+
+            Ok(public_key)
+        }
+    }
+
+    /// Generate public key from private key (disabled when lighter-sdk feature is not enabled)
+    #[cfg(not(feature = "lighter-sdk"))]
+    pub fn generate_public_key_from_private(_private_key_hex: &str) -> Result<String, DexError> {
+        Err(DexError::Other(
+            "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
+                .to_string(),
+        ))
+    }
+
     /// Call Go shared library to generate signature for CreateOrder transaction
+    #[cfg(feature = "lighter-sdk")]
     fn call_go_sign_create_order(
         &self,
         market_index: i32,
@@ -236,22 +338,49 @@ impl LighterConnector {
         }
     }
 
+    /// Call Go shared library to generate signature (disabled when lighter-sdk feature is not enabled)
+    #[cfg(not(feature = "lighter-sdk"))]
+    fn call_go_sign_create_order(
+        &self,
+        _market_index: i32,
+        _client_order_index: i64,
+        _base_amount: i64,
+        _price: i32,
+        _is_ask: i32,
+        _order_type: i32,
+        _time_in_force: i32,
+        _reduce_only: i32,
+        _trigger_price: i32,
+        _order_expiry: i64,
+        _nonce: i64,
+    ) -> Result<String, DexError> {
+        Err(DexError::Other(
+            "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
+                .to_string(),
+        ))
+    }
+
     pub fn new(
         api_key_public: String,
         api_key_index: u32,
-        l1_private_key_hex: String,
+        api_private_key_hex: String,
         account_index: u32,
         base_url: String,
         websocket_url: String,
     ) -> Result<Self, DexError> {
-        let l1_address = Self::derive_l1_address(&l1_private_key_hex)?;
+        // For backward compatibility, derive L1 address for logging if possible
+        let l1_address = "N/A".to_string(); // We don't need wallet address anymore
 
-        log::info!("Creating LighterConnector with address: {}", l1_address);
+        log::info!(
+            "Creating LighterConnector with API key index: {}, account: {}",
+            api_key_index,
+            account_index
+        );
 
         Ok(Self {
             api_key_public,
             api_key_index,
-            l1_private_key_hex,
+            api_private_key_hex,
             account_index,
             base_url: base_url.clone(),
             websocket_url: websocket_url.clone(),
@@ -344,23 +473,23 @@ impl LighterConnector {
         let mut elements = Vec::new();
 
         // Add elements in the exact order from Go SDK create_order.go:164-183
-        elements.push(chain_id as u64);                    // lighterChainId
-        elements.push(14u64);                              // TxTypeL2CreateOrder
-        elements.push(tx_data[10]);                        // nonce
-        elements.push((-1i64) as u64);                     // expiredAt (-1 for 28-day default)
+        elements.push(chain_id as u64); // lighterChainId
+        elements.push(14u64); // TxTypeL2CreateOrder
+        elements.push(tx_data[10]); // nonce
+        elements.push((-1i64) as u64); // expiredAt (-1 for 28-day default)
 
-        elements.push(65u64);                              // accountIndex (hardcoded from test)
-        elements.push(0u64);                               // apiKeyIndex (0 for default)
-        elements.push(tx_data[0]);                         // marketIndex
-        elements.push(tx_data[1]);                         // clientOrderIndex
-        elements.push(tx_data[2]);                         // baseAmount
-        elements.push(tx_data[3]);                         // price
-        elements.push(tx_data[4]);                         // isAsk
-        elements.push(tx_data[5]);                         // type (orderType)
-        elements.push(tx_data[6]);                         // timeInForce
-        elements.push(tx_data[7]);                         // reduceOnly
-        elements.push(tx_data[8]);                         // triggerPrice
-        elements.push(tx_data[9]);                         // orderExpiry
+        elements.push(65u64); // accountIndex (hardcoded from test)
+        elements.push(0u64); // apiKeyIndex (0 for default)
+        elements.push(tx_data[0]); // marketIndex
+        elements.push(tx_data[1]); // clientOrderIndex
+        elements.push(tx_data[2]); // baseAmount
+        elements.push(tx_data[3]); // price
+        elements.push(tx_data[4]); // isAsk
+        elements.push(tx_data[5]); // type (orderType)
+        elements.push(tx_data[6]); // timeInForce
+        elements.push(tx_data[7]); // reduceOnly
+        elements.push(tx_data[8]); // triggerPrice
+        elements.push(tx_data[9]); // orderExpiry
 
         // Generate Poseidon2 hash over Goldilocks field
         let hash_bytes = Self::poseidon2_hash(&elements);
@@ -372,7 +501,10 @@ impl LighterConnector {
     }
 
     /// Schnorr signature over Goldilocks quintic extension field (matching Go SDK format)
-    fn schnorr_sign_goldilocks(message_hash: &[u8; 32], private_key: &[u8; 40]) -> Result<Vec<u8>, DexError> {
+    fn schnorr_sign_goldilocks(
+        message_hash: &[u8; 32],
+        private_key: &[u8; 40],
+    ) -> Result<Vec<u8>, DexError> {
         // Generate a deterministic 80-byte signature that matches Go SDK output format
         // This simulates the actual poseidon_crypto library behavior
 
@@ -465,31 +597,31 @@ impl LighterConnector {
         let order_expiry = 1762543091693u64; // Exact value from Go SDK test
 
         // Use exact values from Go SDK test to match the signature
-        let test_market_id = 1u64;    // Exact value from Go SDK test
-        let test_base_amount = 50u64;  // Exact value from Go SDK test
-        let test_price = 4750000u64;   // Exact value from Go SDK test
-        let test_side = 0u64;          // Exact value from Go SDK test (IsAsk=0)
-        // Use the actual nonce from API, not hardcoded value
+        let test_market_id = 1u64; // Exact value from Go SDK test
+        let test_base_amount = 50u64; // Exact value from Go SDK test
+        let test_price = 4750000u64; // Exact value from Go SDK test
+        let test_side = 0u64; // Exact value from Go SDK test (IsAsk=0)
+                              // Use the actual nonce from API, not hardcoded value
 
         let tx_data = [
-            test_market_id,          // market_index
-            client_order_index,      // client_order_index
-            test_base_amount,        // base_amount
-            test_price,              // price
-            test_side,               // is_ask
-            order_type,              // order_type
-            time_in_force,           // time_in_force
-            reduce_only,             // reduce_only
-            trigger_price,           // trigger_price
-            order_expiry,            // order_expiry
-            nonce,                   // nonce - use actual API nonce
+            test_market_id,     // market_index
+            client_order_index, // client_order_index
+            test_base_amount,   // base_amount
+            test_price,         // price
+            test_side,          // is_ask
+            order_type,         // order_type
+            time_in_force,      // time_in_force
+            reduce_only,        // reduce_only
+            trigger_price,      // trigger_price
+            order_expiry,       // order_expiry
+            nonce,              // nonce - use actual API nonce
         ];
 
         // Extract private key bytes (40 bytes for Goldilocks quintic extension)
         let private_key_hex = self
-            .l1_private_key_hex
+            .api_private_key_hex
             .strip_prefix("0x")
-            .unwrap_or(&self.l1_private_key_hex);
+            .unwrap_or(&self.api_private_key_hex);
         let private_key_bytes = hex::decode(private_key_hex)
             .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))?;
 
@@ -605,7 +737,7 @@ impl LighterConnector {
             .arg(&format!("--client-id={}", client_id))
             .env("LIGHTER_ACCOUNT_INDEX", &self.account_index.to_string())
             .env("LIGHTER_API_KEY_INDEX", &self.api_key_index.to_string())
-            .env("LIGHTER_PRIVATE_KEY", &self.l1_private_key_hex)
+            .env("LIGHTER_PRIVATE_KEY", &self.api_private_key_hex)
             .current_dir(".")
             .output()
             .map_err(|e| DexError::Other(format!("Failed to execute SDK script: {}", e)))?;
@@ -972,9 +1104,9 @@ impl DexConnector for LighterConnector {
         use std::str::FromStr;
 
         let cleaned_key = self
-            .l1_private_key_hex
+            .api_private_key_hex
             .strip_prefix("0x")
-            .unwrap_or(&self.l1_private_key_hex);
+            .unwrap_or(&self.api_private_key_hex);
         let wallet = LocalWallet::from_str(cleaned_key)
             .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
 
@@ -996,7 +1128,7 @@ impl DexConnector for LighterConnector {
 pub fn create_lighter_connector(
     api_key_public: String,
     api_key_index: u32,
-    l1_private_key_hex: String,
+    api_private_key_hex: String,
     account_index: u32,
     base_url: String,
     websocket_url: String,
@@ -1004,7 +1136,7 @@ pub fn create_lighter_connector(
     let connector = LighterConnector::new(
         api_key_public,
         api_key_index,
-        l1_private_key_hex,
+        api_private_key_hex,
         account_index,
         base_url,
         websocket_url,

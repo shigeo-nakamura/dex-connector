@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "2.5.6"
+version = "2.5.7"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -8,6 +8,10 @@ documentation = "https://docs.rs/dex-connector/"
 homepage = "https://crates.io/crates/dex-connector"
 repository = "https://github.com/shigeo-nakamura/dex-connector"
 license = "MIT"
+
+[features]
+default = ["lighter-sdk"]
+lighter-sdk = ["dep:libc"]
 
 [dependencies]
 chrono = { version = "0.4.26", default-features = false, features = ["clock", "serde"] }
@@ -40,7 +44,7 @@ web3 = "0.19"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 urlencoding = "2.1"
 base64 = "0.21"
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 # Cryptographic dependencies for Schnorr+Poseidon2
 curve25519-dalek = { version = "4.1", features = ["rand_core"] }
