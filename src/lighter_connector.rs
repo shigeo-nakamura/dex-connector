@@ -737,7 +737,7 @@ impl LighterConnector {
             .arg(&format!("--client-id={}", client_id))
             .env("LIGHTER_ACCOUNT_INDEX", &self.account_index.to_string())
             .env("LIGHTER_API_KEY_INDEX", &self.api_key_index.to_string())
-            .env("LIGHTER_PRIVATE_KEY", &self.api_private_key_hex)
+            .env("LIGHTER_PRIVATE_API_KEY", &self.api_private_key_hex)
             .current_dir(".")
             .output()
             .map_err(|e| DexError::Other(format!("Failed to execute SDK script: {}", e)))?;
