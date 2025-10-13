@@ -69,11 +69,12 @@ extern "C" {
 
 #[derive(Clone)]
 pub struct LighterConnector {
-    api_key_public: String,                 // X-API-KEY header (from Lighter UI)
-    api_key_index: u32,                     // api_key_index query param
-    api_private_key_hex: String,            // API private key for signing (40-byte)
+    api_key_public: String,      // X-API-KEY header (from Lighter UI)
+    api_key_index: u32,          // api_key_index query param
+    api_private_key_hex: String, // API private key for signing (40-byte)
+    #[cfg(feature = "lighter-sdk")]
     evm_wallet_private_key: Option<String>, // EVM wallet private key for API key registration
-    account_index: u32,                     // account_index query param
+    account_index: u32,          // account_index query param
     base_url: String,
     websocket_url: String,
     _l1_address: String, // derived from wallet for logging purposes
@@ -231,6 +232,7 @@ impl LighterConnector {
                 }
 
                 // If EVM wallet private key is provided, mark for API key registration
+                #[cfg(feature = "lighter-sdk")]
                 if self.evm_wallet_private_key.is_some() {
                     log::info!(
                         "EVM wallet private key provided. API key registration is required."
@@ -242,6 +244,12 @@ impl LighterConnector {
                         error_msg
                     )));
                 }
+
+                #[cfg(not(feature = "lighter-sdk"))]
+                return Err(DexError::Other(format!(
+                    "API key validation failed: {}",
+                    error_msg
+                )));
             } else {
                 log::info!("API key validation successful");
             }
@@ -337,6 +345,7 @@ impl LighterConnector {
         ))
     }
 
+    #[cfg(feature = "lighter-sdk")]
     pub fn new(
         api_key_public: String,
         api_key_index: u32,
@@ -360,6 +369,41 @@ impl LighterConnector {
             api_key_index,
             api_private_key_hex,
             evm_wallet_private_key,
+            account_index,
+            base_url: base_url.clone(),
+            websocket_url: websocket_url.clone(),
+            _l1_address: l1_address,
+            client: Client::new(),
+            filled_orders: Arc::new(RwLock::new(HashMap::new())),
+            canceled_orders: Arc::new(RwLock::new(HashMap::new())),
+            is_running: Arc::new(AtomicBool::new(false)),
+            _ws: Some(DexWebSocket::new(websocket_url)),
+        })
+    }
+
+    #[cfg(not(feature = "lighter-sdk"))]
+    pub fn new(
+        api_key_public: String,
+        api_key_index: u32,
+        api_private_key_hex: String,
+        _evm_wallet_private_key: Option<String>,
+        account_index: u32,
+        base_url: String,
+        websocket_url: String,
+    ) -> Result<Self, DexError> {
+        // For backward compatibility, derive L1 address for logging if possible
+        let l1_address = "N/A".to_string(); // We don't need wallet address anymore
+
+        log::info!(
+            "Creating LighterConnector with API key index: {}, account: {}",
+            api_key_index,
+            account_index
+        );
+
+        Ok(Self {
+            api_key_public,
+            api_key_index,
+            api_private_key_hex,
             account_index,
             base_url: base_url.clone(),
             websocket_url: websocket_url.clone(),
@@ -754,6 +798,7 @@ impl LighterConnector {
         Err("API key registration requires lighter-sdk feature".to_string())
     }
 
+    #[cfg(feature = "lighter-sdk")]
     fn sign_message_with_lighter_go_evm(
         &self,
         evm_private_key: &str,
@@ -784,6 +829,15 @@ impl LighterConnector {
         };
 
         Ok(signature_clean.to_string())
+    }
+
+    #[cfg(not(feature = "lighter-sdk"))]
+    fn sign_message_with_lighter_go_evm(
+        &self,
+        _evm_private_key: &str,
+        _message: &str,
+    ) -> Result<String, String> {
+        Err("EVM signing with lighter-go requires lighter-sdk feature".to_string())
     }
 
     fn _unused_sign_with_evm_key(
@@ -907,6 +961,7 @@ impl DexConnector for LighterConnector {
                     log::info!("API key validation successful");
                 }
                 Err(DexError::ApiKeyRegistrationRequired) => {
+                    #[cfg(feature = "lighter-sdk")]
                     if let Some(evm_key) = &self.evm_wallet_private_key {
                         log::info!("API key registration required. Attempting to register...");
                         self.register_api_key(evm_key).await.map_err(|e| {
@@ -920,6 +975,9 @@ impl DexConnector for LighterConnector {
                     } else {
                         return Err(DexError::ApiKeyRegistrationRequired);
                     }
+
+                    #[cfg(not(feature = "lighter-sdk"))]
+                    return Err(DexError::ApiKeyRegistrationRequired);
                 }
                 Err(e) => return Err(e),
             }
