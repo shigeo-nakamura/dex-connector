@@ -468,6 +468,8 @@ impl LighterConnector {
         private_key_bytes: &[u8; 40], // 40 bytes for Goldilocks quintic extension
         tx_data: &[u64],
         chain_id: u32,
+        account_index: u32,
+        api_key_index: u32,
     ) -> Result<String, DexError> {
         // Convert transaction data to Goldilocks field elements (matching Go SDK Hash function)
         let mut elements = Vec::new();
@@ -478,8 +480,8 @@ impl LighterConnector {
         elements.push(tx_data[10]); // nonce
         elements.push((-1i64) as u64); // expiredAt (-1 for 28-day default)
 
-        elements.push(65u64); // accountIndex (hardcoded from test)
-        elements.push(0u64); // apiKeyIndex (0 for default)
+        elements.push(account_index as u64); // accountIndex
+        elements.push(api_key_index as u64); // apiKeyIndex
         elements.push(tx_data[0]); // marketIndex
         elements.push(tx_data[1]); // clientOrderIndex
         elements.push(tx_data[2]); // baseAmount
