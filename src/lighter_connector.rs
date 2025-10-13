@@ -1016,7 +1016,7 @@ impl LighterConnector {
         let url = format!("{}/api/v1/sendTx", base_url);
 
         let form_data = [
-            ("tx_type", "17"), // TX_TYPE_CHANGE_PUB_KEY = 17 (correct value)
+            ("tx_type", "8"), // TX_TYPE_CHANGE_PUB_KEY = 8 (correct value from Go SDK)
             ("tx_info", tx_info),
         ];
 
