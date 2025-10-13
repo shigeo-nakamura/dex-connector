@@ -27,6 +27,7 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use secp256k1::{Message, Secp256k1, SecretKey};
 use sha3::{Digest, Keccak256};
+use serde_json::Value;
 #[cfg(feature = "lighter-sdk")]
 use std::ffi::{CStr, CString};
 use tokio::{sync::RwLock, time::sleep};
@@ -74,6 +75,8 @@ extern "C" {
         order_expiry: c_longlong,
         nonce: c_longlong,
     ) -> StrOrErr;
+
+    fn SignChangePubKey(new_pubkey: *const c_char, nonce: c_longlong) -> StrOrErr;
 }
 
 #[derive(Clone)]
@@ -81,6 +84,7 @@ pub struct LighterConnector {
     api_key_public: String,      // X-API-KEY header (from Lighter UI)
     api_key_index: u32,          // api_key_index query param
     api_private_key_hex: String, // API private key for signing (40-byte)
+    evm_wallet_private_key: Option<String>, // EVM wallet private key for API key registration
     account_index: u32,          // account_index query param
     base_url: String,
     websocket_url: String,
@@ -179,7 +183,7 @@ impl LighterConnector {
             let result = CreateClient(
                 url.as_ptr(),
                 private_key.as_ptr(),
-                1, // chain_id = 1 for mainnet
+                304, // chain_id = 304 for mainnet (same as Python SDK)
                 self.api_key_index as c_int,
                 self.account_index as c_longlong,
             );
@@ -204,8 +208,15 @@ impl LighterConnector {
                 let error_cstr = CStr::from_ptr(check_result);
                 let error_msg = error_cstr.to_string_lossy().to_string();
                 libc::free(check_result as *mut libc::c_void);
-                log::warn!("API key validation warning: {}", error_msg);
-                // Don't fail here, just log the warning as this might be normal in some cases
+                log::error!("API key validation failed: {}", error_msg);
+
+                // If EVM wallet private key is provided, mark for API key registration
+                if self.evm_wallet_private_key.is_some() {
+                    log::info!("EVM wallet private key provided. API key registration is required.");
+                    return Err(DexError::ApiKeyRegistrationRequired);
+                } else {
+                    return Err(DexError::Other(format!("API key validation failed: {}", error_msg)));
+                }
             } else {
                 log::info!("API key validation successful");
             }
@@ -364,6 +375,7 @@ impl LighterConnector {
         api_key_public: String,
         api_key_index: u32,
         api_private_key_hex: String,
+        evm_wallet_private_key: Option<String>,
         account_index: u32,
         base_url: String,
         websocket_url: String,
@@ -381,6 +393,7 @@ impl LighterConnector {
             api_key_public,
             api_key_index,
             api_private_key_hex,
+            evm_wallet_private_key,
             account_index,
             base_url: base_url.clone(),
             websocket_url: websocket_url.clone(),
@@ -659,24 +672,23 @@ impl LighterConnector {
         // Use the complete transaction JSON from Go SDK directly
         let tx_info = go_result;
 
-        // Send to Lighter API using multipart/form-data as per OpenAPI spec
-        use reqwest::multipart;
-
-        let form = multipart::Form::new()
-            .text("tx_type", "14")
-            .text("tx_info", tx_info.clone())
-            .text("price_protection", "false");
+        // Send to Lighter API using application/x-www-form-urlencoded format (same as Go SDK)
+        let form_data = format!(
+            "tx_type=14&tx_info={}&price_protection=false",
+            urlencoding::encode(&tx_info)
+        );
 
         log::info!("=== REQUEST DEBUG ===");
         log::info!("Timestamp: {}", timestamp);
         log::info!("TX Info JSON: {}", tx_info);
+        log::info!("Form data: {}", form_data);
 
-        // Use multipart/form-data as specified in OpenAPI
+        // Use form-urlencoded format same as Go SDK, without X-API-KEY header
         let response = self
             .client
             .post(&format!("{}/api/v1/sendTx", self.base_url))
-            .header("X-API-KEY", &self.api_key_public)
-            .multipart(form)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_data)
             .send()
             .await
             .map_err(|e| DexError::Other(format!("HTTP request failed: {}", e)))?;
@@ -879,6 +891,195 @@ impl LighterConnector {
             .await
             .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))
     }
+
+    #[cfg(feature = "lighter-sdk")]
+    async fn register_api_key(&self, evm_private_key: &str) -> Result<(), String> {
+        use libc;
+
+        log::info!("Starting API key registration process...");
+
+        // Step 1: Generate new API key pair
+        let seed = CString::new("api_key_registration_seed").map_err(|e| format!("Failed to create seed CString: {}", e))?;
+        let api_key_response = unsafe { GenerateAPIKey(seed.as_ptr()) };
+
+        if !api_key_response.err.is_null() {
+            let error_cstr = unsafe { CStr::from_ptr(api_key_response.err) };
+            let error_msg = error_cstr.to_string_lossy().to_string();
+            unsafe {
+                if !api_key_response.private_key.is_null() {
+                    libc::free(api_key_response.private_key as *mut libc::c_void);
+                }
+                if !api_key_response.public_key.is_null() {
+                    libc::free(api_key_response.public_key as *mut libc::c_void);
+                }
+                libc::free(api_key_response.err as *mut libc::c_void);
+            }
+            return Err(format!("Failed to generate API key: {}", error_msg));
+        }
+
+        let public_key = if api_key_response.public_key.is_null() {
+            return Err("Generated public key is null".to_string());
+        } else {
+            let public_key_cstr = unsafe { CStr::from_ptr(api_key_response.public_key) };
+            public_key_cstr.to_string_lossy().to_string()
+        };
+
+        // Clean up the private key immediately (we don't need it for registration)
+        unsafe {
+            if !api_key_response.private_key.is_null() {
+                libc::free(api_key_response.private_key as *mut libc::c_void);
+            }
+            if !api_key_response.public_key.is_null() {
+                libc::free(api_key_response.public_key as *mut libc::c_void);
+            }
+        }
+
+        log::info!("Generated new API key pair, public key: {}", public_key);
+
+        // Step 2: Get current nonce
+        let nonce = self.get_nonce().await.map_err(|e| format!("Failed to get nonce: {:?}", e))?;
+        log::info!("Got nonce for API key change: {}", nonce);
+
+        // Step 3: Sign the change API key transaction
+        let new_pubkey_cstr = CString::new(public_key.clone()).map_err(|e| format!("Failed to create pubkey CString: {}", e))?;
+        let sign_result = unsafe { SignChangePubKey(new_pubkey_cstr.as_ptr(), nonce as c_longlong) };
+
+        if !sign_result.err.is_null() {
+            let error_cstr = unsafe { CStr::from_ptr(sign_result.err) };
+            let error_msg = error_cstr.to_string_lossy().to_string();
+            unsafe {
+                if !sign_result.str.is_null() {
+                    libc::free(sign_result.str as *mut libc::c_void);
+                }
+                libc::free(sign_result.err as *mut libc::c_void);
+            }
+            return Err(format!("Failed to sign change API key transaction: {}", error_msg));
+        }
+
+        let tx_info_str = if sign_result.str.is_null() {
+            return Err("Signed transaction info is null".to_string());
+        } else {
+            let tx_info_cstr = unsafe { CStr::from_ptr(sign_result.str) };
+            let tx_info_string = tx_info_cstr.to_string_lossy().to_string();
+            unsafe {
+                libc::free(sign_result.str as *mut libc::c_void);
+            }
+            tx_info_string
+        };
+
+        log::debug!("Change API key tx info: {}", tx_info_str);
+
+        // Step 4: Parse the transaction info to get the message to sign
+        let tx_info: Value = serde_json::from_str(&tx_info_str)
+            .map_err(|e| format!("Failed to parse tx info JSON: {}", e))?;
+
+        let message_to_sign = tx_info.get("MessageToSign")
+            .and_then(|v| v.as_str())
+            .ok_or("MessageToSign not found in tx info")?;
+
+        log::debug!("Message to sign: {}", message_to_sign);
+
+        // Step 5: Sign with EVM private key
+        let evm_signature = self.sign_with_evm_key(evm_private_key, message_to_sign)?;
+        log::debug!("EVM signature: {}", evm_signature);
+
+        // Step 6: Add EVM signature to tx_info
+        let mut tx_info_with_sig = tx_info;
+        tx_info_with_sig["EvmSignature"] = Value::String(evm_signature);
+
+        let final_tx_info = serde_json::to_string(&tx_info_with_sig)
+            .map_err(|e| format!("Failed to serialize final tx info: {}", e))?;
+
+        log::debug!("Final tx info with EVM signature: {}", final_tx_info);
+
+        // Step 7: Send the change API key transaction
+        let response = self.send_change_api_key_request(&final_tx_info).await?;
+
+        log::info!("API key registration completed successfully: {:?}", response);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "lighter-sdk"))]
+    async fn register_api_key(&self, _evm_private_key: &str) -> Result<(), String> {
+        Err("API key registration requires lighter-sdk feature".to_string())
+    }
+
+    fn sign_with_evm_key(&self, evm_private_key: &str, message: &str) -> Result<String, String> {
+        // Parse the private key - try base64 first, then hex
+        let private_key_bytes = if evm_private_key.contains("=") || evm_private_key.contains("+") || evm_private_key.contains("/") {
+            // Looks like base64
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(evm_private_key)
+                .map_err(|e| format!("Failed to decode private key base64: {}", e))?
+        } else {
+            // Try hex format
+            let private_key_hex = if evm_private_key.starts_with("0x") {
+                &evm_private_key[2..]
+            } else {
+                evm_private_key
+            };
+
+            hex::decode(private_key_hex)
+                .map_err(|e| format!("Failed to decode private key hex: {}", e))?
+        };
+
+        if private_key_bytes.len() != 32 {
+            return Err("Private key must be 32 bytes".to_string());
+        }
+
+        let secret_key = SecretKey::from_slice(&private_key_bytes)
+            .map_err(|e| format!("Failed to create secret key: {}", e))?;
+
+        // Create message hash (Keccak256 of the message)
+        let message_bytes = message.as_bytes();
+        let mut hasher = Keccak256::new();
+        hasher.update(message_bytes);
+        let message_hash = hasher.finalize();
+
+        // Sign the message
+        let secp = Secp256k1::new();
+        let message_obj = Message::from_digest_slice(&message_hash)
+            .map_err(|e| format!("Failed to create message: {}", e))?;
+
+        let signature = secp.sign_ecdsa(&message_obj, &secret_key);
+        let signature_bytes = signature.serialize_compact();
+
+        // Encode as hex
+        Ok(hex::encode(signature_bytes))
+    }
+
+    async fn send_change_api_key_request(&self, tx_info: &str) -> Result<serde_json::Value, String> {
+        let base_url = self.base_url.trim_end_matches('/');
+        let url = format!("{}/api/v1/send_tx", base_url);
+
+        let form_data = [
+            ("tx_type", "17"), // TX_TYPE_CHANGE_PUB_KEY = 17
+            ("tx_info", tx_info),
+        ];
+
+        log::debug!("Sending change API key request to: {}", url);
+        log::debug!("Form data: {:?}", form_data);
+
+        let response = self.client
+            .post(&url)
+            .form(&form_data)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+
+        let status = response.status();
+        let response_text = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+
+        log::debug!("Change API key response: HTTP {}, Body: {}", status, response_text);
+
+        if !status.is_success() {
+            return Err(format!("HTTP {}: {}", status, response_text));
+        }
+
+        serde_json::from_str(&response_text)
+            .map_err(|e| format!("Failed to parse response JSON: {}", e))
+    }
 }
 
 #[async_trait]
@@ -889,6 +1090,32 @@ impl DexConnector for LighterConnector {
             "Lighter connector started with WebSocket: {}",
             self.websocket_url
         );
+
+        // Initialize the Go client and validate API key
+        #[cfg(feature = "lighter-sdk")]
+        {
+            match self.create_go_client() {
+                Ok(()) => {
+                    log::info!("API key validation successful");
+                }
+                Err(DexError::ApiKeyRegistrationRequired) => {
+                    if let Some(evm_key) = &self.evm_wallet_private_key {
+                        log::info!("API key registration required. Attempting to register...");
+                        self.register_api_key(evm_key).await
+                            .map_err(|e| DexError::Other(format!("API key registration failed: {}", e)))?;
+
+                        // Retry validation after registration
+                        log::info!("Retrying API key validation after registration...");
+                        self.create_go_client()?;
+                        log::info!("API key validation successful after registration");
+                    } else {
+                        return Err(DexError::ApiKeyRegistrationRequired);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         Ok(())
     }
 
@@ -1131,6 +1358,7 @@ pub fn create_lighter_connector(
     api_key_public: String,
     api_key_index: u32,
     api_private_key_hex: String,
+    evm_wallet_private_key: Option<String>,
     account_index: u32,
     base_url: String,
     websocket_url: String,
@@ -1139,6 +1367,7 @@ pub fn create_lighter_connector(
         api_key_public,
         api_key_index,
         api_private_key_hex,
+        evm_wallet_private_key,
         account_index,
         base_url,
         websocket_url,

@@ -43,6 +43,7 @@ pub enum DexError {
     Other(String),
     NoConnection,
     UpcomingMaintenance,
+    ApiKeyRegistrationRequired,
 }
 
 impl From<ParseDecimalError> for DexError {
@@ -61,6 +62,7 @@ impl Display for DexError {
             DexError::NoConnection => write!(f, "No running WebSocketConnection"),
             DexError::WebSocketError(ref e) => write!(f, "WebSocket error: {}", e),
             DexError::UpcomingMaintenance => write!(f, "Network upgrade scheduled in < 2h"),
+            DexError::ApiKeyRegistrationRequired => write!(f, "API key registration is required"),
         }
     }
 }
@@ -75,6 +77,7 @@ impl StdError for DexError {
             DexError::NoConnection => None,
             DexError::WebSocketError(_) => None,
             DexError::UpcomingMaintenance => None,
+            DexError::ApiKeyRegistrationRequired => None,
         }
     }
 }
