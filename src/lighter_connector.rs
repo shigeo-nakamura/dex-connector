@@ -40,13 +40,6 @@ pub struct StrOrErr {
     pub err: *mut c_char,
 }
 
-#[cfg(feature = "lighter-sdk")]
-#[repr(C)]
-pub struct ApiKeyResponse {
-    pub private_key: *mut c_char,
-    pub public_key: *mut c_char,
-    pub err: *mut c_char,
-}
 
 #[cfg(feature = "lighter-sdk")]
 extern "C" {
@@ -60,7 +53,6 @@ extern "C" {
 
     fn CheckClient(api_key_index: c_int, account_index: c_longlong) -> *mut c_char;
 
-    fn GenerateAPIKey(seed: *const c_char) -> ApiKeyResponse;
 
     fn SignCreateOrder(
         market_index: c_int,
@@ -234,60 +226,6 @@ impl LighterConnector {
         ))
     }
 
-    /// Generate public key from private key using Go SDK
-    #[cfg(feature = "lighter-sdk")]
-    pub fn generate_public_key_from_private(private_key_hex: &str) -> Result<String, DexError> {
-        unsafe {
-            let private_key_cleaned = private_key_hex
-                .strip_prefix("0x")
-                .unwrap_or(private_key_hex);
-
-            let private_key_cstr = CString::new(private_key_cleaned)
-                .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
-
-            let response = GenerateAPIKey(private_key_cstr.as_ptr());
-
-            if !response.err.is_null() {
-                let error_cstr = CStr::from_ptr(response.err);
-                let error_msg = error_cstr.to_string_lossy().to_string();
-                libc::free(response.err as *mut libc::c_void);
-                if !response.private_key.is_null() {
-                    libc::free(response.private_key as *mut libc::c_void);
-                }
-                if !response.public_key.is_null() {
-                    libc::free(response.public_key as *mut libc::c_void);
-                }
-                return Err(DexError::Other(format!(
-                    "GenerateAPIKey error: {}",
-                    error_msg
-                )));
-            }
-
-            if response.public_key.is_null() {
-                return Err(DexError::Other("No public key returned".to_string()));
-            }
-
-            let public_key_cstr = CStr::from_ptr(response.public_key);
-            let public_key = public_key_cstr.to_string_lossy().to_string();
-
-            // Clean up memory
-            if !response.private_key.is_null() {
-                libc::free(response.private_key as *mut libc::c_void);
-            }
-            libc::free(response.public_key as *mut libc::c_void);
-
-            Ok(public_key)
-        }
-    }
-
-    /// Generate public key from private key (disabled when lighter-sdk feature is not enabled)
-    #[cfg(not(feature = "lighter-sdk"))]
-    pub fn generate_public_key_from_private(_private_key_hex: &str) -> Result<String, DexError> {
-        Err(DexError::Other(
-            "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
-                .to_string(),
-        ))
-    }
 
     /// Call Go shared library to generate signature for CreateOrder transaction
     #[cfg(feature = "lighter-sdk")]
@@ -893,110 +831,8 @@ impl LighterConnector {
     }
 
     #[cfg(feature = "lighter-sdk")]
-    async fn register_api_key(&self, evm_private_key: &str) -> Result<(), String> {
-        use libc;
-
-        log::info!("Starting API key registration process...");
-
-        // Step 1: Generate new API key pair
-        let seed = CString::new("api_key_registration_seed").map_err(|e| format!("Failed to create seed CString: {}", e))?;
-        let api_key_response = unsafe { GenerateAPIKey(seed.as_ptr()) };
-
-        if !api_key_response.err.is_null() {
-            let error_cstr = unsafe { CStr::from_ptr(api_key_response.err) };
-            let error_msg = error_cstr.to_string_lossy().to_string();
-            unsafe {
-                if !api_key_response.private_key.is_null() {
-                    libc::free(api_key_response.private_key as *mut libc::c_void);
-                }
-                if !api_key_response.public_key.is_null() {
-                    libc::free(api_key_response.public_key as *mut libc::c_void);
-                }
-                libc::free(api_key_response.err as *mut libc::c_void);
-            }
-            return Err(format!("Failed to generate API key: {}", error_msg));
-        }
-
-        let public_key = if api_key_response.public_key.is_null() {
-            return Err("Generated public key is null".to_string());
-        } else {
-            let public_key_cstr = unsafe { CStr::from_ptr(api_key_response.public_key) };
-            public_key_cstr.to_string_lossy().to_string()
-        };
-
-        // Clean up the private key immediately (we don't need it for registration)
-        unsafe {
-            if !api_key_response.private_key.is_null() {
-                libc::free(api_key_response.private_key as *mut libc::c_void);
-            }
-            if !api_key_response.public_key.is_null() {
-                libc::free(api_key_response.public_key as *mut libc::c_void);
-            }
-        }
-
-        log::info!("Generated new API key pair, public key: {}", public_key);
-
-        // Step 2: Get current nonce
-        let nonce = self.get_nonce().await.map_err(|e| format!("Failed to get nonce: {:?}", e))?;
-        log::info!("Got nonce for API key change: {}", nonce);
-
-        // Step 3: Sign the change API key transaction
-        let new_pubkey_cstr = CString::new(public_key.clone()).map_err(|e| format!("Failed to create pubkey CString: {}", e))?;
-        let sign_result = unsafe { SignChangePubKey(new_pubkey_cstr.as_ptr(), nonce as c_longlong) };
-
-        if !sign_result.err.is_null() {
-            let error_cstr = unsafe { CStr::from_ptr(sign_result.err) };
-            let error_msg = error_cstr.to_string_lossy().to_string();
-            unsafe {
-                if !sign_result.str.is_null() {
-                    libc::free(sign_result.str as *mut libc::c_void);
-                }
-                libc::free(sign_result.err as *mut libc::c_void);
-            }
-            return Err(format!("Failed to sign change API key transaction: {}", error_msg));
-        }
-
-        let tx_info_str = if sign_result.str.is_null() {
-            return Err("Signed transaction info is null".to_string());
-        } else {
-            let tx_info_cstr = unsafe { CStr::from_ptr(sign_result.str) };
-            let tx_info_string = tx_info_cstr.to_string_lossy().to_string();
-            unsafe {
-                libc::free(sign_result.str as *mut libc::c_void);
-            }
-            tx_info_string
-        };
-
-        log::debug!("Change API key tx info: {}", tx_info_str);
-
-        // Step 4: Parse the transaction info to get the message to sign
-        let tx_info: Value = serde_json::from_str(&tx_info_str)
-            .map_err(|e| format!("Failed to parse tx info JSON: {}", e))?;
-
-        let message_to_sign = tx_info.get("MessageToSign")
-            .and_then(|v| v.as_str())
-            .ok_or("MessageToSign not found in tx info")?;
-
-        log::debug!("Message to sign: {}", message_to_sign);
-
-        // Step 5: Sign with EVM private key
-        let evm_signature = self.sign_with_evm_key(evm_private_key, message_to_sign)?;
-        log::debug!("EVM signature: {}", evm_signature);
-
-        // Step 6: Add EVM signature to tx_info
-        let mut tx_info_with_sig = tx_info;
-        tx_info_with_sig["EvmSignature"] = Value::String(evm_signature);
-
-        let final_tx_info = serde_json::to_string(&tx_info_with_sig)
-            .map_err(|e| format!("Failed to serialize final tx info: {}", e))?;
-
-        log::debug!("Final tx info with EVM signature: {}", final_tx_info);
-
-        // Step 7: Send the change API key transaction
-        let response = self.send_change_api_key_request(&final_tx_info).await?;
-
-        log::info!("API key registration completed successfully: {:?}", response);
-        Ok(())
+    async fn register_api_key(&self, _evm_private_key: &str) -> Result<(), String> {
+        Err("API key registration is no longer supported. Use pre-configured API keys in environment variables.".to_string())
     }
 
     #[cfg(not(feature = "lighter-sdk"))]
@@ -1050,10 +886,10 @@ impl LighterConnector {
 
     async fn send_change_api_key_request(&self, tx_info: &str) -> Result<serde_json::Value, String> {
         let base_url = self.base_url.trim_end_matches('/');
-        let url = format!("{}/api/v1/send_tx", base_url);
+        let url = format!("{}/api/v1/sendTx", base_url);
 
         let form_data = [
-            ("tx_type", "17"), // TX_TYPE_CHANGE_PUB_KEY = 17
+            ("tx_type", "8"), // TX_TYPE_CHANGE_PUB_KEY = 8
             ("tx_info", tx_info),
         ];
 

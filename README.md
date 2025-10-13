@@ -68,19 +68,7 @@ let lighter = create_lighter_connector(
 
 ### Feature-Conditional Code
 
-```rust
-#[cfg(feature = "lighter-sdk")]
-fn use_lighter_features() {
-    // Lighter-specific functionality
-    let public_key = LighterConnector::generate_public_key_from_private(&private_key)?;
-}
-
-#[cfg(not(feature = "lighter-sdk"))]
-fn use_lighter_features() {
-    // Alternative implementation or error
-    return Err("Lighter SDK not available");
-}
-```
+The `lighter-sdk` feature enables integration with the Lighter Go shared library for cryptographic operations. When this feature is not available, the connector will return appropriate error messages.
 
 ## Dependencies
 
