@@ -245,15 +245,28 @@ impl LighterConnector {
 
             // Compare Go-derived key with server key
             if let Some(go_key) = &go_derived_pubkey {
-                if go_key != &server_pubkey {
-                    log::warn!("Public key mismatch detected!");
-                    log::warn!("  Go-derived: {}", go_key);
-                    log::warn!("  Server has: {}", server_pubkey);
+                let srv = server_pubkey
+                    .to_lowercase()
+                    .trim_start_matches("0x")
+                    .to_string();
+                let loc = go_key.to_lowercase().trim_start_matches("0x").to_string();
+
+                if loc != srv {
                     log::info!(
-                        "Will attempt to update server with Go-derived key using ChangePubKey"
+                        "API key mismatch detected (account={}, index={}). server={}…{} vs local={}…{} — will attempt ChangePubKey",
+                        self.account_index,
+                        self.api_key_index,
+                        &srv[..8], &srv[srv.len()-8..],
+                        &loc[..8], &loc[loc.len()-8..]
                     );
                 } else {
-                    log::info!("Public keys match - no ChangePubKey needed");
+                    log::info!(
+                        "API key verified (account={}, index={}). public_key={}…{}",
+                        self.account_index,
+                        self.api_key_index,
+                        &srv[..8],
+                        &srv[srv.len() - 8..]
+                    );
                 }
             }
 
@@ -301,10 +314,7 @@ impl LighterConnector {
 
                 // If we have the Go-derived public key and EVM wallet key, try to update the API key
                 #[cfg(feature = "lighter-sdk")]
-                if let (Some(go_pubkey), Some(_)) =
-                    (&go_derived_pubkey, &self.evm_wallet_private_key)
-                {
-                    log::info!("API key mismatch detected. Attempting to update server public key from '{}' to '{}'", server_pubkey, go_pubkey);
+                if let (Some(_), Some(_)) = (&go_derived_pubkey, &self.evm_wallet_private_key) {
                     return Err(DexError::ApiKeyRegistrationRequired);
                 } else {
                     return Err(DexError::Other(format!(
@@ -894,16 +904,67 @@ impl LighterConnector {
             self.sign_message_with_lighter_go_evm(evm_private_key, &message_to_sign)?;
         log::info!("EVM signature: {}", evm_signature);
 
+        // Compare expected vs actual L1 address for debugging
+        if let Ok(recovered_addr) =
+            self.recover_address_from_signature(&message_to_sign, &evm_signature)
+        {
+            if let Ok(expected_addr) = self.get_account_l1_address().await {
+                log::info!("L1 Address Comparison:");
+                log::info!(
+                    "  Expected (account {}): {}",
+                    self.account_index,
+                    expected_addr
+                );
+                log::info!("  Recovered from EVM sig: {}", recovered_addr);
+                if expected_addr.to_lowercase() == recovered_addr.to_lowercase() {
+                    log::info!("  ✓ Addresses match - signature should be valid");
+                } else {
+                    log::error!("  ✗ Addresses MISMATCH - signature will fail validation");
+                    log::error!("  This explains the L1 signature failure (code 21504)");
+                }
+            } else {
+                log::warn!("Could not retrieve expected L1 address for comparison");
+            }
+        }
+
         // Add L1Sig field with the EVM signature (Python SDK uses L1Sig, not evmSignature)
         tx_info["L1Sig"] = serde_json::Value::String(evm_signature);
 
         // Send the ChangePubKey request
-        let response = self
-            .send_change_api_key_request(&tx_info.to_string())
-            .await?;
-        log::info!("ChangePubKey response: {:?}", response);
+        let response = self.send_change_api_key_request(&tx_info.to_string()).await;
 
-        Ok(())
+        match response {
+            Ok(_v) => {
+                let srv_short = &server_public_key[..8];
+                let srv_end = &server_public_key[server_public_key.len() - 8..];
+                let new_short = &new_pubkey.trim_start_matches("0x")[..8];
+                let new_end_start = new_pubkey.len().saturating_sub(10); // account for "0x"
+                let new_end = &new_pubkey[new_end_start..];
+
+                log::info!(
+                    "ChangePubKey succeeded (account={}, index={}). Server public key updated from {}…{} to {}…{}",
+                    self.account_index,
+                    self.api_key_index,
+                    srv_short, srv_end,
+                    new_short, new_end
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let srv_short = &server_public_key[..8];
+                let srv_end = &server_public_key[server_public_key.len() - 8..];
+
+                log::error!(
+                    "ChangePubKey failed (account={}, index={}) -> {}. Server key remains {}…{}",
+                    self.account_index,
+                    self.api_key_index,
+                    e,
+                    srv_short,
+                    srv_end
+                );
+                Err(e)
+            }
+        }
     }
 
     #[cfg(not(feature = "lighter-sdk"))]
@@ -939,14 +1000,46 @@ impl LighterConnector {
 
         let signature = unsafe { std::ffi::CStr::from_ptr(sign_result.str).to_string_lossy() };
 
-        // Remove 0x prefix if present
-        let signature_clean = if signature.starts_with("0x") {
-            &signature[2..]
+        // Ensure 0x prefix is present (Lighter expects 0x-prefixed signatures)
+        let signature_with_prefix = if signature.starts_with("0x") {
+            signature.to_string()
         } else {
-            &signature
+            format!("0x{}", signature)
         };
 
-        Ok(signature_clean.to_string())
+        // Check if v value needs to be adjusted from {0,1} to {27,28}
+        if signature_with_prefix.len() == 132 {
+            // "0x" + 130 hex chars = 132
+            let mut sig_bytes = hex::decode(&signature_with_prefix[2..])
+                .map_err(|e| format!("Failed to decode signature hex: {}", e))?;
+
+            if sig_bytes.len() == 65 {
+                // Check if v is 0 or 1, and convert to 27 or 28
+                if sig_bytes[64] == 0 {
+                    log::debug!("Converting v from 0 to 27");
+                    sig_bytes[64] = 27;
+                } else if sig_bytes[64] == 1 {
+                    log::debug!("Converting v from 1 to 28");
+                    sig_bytes[64] = 28;
+                }
+
+                let corrected_signature = format!("0x{}", hex::encode(sig_bytes));
+                log::debug!("EVM signature v-corrected: {}", corrected_signature);
+
+                // Log recovered address for debugging
+                if let Ok(recovered_addr) =
+                    self.recover_address_from_signature(message, &corrected_signature)
+                {
+                    log::info!("EVM signature recovery check - Address: {}", recovered_addr);
+                } else {
+                    log::warn!("Failed to recover address from EVM signature for verification");
+                }
+
+                return Ok(corrected_signature);
+            }
+        }
+
+        Ok(signature_with_prefix)
     }
 
     #[cfg(not(feature = "lighter-sdk"))]
@@ -956,6 +1049,125 @@ impl LighterConnector {
         _message: &str,
     ) -> Result<String, String> {
         Err("EVM signing with lighter-go requires lighter-sdk feature".to_string())
+    }
+
+    /// Get account details to find the L1 address for this account
+    async fn get_account_l1_address(&self) -> Result<String, DexError> {
+        let url = format!(
+            "{}/api/v1/account?account_index={}",
+            self.base_url, self.account_index
+        );
+        log::debug!("Getting account details from: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to get account details: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+        log::debug!(
+            "Account details response: HTTP {}, Body: {}",
+            status,
+            response_text
+        );
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        // Parse the response to extract L1 address
+        let account_data: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse account response: {}", e)))?;
+
+        // Look for l1Address field
+        if let Some(l1_address) = account_data.get("l1Address").and_then(|v| v.as_str()) {
+            Ok(l1_address.to_string())
+        } else {
+            Err(DexError::Other(
+                "l1Address not found in account response".to_string(),
+            ))
+        }
+    }
+
+    /// Recover the EVM address from a signature for debugging purposes
+    fn recover_address_from_signature(
+        &self,
+        message: &str,
+        signature: &str,
+    ) -> Result<String, String> {
+        // Remove 0x prefix if present
+        let signature_hex = signature.strip_prefix("0x").unwrap_or(signature);
+
+        // Decode the signature
+        let signature_bytes = hex::decode(signature_hex)
+            .map_err(|e| format!("Failed to decode signature hex: {}", e))?;
+
+        if signature_bytes.len() != 65 {
+            return Err(format!(
+                "Invalid signature length: {} (expected 65)",
+                signature_bytes.len()
+            ));
+        }
+
+        // Split signature into r, s, v components
+        let r = &signature_bytes[0..32];
+        let s = &signature_bytes[32..64];
+        let v = signature_bytes[64];
+
+        // Convert v to recovery id (0 or 1)
+        let recovery_id = match v {
+            27 => 0,
+            28 => 1,
+            0 | 1 => v, // Already in correct format
+            _ => return Err(format!("Invalid v value: {}", v)),
+        };
+
+        // Create the message hash (EIP-191 personal_sign format)
+        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+        let mut hasher = Keccak256::new();
+        hasher.update(prefix.as_bytes());
+        hasher.update(message.as_bytes());
+        let message_hash = hasher.finalize();
+
+        // Create secp256k1 objects
+        let secp = Secp256k1::new();
+        let message_obj = Message::from_slice(&message_hash)
+            .map_err(|e| format!("Invalid message hash: {}", e))?;
+
+        // Create recoverable signature
+        let recoverable_sig = secp256k1::ecdsa::RecoverableSignature::from_compact(
+            &signature_bytes[0..64],
+            secp256k1::ecdsa::RecoveryId::from_i32(recovery_id as i32)
+                .map_err(|e| format!("Invalid recovery id: {}", e))?,
+        )
+        .map_err(|e| format!("Failed to create recoverable signature: {}", e))?;
+
+        // Recover the public key
+        let public_key = secp
+            .recover_ecdsa(&message_obj, &recoverable_sig)
+            .map_err(|e| format!("Failed to recover public key: {}", e))?;
+
+        // Convert public key to address
+        let public_key_bytes = public_key.serialize_uncompressed();
+        let mut hasher = Keccak256::new();
+        hasher.update(&public_key_bytes[1..]); // Skip the 0x04 prefix
+        let hash = hasher.finalize();
+
+        // Take the last 20 bytes and format as address
+        let address = format!("0x{}", hex::encode(&hash[12..]));
+
+        Ok(address)
     }
 
     fn _unused_sign_with_evm_key(
