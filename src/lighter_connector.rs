@@ -104,9 +104,12 @@ struct LighterNonceResponse {
 #[derive(Deserialize, Debug)]
 struct ApiKeyInfo {
     #[serde(rename = "account_index")]
+    #[allow(dead_code)]
     account_index: u32,
     #[serde(rename = "api_key_index")]
+    #[allow(dead_code)]
     api_key_index: u32,
+    #[allow(dead_code)]
     nonce: u32,
     #[serde(rename = "public_key")]
     public_key: String,
@@ -114,6 +117,7 @@ struct ApiKeyInfo {
 
 #[derive(Deserialize, Debug)]
 struct ApiKeyResponse {
+    #[allow(dead_code)]
     code: u32,
     #[serde(rename = "api_keys")]
     api_keys: Vec<ApiKeyInfo>,
@@ -191,19 +195,19 @@ impl LighterConnector {
             }
 
             // Log key configuration details for debugging
-            log::info!("API Key Validation Details:");
-            log::info!("  Account Index: {}", self.account_index);
-            log::info!("  API Key Index: {}", self.api_key_index);
-            log::info!("  Chain ID: 304 (hardcoded)");
-            log::info!(
+            log::debug!("API Key Validation Details:");
+            log::debug!("  Account Index: {}", self.account_index);
+            log::debug!("  API Key Index: {}", self.api_key_index);
+            log::debug!("  Chain ID: 304 (hardcoded)");
+            log::debug!(
                 "  API Private Key Length: {} chars",
                 self.api_private_key_hex.len()
             );
-            log::info!(
+            log::debug!(
                 "  API Private Key (first 8): {}",
                 &self.api_private_key_hex[..std::cmp::min(8, self.api_private_key_hex.len())]
             );
-            log::info!(
+            log::debug!(
                 "  API Private Key (last 8): {}",
                 &self.api_private_key_hex
                     [std::cmp::max(0, self.api_private_key_hex.len().saturating_sub(8))..]
@@ -228,12 +232,12 @@ impl LighterConnector {
                 let pubkey_cstr = CStr::from_ptr(go_pubkey_result);
                 let pubkey_str = pubkey_cstr.to_string_lossy().to_string();
                 libc::free(go_pubkey_result as *mut libc::c_void);
-                log::info!("Go-derived public key: {}", pubkey_str);
-                log::info!(
+                log::debug!("Go-derived public key: {}", pubkey_str);
+                log::debug!(
                     "  Go-derived public key (first 8): {}",
                     &pubkey_str[..std::cmp::min(8, pubkey_str.len())]
                 );
-                log::info!(
+                log::debug!(
                     "  Go-derived public key (last 8): {}",
                     &pubkey_str[std::cmp::max(0, pubkey_str.len().saturating_sub(8))..]
                 );
@@ -252,7 +256,7 @@ impl LighterConnector {
                 let loc = go_key.to_lowercase().trim_start_matches("0x").to_string();
 
                 if loc != srv {
-                    log::info!(
+                    log::debug!(
                         "API key mismatch detected (account={}, index={}). server={}…{} vs local={}…{} — will attempt ChangePubKey",
                         self.account_index,
                         self.api_key_index,
@@ -260,7 +264,7 @@ impl LighterConnector {
                         &loc[..8], &loc[loc.len()-8..]
                     );
                 } else {
-                    log::info!(
+                    log::debug!(
                         "API key verified (account={}, index={}). public_key={}…{}",
                         self.account_index,
                         self.api_key_index,
@@ -329,7 +333,7 @@ impl LighterConnector {
                     error_msg
                 )));
             } else {
-                log::info!("API key validation successful");
+                log::debug!("API key validation successful");
             }
 
             Ok(())
@@ -436,7 +440,7 @@ impl LighterConnector {
         // For backward compatibility, derive L1 address for logging if possible
         let l1_address = "N/A".to_string(); // We don't need wallet address anymore
 
-        log::info!(
+        log::debug!(
             "Creating LighterConnector with API key index: {}, account: {}",
             api_key_index,
             account_index
@@ -472,7 +476,7 @@ impl LighterConnector {
         // For backward compatibility, derive L1 address for logging if possible
         let l1_address = "N/A".to_string(); // We don't need wallet address anymore
 
-        log::info!(
+        log::debug!(
             "Creating LighterConnector with API key index: {}, account: {}",
             api_key_index,
             account_index
@@ -508,7 +512,7 @@ impl LighterConnector {
         let client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
         let nonce = self.get_nonce().await?;
 
-        log::info!(
+        log::debug!(
             "Creating native order: market_id={}, side={}, base_amount={}, price={}",
             market_id,
             side,
@@ -575,14 +579,14 @@ impl LighterConnector {
             )
             .await?;
 
-        log::info!("=== GO SDK RESULT ===");
-        log::info!("Go SDK JSON: {}", go_result);
+        log::debug!("=== GO SDK RESULT ===");
+        log::debug!("Go SDK JSON: {}", go_result);
 
         // Use the exact JSON from Go SDK - it already contains everything correctly
-        log::info!("=== SIGNATURE DEBUG ===");
-        log::info!("API nonce: {}", nonce);
-        log::info!("Transaction data: {:?}", tx_data);
-        log::info!("Using Go SDK transaction JSON directly");
+        log::debug!("=== SIGNATURE DEBUG ===");
+        log::debug!("API nonce: {}", nonce);
+        log::debug!("Transaction data: {:?}", tx_data);
+        log::debug!("Using Go SDK transaction JSON directly");
 
         // Use the complete transaction JSON from Go SDK directly
         let tx_info = go_result;
@@ -593,10 +597,10 @@ impl LighterConnector {
             urlencoding::encode(&tx_info)
         );
 
-        log::info!("=== REQUEST DEBUG ===");
-        log::info!("Timestamp: {}", timestamp);
-        log::info!("TX Info JSON: {}", tx_info);
-        log::info!("Form data: {}", form_data);
+        log::debug!("=== REQUEST DEBUG ===");
+        log::debug!("Timestamp: {}", timestamp);
+        log::debug!("TX Info JSON: {}", tx_info);
+        log::debug!("Form data: {}", form_data);
 
         // Use form-urlencoded format same as Go SDK, without X-API-KEY header
         let response = self
@@ -614,14 +618,14 @@ impl LighterConnector {
             .await
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-        log::info!(
+        log::debug!(
             "Native order response: HTTP {}, Body: {}",
             status,
             response_text
         );
 
         if status.is_success() {
-            log::info!("Native order submitted successfully!");
+            log::debug!("Native order submitted successfully!");
             Ok(CreateOrderResponse {
                 order_id: client_id,
                 ordered_price: Decimal::new(price as i64, 6),
@@ -648,7 +652,7 @@ impl LighterConnector {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         let client_id = client_order_id.unwrap_or_else(|| format!("rust-order-{}", timestamp));
 
-        log::info!(
+        log::debug!(
             "Delegating order to Python SDK: market_id={}, side={}, base_amount={}, price={}",
             market_id,
             side,
@@ -688,7 +692,7 @@ impl LighterConnector {
             .map_err(|e| DexError::Other(format!("Failed to parse SDK response: {}", e)))?;
 
         if let Some(true) = response.get("success").and_then(|v| v.as_bool()) {
-            log::info!("Order successfully sent via SDK");
+            log::debug!("Order successfully sent via SDK");
 
             let order_id = response
                 .get("tx_hash")
@@ -771,7 +775,7 @@ impl LighterConnector {
             self.account_index, self.api_key_index
         );
 
-        log::info!("Getting server public key from: {}", endpoint);
+        log::debug!("Getting server public key from: {}", endpoint);
 
         let response: ApiKeyResponse = self
             .make_request(&endpoint, crate::dex_request::HttpMethod::Get, None)
@@ -782,12 +786,12 @@ impl LighterConnector {
         }
 
         let server_pubkey = &response.api_keys[0].public_key;
-        log::info!("Server public key: {}", server_pubkey);
-        log::info!(
+        log::debug!("Server public key: {}", server_pubkey);
+        log::debug!(
             "  Server public key (first 8): {}",
             &server_pubkey[..std::cmp::min(8, server_pubkey.len())]
         );
-        log::info!(
+        log::debug!(
             "  Server public key (last 8): {}",
             &server_pubkey[std::cmp::max(0, server_pubkey.len().saturating_sub(8))..]
         );
@@ -848,7 +852,7 @@ impl LighterConnector {
         go_public_key: &str,
         server_public_key: &str,
     ) -> Result<(), String> {
-        log::info!(
+        log::debug!(
             "Attempting ChangePubKey: server='{}' -> local='{}'",
             server_public_key,
             go_public_key
@@ -859,7 +863,7 @@ impl LighterConnector {
             .get_nonce_with_key(server_public_key)
             .await
             .map_err(|e| format!("Failed to get nonce: {:?}", e))?;
-        log::info!("Got nonce for ChangePubKey: {}", nonce);
+        log::debug!("Got nonce for ChangePubKey: {}", nonce);
 
         // Use the Go-derived public key
         let new_pubkey = if go_public_key.starts_with("0x") {
@@ -867,7 +871,7 @@ impl LighterConnector {
         } else {
             format!("0x{}", go_public_key)
         };
-        log::info!("New public key to register: {}", new_pubkey);
+        log::debug!("New public key to register: {}", new_pubkey);
 
         // Use SignChangePubKey from the lighter-go library
         let sign_result = unsafe {
@@ -884,7 +888,7 @@ impl LighterConnector {
         }
 
         let tx_info_str = unsafe { std::ffi::CStr::from_ptr(sign_result.str).to_string_lossy() };
-        log::info!("SignChangePubKey result: {}", tx_info_str);
+        log::debug!("SignChangePubKey result: {}", tx_info_str);
 
         // Parse the tx_info JSON and extract MessageToSign
         let mut tx_info: serde_json::Value = serde_json::from_str(&tx_info_str)
@@ -894,7 +898,7 @@ impl LighterConnector {
             .as_str()
             .ok_or("MessageToSign not found in tx_info")?
             .to_string();
-        log::info!("MessageToSign: {}", message_to_sign);
+        log::debug!("MessageToSign: {}", message_to_sign);
 
         // Remove MessageToSign from tx_info as per Python SDK implementation
         tx_info.as_object_mut().unwrap().remove("MessageToSign");
@@ -902,22 +906,22 @@ impl LighterConnector {
         // Sign the message with EVM key using lighter-go SignMessageWithEVM
         let evm_signature =
             self.sign_message_with_lighter_go_evm(evm_private_key, &message_to_sign)?;
-        log::info!("EVM signature: {}", evm_signature);
+        log::debug!("EVM signature: {}", evm_signature);
 
         // Compare expected vs actual L1 address for debugging
         if let Ok(recovered_addr) =
             self.recover_address_from_signature(&message_to_sign, &evm_signature)
         {
             if let Ok(expected_addr) = self.get_account_l1_address().await {
-                log::info!("L1 Address Comparison:");
-                log::info!(
+                log::debug!("L1 Address Comparison:");
+                log::debug!(
                     "  Expected (account {}): {}",
                     self.account_index,
                     expected_addr
                 );
-                log::info!("  Recovered from EVM sig: {}", recovered_addr);
+                log::debug!("  Recovered from EVM sig: {}", recovered_addr);
                 if expected_addr.to_lowercase() == recovered_addr.to_lowercase() {
-                    log::info!("  ✓ Addresses match - signature should be valid");
+                    log::debug!("  ✓ Addresses match - signature should be valid");
                 } else {
                     log::error!("  ✗ Addresses MISMATCH - signature will fail validation");
                     log::error!("  This explains the L1 signature failure (code 21504)");
@@ -941,7 +945,7 @@ impl LighterConnector {
                 let new_end_start = new_pubkey.len().saturating_sub(10); // account for "0x"
                 let new_end = &new_pubkey[new_end_start..];
 
-                log::info!(
+                log::debug!(
                     "ChangePubKey succeeded (account={}, index={}). Server public key updated from {}…{} to {}…{}",
                     self.account_index,
                     self.api_key_index,
@@ -1030,7 +1034,7 @@ impl LighterConnector {
                 if let Ok(recovered_addr) =
                     self.recover_address_from_signature(message, &corrected_signature)
                 {
-                    log::info!("EVM signature recovery check - Address: {}", recovered_addr);
+                    log::debug!("EVM signature recovery check - Address: {}", recovered_addr);
                 } else {
                     log::warn!("Failed to recover address from EVM signature for verification");
                 }
@@ -1121,8 +1125,8 @@ impl LighterConnector {
         }
 
         // Split signature into r, s, v components
-        let r = &signature_bytes[0..32];
-        let s = &signature_bytes[32..64];
+        let _r = &signature_bytes[0..32];
+        let _s = &signature_bytes[32..64];
         let v = signature_bytes[64];
 
         // Convert v to recovery id (0 or 1)
@@ -1142,7 +1146,7 @@ impl LighterConnector {
 
         // Create secp256k1 objects
         let secp = Secp256k1::new();
-        let message_obj = Message::from_slice(&message_hash)
+        let message_obj = Message::from_digest_slice(&message_hash)
             .map_err(|e| format!("Invalid message hash: {}", e))?;
 
         // Create recoverable signature
@@ -1278,7 +1282,7 @@ impl LighterConnector {
 impl DexConnector for LighterConnector {
     async fn start(&self) -> Result<(), DexError> {
         self.is_running.store(true, Ordering::SeqCst);
-        log::info!(
+        log::debug!(
             "Lighter connector started with WebSocket: {}",
             self.websocket_url
         );
@@ -1288,7 +1292,7 @@ impl DexConnector for LighterConnector {
         {
             match self.create_go_client().await {
                 Ok(()) => {
-                    log::info!("API key validation successful");
+                    log::debug!("API key validation successful");
                 }
                 Err(DexError::ApiKeyRegistrationRequired) => {
                     #[cfg(feature = "lighter-sdk")]
@@ -1306,7 +1310,7 @@ impl DexConnector for LighterConnector {
                             let go_key = pubkey_cstr.to_string_lossy().to_string();
                             unsafe { libc::free(go_pubkey_result as *mut libc::c_void) };
 
-                            log::info!("API key registration required. Attempting to register...");
+                            log::debug!("API key registration required. Attempting to register...");
 
                             // Get server public key for ChangePubKey
                             let server_pubkey =
@@ -1324,9 +1328,9 @@ impl DexConnector for LighterConnector {
                                 })?;
 
                             // Retry validation after registration
-                            log::info!("Retrying API key validation after registration...");
+                            log::debug!("Retrying API key validation after registration...");
                             self.create_go_client().await?;
-                            log::info!("API key validation successful after registration");
+                            log::debug!("API key validation successful after registration");
                         } else {
                             log::error!("Failed to get Go-derived public key for registration");
                             return Err(DexError::Other(
@@ -1349,7 +1353,7 @@ impl DexConnector for LighterConnector {
 
     async fn stop(&self) -> Result<(), DexError> {
         self.is_running.store(false, Ordering::SeqCst);
-        log::info!("Lighter connector stopped");
+        log::debug!("Lighter connector stopped");
         Ok(())
     }
 
@@ -1527,7 +1531,7 @@ impl DexConnector for LighterConnector {
     }
 
     async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
-        log::info!("Cancelling all orders for Lighter connector");
+        log::debug!("Cancelling all orders for Lighter connector");
         // For now, just return success - this is primarily used for testing
         Ok(())
     }
