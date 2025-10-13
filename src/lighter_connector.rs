@@ -703,18 +703,22 @@ impl LighterConnector {
 
     #[allow(dead_code)]
     async fn get_nonce(&self) -> Result<u64, DexError> {
+        self.get_nonce_with_key(&self.api_key_public).await
+    }
+
+    async fn get_nonce_with_key(&self, api_key: &str) -> Result<u64, DexError> {
         let url = format!(
             "{}/api/v1/nextNonce?account_index={}&api_key_index={}",
             self.base_url, self.account_index, self.api_key_index
         );
 
         log::debug!("Getting nonce from: {}", url);
-        log::debug!("Using API key: {}", self.api_key_public);
+        log::debug!("Using API key: {}", api_key);
 
         let response = self
             .client
             .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
+            .header("X-API-KEY", api_key)
             .send()
             .await
             .map_err(|e| DexError::Other(format!("Failed to get nonce: {}", e)))?;
@@ -832,12 +836,17 @@ impl LighterConnector {
         &self,
         evm_private_key: &str,
         go_public_key: &str,
+        server_public_key: &str,
     ) -> Result<(), String> {
-        log::info!("Attempting to register API key using ChangePubKey...");
+        log::info!(
+            "Attempting ChangePubKey: server='{}' -> local='{}'",
+            server_public_key,
+            go_public_key
+        );
 
-        // Get next nonce
+        // Get next nonce using server-registered public key (not our new key)
         let nonce = self
-            .get_nonce()
+            .get_nonce_with_key(server_public_key)
             .await
             .map_err(|e| format!("Failed to get nonce: {:?}", e))?;
         log::info!("Got nonce for ChangePubKey: {}", nonce);
@@ -902,6 +911,7 @@ impl LighterConnector {
         &self,
         _evm_private_key: &str,
         _go_public_key: &str,
+        _server_public_key: &str,
     ) -> Result<(), String> {
         Err("API key registration requires lighter-sdk feature".to_string())
     }
@@ -1085,9 +1095,21 @@ impl DexConnector for LighterConnector {
                             unsafe { libc::free(go_pubkey_result as *mut libc::c_void) };
 
                             log::info!("API key registration required. Attempting to register...");
-                            self.register_api_key(evm_key, &go_key).await.map_err(|e| {
-                                DexError::Other(format!("API key registration failed: {}", e))
-                            })?;
+
+                            // Get server public key for ChangePubKey
+                            let server_pubkey =
+                                self.get_server_public_key().await.map_err(|e| {
+                                    DexError::Other(format!(
+                                        "Failed to get server public key: {}",
+                                        e
+                                    ))
+                                })?;
+
+                            self.register_api_key(evm_key, &go_key, &server_pubkey)
+                                .await
+                                .map_err(|e| {
+                                    DexError::Other(format!("API key registration failed: {}", e))
+                                })?;
 
                             // Retry validation after registration
                             log::info!("Retrying API key validation after registration...");
