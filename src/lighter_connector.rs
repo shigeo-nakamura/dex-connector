@@ -20,14 +20,10 @@ use std::{
 };
 
 // Cryptographic imports
-use ed25519_dalek::{Signer, SigningKey};
 #[cfg(feature = "lighter-sdk")]
 use libc::{c_char, c_int, c_longlong};
-use num_bigint::BigUint;
-use num_traits::Zero;
 use secp256k1::{Message, Secp256k1, SecretKey};
 use sha3::{Digest, Keccak256};
-use serde_json::Value;
 #[cfg(feature = "lighter-sdk")]
 use std::ffi::{CStr, CString};
 use tokio::{sync::RwLock, time::sleep};
@@ -40,7 +36,6 @@ pub struct StrOrErr {
     pub err: *mut c_char,
 }
 
-
 #[cfg(feature = "lighter-sdk")]
 extern "C" {
     fn CreateClient(
@@ -52,7 +47,6 @@ extern "C" {
     ) -> *mut c_char;
 
     fn CheckClient(api_key_index: c_int, account_index: c_longlong) -> *mut c_char;
-
 
     fn SignCreateOrder(
         market_index: c_int,
@@ -69,15 +63,17 @@ extern "C" {
     ) -> StrOrErr;
 
     fn SignChangePubKey(new_pubkey: *const c_char, nonce: c_longlong) -> StrOrErr;
+
+    fn SignMessageWithEVM(private_key: *const c_char, message: *const c_char) -> StrOrErr;
 }
 
 #[derive(Clone)]
 pub struct LighterConnector {
-    api_key_public: String,      // X-API-KEY header (from Lighter UI)
-    api_key_index: u32,          // api_key_index query param
-    api_private_key_hex: String, // API private key for signing (40-byte)
+    api_key_public: String,                 // X-API-KEY header (from Lighter UI)
+    api_key_index: u32,                     // api_key_index query param
+    api_private_key_hex: String,            // API private key for signing (40-byte)
     evm_wallet_private_key: Option<String>, // EVM wallet private key for API key registration
-    account_index: u32,          // account_index query param
+    account_index: u32,                     // account_index query param
     base_url: String,
     websocket_url: String,
     _l1_address: String, // derived from wallet for logging purposes
@@ -130,23 +126,6 @@ struct LighterSignedEnvelope {
 }
 
 // Lighter-specific cryptographic structures
-#[derive(Debug)]
-struct LighterSchnorrSignature {
-    r: [u8; 32],
-    s: [u8; 32],
-}
-
-#[derive(Debug)]
-struct LighterTransaction {
-    pub market_id: u32,
-    pub side: u32,
-    pub tif: u32,
-    pub base_amount: u64,
-    pub price: u64,
-    pub _client_order_id: String, // Currently unused in hash calculation
-    pub nonce: u64,
-    pub timestamp: u64,
-}
 
 impl LighterConnector {
     /// Initialize Go client
@@ -190,6 +169,25 @@ impl LighterConnector {
                 )));
             }
 
+            // Log key configuration details for debugging
+            log::info!("API Key Validation Details:");
+            log::info!("  Account Index: {}", self.account_index);
+            log::info!("  API Key Index: {}", self.api_key_index);
+            log::info!("  Chain ID: 304 (hardcoded)");
+            log::info!(
+                "  API Private Key Length: {} chars",
+                self.api_private_key_hex.len()
+            );
+            log::info!(
+                "  API Private Key (first 8): {}",
+                &self.api_private_key_hex[..std::cmp::min(8, self.api_private_key_hex.len())]
+            );
+            log::info!(
+                "  API Private Key (last 8): {}",
+                &self.api_private_key_hex
+                    [std::cmp::max(0, self.api_private_key_hex.len().saturating_sub(8))..]
+            );
+
             // Verify the API key is properly registered with Lighter
             let check_result = CheckClient(
                 self.api_key_index as c_int,
@@ -202,12 +200,47 @@ impl LighterConnector {
                 libc::free(check_result as *mut libc::c_void);
                 log::error!("API key validation failed: {}", error_msg);
 
+                // Parse the error message to extract key details
+                if error_msg.contains("ownPubKey:") && error_msg.contains("PublicKey:") {
+                    if let Some(own_start) = error_msg.find("ownPubKey: ") {
+                        if let Some(own_end) = error_msg[own_start + 11..].find(" ") {
+                            let own_key = &error_msg[own_start + 11..own_start + 11 + own_end];
+                            log::error!(
+                                "  Our derived public key (first 8): {}",
+                                &own_key[..std::cmp::min(8, own_key.len())]
+                            );
+                            log::error!(
+                                "  Our derived public key (last 8): {}",
+                                &own_key[std::cmp::max(0, own_key.len().saturating_sub(8))..]
+                            );
+                        }
+                    }
+                    if let Some(resp_start) = error_msg.find("PublicKey:") {
+                        if let Some(resp_end) = error_msg[resp_start + 10..].find("}") {
+                            let resp_key = &error_msg[resp_start + 10..resp_start + 10 + resp_end];
+                            log::error!(
+                                "  Server expected public key (first 8): {}",
+                                &resp_key[..std::cmp::min(8, resp_key.len())]
+                            );
+                            log::error!(
+                                "  Server expected public key (last 8): {}",
+                                &resp_key[std::cmp::max(0, resp_key.len().saturating_sub(8))..]
+                            );
+                        }
+                    }
+                }
+
                 // If EVM wallet private key is provided, mark for API key registration
                 if self.evm_wallet_private_key.is_some() {
-                    log::info!("EVM wallet private key provided. API key registration is required.");
+                    log::info!(
+                        "EVM wallet private key provided. API key registration is required."
+                    );
                     return Err(DexError::ApiKeyRegistrationRequired);
                 } else {
-                    return Err(DexError::Other(format!("API key validation failed: {}", error_msg)));
+                    return Err(DexError::Other(format!(
+                        "API key validation failed: {}",
+                        error_msg
+                    )));
                 }
             } else {
                 log::info!("API key validation successful");
@@ -225,7 +258,6 @@ impl LighterConnector {
                 .to_string(),
         ))
     }
-
 
     /// Call Go shared library to generate signature for CreateOrder transaction
     #[cfg(feature = "lighter-sdk")]
@@ -278,10 +310,6 @@ impl LighterConnector {
             let result_cstr = CStr::from_ptr(result.str);
             let json_str = result_cstr.to_string_lossy().to_string();
             libc::free(result.str as *mut libc::c_void);
-
-            // Parse JSON to extract signature and other data
-            let json_value: serde_json::Value = serde_json::from_str(&json_str)
-                .map_err(|e| DexError::Other(format!("Failed to parse Go SDK JSON: {}", e)))?;
 
             Ok(json_str)
         }
@@ -344,175 +372,12 @@ impl LighterConnector {
         })
     }
 
-    fn derive_l1_address(private_key_hex: &str) -> Result<String, DexError> {
-        use ethers::signers::{LocalWallet, Signer};
-        use std::str::FromStr;
-
-        let cleaned_key = private_key_hex
-            .strip_prefix("0x")
-            .unwrap_or(private_key_hex);
-        let wallet = LocalWallet::from_str(cleaned_key)
-            .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
-
-        Ok(format!("0x{:x}", wallet.address()))
-    }
-
-    /// Generate a Poseidon2 hash using Goldilocks field arithmetic
-    fn poseidon2_hash(inputs: &[u64]) -> [u8; 32] {
-        // Goldilocks prime: p = 2^64 - 2^32 + 1 = 18446744069414584321
-        let goldilocks_prime = BigUint::parse_bytes(b"18446744069414584321", 10).unwrap();
-
-        // Convert inputs to Goldilocks field elements
-        let mut state: Vec<BigUint> = inputs
-            .iter()
-            .map(|&x| BigUint::from(x) % &goldilocks_prime)
-            .collect();
-
-        // Ensure we have at least 4 elements for the hash state
-        while state.len() < 4 {
-            state.push(BigUint::zero());
-        }
-
-        // Simple Poseidon-like permutation
-        // This is a simplified version for compatibility
-        for round in 0..8 {
-            // Add round constants (simplified)
-            for (i, elem) in state.iter_mut().enumerate().take(4) {
-                let round_constant = BigUint::from((round + i + 1) * 0x123456789abcdef);
-                *elem = (elem.clone() + round_constant) % &goldilocks_prime;
-            }
-
-            // S-box operation (x^5)
-            for elem in state.iter_mut().take(4) {
-                let temp = elem.clone();
-                *elem = (&temp * &temp) % &goldilocks_prime;
-                *elem = (elem as &BigUint * &temp) % &goldilocks_prime;
-                *elem = (elem as &BigUint * &temp) % &goldilocks_prime;
-                *elem = (elem as &BigUint * &temp) % &goldilocks_prime;
-            }
-
-            // Linear layer (simplified MDS matrix)
-            let temp = state.clone();
-            for i in 0..4 {
-                state[i] = (&temp[0] + &temp[1] + &temp[2] + &temp[3]) % &goldilocks_prime;
-                if i < 3 {
-                    state[i] = (&state[i] + &temp[i + 1]) % &goldilocks_prime;
-                }
-            }
-        }
-
-        // Convert result to bytes
-        let mut result = [0u8; 32];
-        for (i, elem) in state.iter().enumerate().take(4) {
-            let bytes = elem.to_bytes_le();
-            let start = i * 8;
-            let end = std::cmp::min(start + 8, 32);
-            let copy_len = std::cmp::min(bytes.len(), end - start);
-            result[start..start + copy_len].copy_from_slice(&bytes[..copy_len]);
-        }
-
-        result
-    }
-
-    /// Generate Lighter signature using Poseidon2 hash + Schnorr signature (matching Go SDK)
-    fn generate_lighter_signature(
-        private_key_bytes: &[u8; 40], // 40 bytes for Goldilocks quintic extension
-        tx_data: &[u64],
-        chain_id: u32,
-        account_index: u32,
-        api_key_index: u32,
-    ) -> Result<String, DexError> {
-        // Convert transaction data to Goldilocks field elements (matching Go SDK Hash function)
-        let mut elements = Vec::new();
-
-        // Add elements in the exact order from Go SDK create_order.go:164-183
-        elements.push(chain_id as u64); // lighterChainId
-        elements.push(14u64); // TxTypeL2CreateOrder
-        elements.push(tx_data[10]); // nonce
-        elements.push((-1i64) as u64); // expiredAt (-1 for 28-day default)
-
-        elements.push(account_index as u64); // accountIndex
-        elements.push(api_key_index as u64); // apiKeyIndex
-        elements.push(tx_data[0]); // marketIndex
-        elements.push(tx_data[1]); // clientOrderIndex
-        elements.push(tx_data[2]); // baseAmount
-        elements.push(tx_data[3]); // price
-        elements.push(tx_data[4]); // isAsk
-        elements.push(tx_data[5]); // type (orderType)
-        elements.push(tx_data[6]); // timeInForce
-        elements.push(tx_data[7]); // reduceOnly
-        elements.push(tx_data[8]); // triggerPrice
-        elements.push(tx_data[9]); // orderExpiry
-
-        // Generate Poseidon2 hash over Goldilocks field
-        let hash_bytes = Self::poseidon2_hash(&elements);
-
-        // Generate Schnorr signature using Goldilocks quintic extension field
-        let signature = Self::schnorr_sign_goldilocks(&hash_bytes, private_key_bytes)?;
-
-        Ok(format!("0x{}", hex::encode(signature)))
-    }
-
-    /// Schnorr signature over Goldilocks quintic extension field (matching Go SDK format)
-    fn schnorr_sign_goldilocks(
-        message_hash: &[u8; 32],
-        private_key: &[u8; 40],
-    ) -> Result<Vec<u8>, DexError> {
-        // Generate a deterministic 80-byte signature that matches Go SDK output format
-        // This simulates the actual poseidon_crypto library behavior
-
-        let mut signature = vec![0u8; 80];
-
-        // First 40 bytes: R component (public key derived from private key + message)
-        for i in 0..40 {
-            signature[i] = private_key[i] ^ message_hash[i % 32];
-        }
-
-        // Second 40 bytes: S component (scalar derived from private key and message)
-        for i in 40..80 {
-            let idx = i - 40;
-            signature[i] = message_hash[idx % 32].wrapping_add(private_key[idx % 40]);
-        }
-
-        // Apply some mixing to make it look more like a real signature
-        for i in 0..80 {
-            signature[i] = signature[i].wrapping_mul(7).wrapping_add(13);
-        }
-
-        Ok(signature)
-    }
-
-    /// Generate Ed25519 signature for Lighter transaction (matching Python SDK)
-    fn generate_ed25519_signature_old(
-        private_key_bytes: &[u8; 32],
-        message_hash: &[u8; 32],
-    ) -> Result<LighterSchnorrSignature, DexError> {
-        // Create Ed25519 signing key from private key bytes
-        let signing_key = SigningKey::from_bytes(private_key_bytes);
-
-        // Sign the message hash
-        let signature = signing_key.sign(message_hash);
-
-        // Extract R and S components from Ed25519 signature
-        let signature_bytes = signature.to_bytes();
-        let mut r_bytes = [0u8; 32];
-        let mut s_bytes = [0u8; 32];
-
-        r_bytes.copy_from_slice(&signature_bytes[0..32]);
-        s_bytes.copy_from_slice(&signature_bytes[32..64]);
-
-        Ok(LighterSchnorrSignature {
-            r: r_bytes,
-            s: s_bytes,
-        })
-    }
-
     /// Create native order without Python SDK
     async fn create_order_native(
         &self,
         market_id: u32,
         side: u32,
-        tif: u32,
+        _tif: u32,
         base_amount: u64,
         price: u64,
         client_order_id: Option<String>,
@@ -528,18 +393,6 @@ impl LighterConnector {
             base_amount,
             price
         );
-
-        // Create transaction structure
-        let tx = LighterTransaction {
-            market_id,
-            side,
-            tif,
-            base_amount,
-            price,
-            _client_order_id: client_id.clone(),
-            nonce,
-            timestamp,
-        };
 
         // Match the exact parameters used in Go SDK test to validate signature
         let client_order_index = 12345u64; // Exact value from Go SDK test
@@ -831,8 +684,69 @@ impl LighterConnector {
     }
 
     #[cfg(feature = "lighter-sdk")]
-    async fn register_api_key(&self, _evm_private_key: &str) -> Result<(), String> {
-        Err("API key registration is no longer supported. Use pre-configured API keys in environment variables.".to_string())
+    async fn register_api_key(&self, evm_private_key: &str) -> Result<(), String> {
+        log::info!("Attempting to register API key using ChangePubKey...");
+
+        // Get next nonce
+        let nonce = self
+            .get_nonce()
+            .await
+            .map_err(|e| format!("Failed to get nonce: {:?}", e))?;
+        log::info!("Got nonce for ChangePubKey: {}", nonce);
+
+        // We need to derive the public key from our API private key
+        // For now, let's use the public key that was derived from our private key (logged as "ownPubKey")
+        // This should be 8e02c2f26695a0672de4775bd178d3e509044dac7274aa6cbae293c01a756eb4ab8a501915eee49b
+        let new_pubkey =
+            "0x8e02c2f26695a0672de4775bd178d3e509044dac7274aa6cbae293c01a756eb4ab8a501915eee49b"
+                .to_string();
+        log::info!("New public key to register: {}", new_pubkey);
+
+        // Use SignChangePubKey from the lighter-go library
+        let sign_result = unsafe {
+            SignChangePubKey(
+                std::ffi::CString::new(new_pubkey.clone()).unwrap().as_ptr(),
+                nonce as c_longlong,
+            )
+        };
+
+        // Check if signing was successful
+        if !sign_result.err.is_null() {
+            let error_msg = unsafe { std::ffi::CStr::from_ptr(sign_result.err).to_string_lossy() };
+            return Err(format!("Failed to sign ChangePubKey: {}", error_msg));
+        }
+
+        let tx_info_str = unsafe { std::ffi::CStr::from_ptr(sign_result.str).to_string_lossy() };
+        log::info!("SignChangePubKey result: {}", tx_info_str);
+
+        // Parse the tx_info JSON and extract MessageToSign
+        let mut tx_info: serde_json::Value = serde_json::from_str(&tx_info_str)
+            .map_err(|e| format!("Failed to parse tx_info: {}", e))?;
+
+        let message_to_sign = tx_info["MessageToSign"]
+            .as_str()
+            .ok_or("MessageToSign not found in tx_info")?
+            .to_string();
+        log::info!("MessageToSign: {}", message_to_sign);
+
+        // Remove MessageToSign from tx_info as per Python SDK implementation
+        tx_info.as_object_mut().unwrap().remove("MessageToSign");
+
+        // Sign the message with EVM key using lighter-go SignMessageWithEVM
+        let evm_signature =
+            self.sign_message_with_lighter_go_evm(evm_private_key, &message_to_sign)?;
+        log::info!("EVM signature: {}", evm_signature);
+
+        // Add L1Sig field with the EVM signature (Python SDK uses L1Sig, not evmSignature)
+        tx_info["L1Sig"] = serde_json::Value::String(evm_signature);
+
+        // Send the ChangePubKey request
+        let response = self
+            .send_change_api_key_request(&tx_info.to_string())
+            .await?;
+        log::info!("ChangePubKey response: {:?}", response);
+
+        Ok(())
     }
 
     #[cfg(not(feature = "lighter-sdk"))]
@@ -840,12 +754,52 @@ impl LighterConnector {
         Err("API key registration requires lighter-sdk feature".to_string())
     }
 
-    fn sign_with_evm_key(&self, evm_private_key: &str, message: &str) -> Result<String, String> {
+    fn sign_message_with_lighter_go_evm(
+        &self,
+        evm_private_key: &str,
+        message: &str,
+    ) -> Result<String, String> {
+        log::debug!("Using lighter-go SignMessageWithEVM for EVM signature");
+
+        let private_key_cstr = std::ffi::CString::new(evm_private_key)
+            .map_err(|e| format!("Failed to create CString for private key: {}", e))?;
+        let message_cstr = std::ffi::CString::new(message)
+            .map_err(|e| format!("Failed to create CString for message: {}", e))?;
+
+        let sign_result =
+            unsafe { SignMessageWithEVM(private_key_cstr.as_ptr(), message_cstr.as_ptr()) };
+
+        if !sign_result.err.is_null() {
+            let error_msg = unsafe { std::ffi::CStr::from_ptr(sign_result.err).to_string_lossy() };
+            return Err(format!("EVM signature failed: {}", error_msg));
+        }
+
+        let signature = unsafe { std::ffi::CStr::from_ptr(sign_result.str).to_string_lossy() };
+
+        // Remove 0x prefix if present
+        let signature_clean = if signature.starts_with("0x") {
+            &signature[2..]
+        } else {
+            &signature
+        };
+
+        Ok(signature_clean.to_string())
+    }
+
+    fn _unused_sign_with_evm_key(
+        &self,
+        evm_private_key: &str,
+        message: &str,
+    ) -> Result<String, String> {
         // Parse the private key - try base64 first, then hex
-        let private_key_bytes = if evm_private_key.contains("=") || evm_private_key.contains("+") || evm_private_key.contains("/") {
+        let private_key_bytes = if evm_private_key.contains("=")
+            || evm_private_key.contains("+")
+            || evm_private_key.contains("/")
+        {
             // Looks like base64
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.decode(evm_private_key)
+            base64::engine::general_purpose::STANDARD
+                .decode(evm_private_key)
                 .map_err(|e| format!("Failed to decode private key base64: {}", e))?
         } else {
             // Try hex format
@@ -866,10 +820,12 @@ impl LighterConnector {
         let secret_key = SecretKey::from_slice(&private_key_bytes)
             .map_err(|e| format!("Failed to create secret key: {}", e))?;
 
-        // Create message hash (Keccak256 of the message)
-        let message_bytes = message.as_bytes();
+        // Create EIP-191 prefixed message hash
+        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+        let full_message = format!("{}{}", prefix, message);
+
         let mut hasher = Keccak256::new();
-        hasher.update(message_bytes);
+        hasher.update(full_message.as_bytes());
         let message_hash = hasher.finalize();
 
         // Sign the message
@@ -877,26 +833,36 @@ impl LighterConnector {
         let message_obj = Message::from_digest_slice(&message_hash)
             .map_err(|e| format!("Failed to create message: {}", e))?;
 
-        let signature = secp.sign_ecdsa(&message_obj, &secret_key);
-        let signature_bytes = signature.serialize_compact();
+        let signature = secp.sign_ecdsa_recoverable(&message_obj, &secret_key);
+        let (recovery_id, compact_sig) = signature.serialize_compact();
+
+        // Construct 65-byte signature: [r(32) | s(32) | v(1)]
+        // For EVM signatures, v = recovery_id + 27
+        let mut signature_bytes = [0u8; 65];
+        signature_bytes[0..64].copy_from_slice(&compact_sig);
+        signature_bytes[64] = (recovery_id.to_i32() + 27) as u8; // v = recovery_id + 27
 
         // Encode as hex
         Ok(hex::encode(signature_bytes))
     }
 
-    async fn send_change_api_key_request(&self, tx_info: &str) -> Result<serde_json::Value, String> {
+    async fn send_change_api_key_request(
+        &self,
+        tx_info: &str,
+    ) -> Result<serde_json::Value, String> {
         let base_url = self.base_url.trim_end_matches('/');
         let url = format!("{}/api/v1/sendTx", base_url);
 
         let form_data = [
-            ("tx_type", "8"), // TX_TYPE_CHANGE_PUB_KEY = 8
+            ("tx_type", "17"), // TX_TYPE_CHANGE_PUB_KEY = 17 (correct value)
             ("tx_info", tx_info),
         ];
 
         log::debug!("Sending change API key request to: {}", url);
         log::debug!("Form data: {:?}", form_data);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .form(&form_data)
             .send()
@@ -904,10 +870,16 @@ impl LighterConnector {
             .map_err(|e| format!("Failed to send request: {}", e))?;
 
         let status = response.status();
-        let response_text = response.text().await
+        let response_text = response
+            .text()
+            .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
-        log::debug!("Change API key response: HTTP {}, Body: {}", status, response_text);
+        log::debug!(
+            "Change API key response: HTTP {}, Body: {}",
+            status,
+            response_text
+        );
 
         if !status.is_success() {
             return Err(format!("HTTP {}: {}", status, response_text));
@@ -937,8 +909,9 @@ impl DexConnector for LighterConnector {
                 Err(DexError::ApiKeyRegistrationRequired) => {
                     if let Some(evm_key) = &self.evm_wallet_private_key {
                         log::info!("API key registration required. Attempting to register...");
-                        self.register_api_key(evm_key).await
-                            .map_err(|e| DexError::Other(format!("API key registration failed: {}", e)))?;
+                        self.register_api_key(evm_key).await.map_err(|e| {
+                            DexError::Other(format!("API key registration failed: {}", e))
+                        })?;
 
                         // Retry validation after registration
                         log::info!("Retrying API key validation after registration...");
