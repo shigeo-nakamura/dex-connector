@@ -1517,7 +1517,7 @@ impl DexConnector for LighterConnector {
 
                 let response = self
                     .client
-                    .post("https://mainnet.zklighter.elliot.ai/api/v1/submit")
+                    .post(&format!("{}/api/v1/sendTx", self.base_url))
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .body(form_data)
                     .send()
