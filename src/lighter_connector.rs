@@ -66,6 +66,8 @@ extern "C" {
 
     fn SignChangePubKey(new_pubkey: *const c_char, nonce: c_longlong) -> StrOrErr;
 
+    fn SignCancelAllOrders(time_in_force: c_int, time: c_longlong, nonce: c_longlong) -> StrOrErr;
+
     fn SignMessageWithEVM(private_key: *const c_char, message: *const c_char) -> StrOrErr;
 }
 
@@ -194,25 +196,6 @@ impl LighterConnector {
                 )));
             }
 
-            // Log key configuration details for debugging
-            log::debug!("API Key Validation Details:");
-            log::debug!("  Account Index: {}", self.account_index);
-            log::debug!("  API Key Index: {}", self.api_key_index);
-            log::debug!("  Chain ID: 304 (hardcoded)");
-            log::debug!(
-                "  API Private Key Length: {} chars",
-                self.api_private_key_hex.len()
-            );
-            log::debug!(
-                "  API Private Key (first 8): {}",
-                &self.api_private_key_hex[..std::cmp::min(8, self.api_private_key_hex.len())]
-            );
-            log::debug!(
-                "  API Private Key (last 8): {}",
-                &self.api_private_key_hex
-                    [std::cmp::max(0, self.api_private_key_hex.len().saturating_sub(8))..]
-            );
-
             // Get the correct public key from the server
             let server_pubkey = match self.get_server_public_key().await {
                 Ok(pubkey) => pubkey,
@@ -232,15 +215,6 @@ impl LighterConnector {
                 let pubkey_cstr = CStr::from_ptr(go_pubkey_result);
                 let pubkey_str = pubkey_cstr.to_string_lossy().to_string();
                 libc::free(go_pubkey_result as *mut libc::c_void);
-                log::debug!("Go-derived public key: {}", pubkey_str);
-                log::debug!(
-                    "  Go-derived public key (first 8): {}",
-                    &pubkey_str[..std::cmp::min(8, pubkey_str.len())]
-                );
-                log::debug!(
-                    "  Go-derived public key (last 8): {}",
-                    &pubkey_str[std::cmp::max(0, pubkey_str.len().saturating_sub(8))..]
-                );
                 Some(pubkey_str)
             } else {
                 log::error!("Failed to get public key from Go client");
@@ -264,13 +238,6 @@ impl LighterConnector {
                         &loc[..8], &loc[loc.len()-8..]
                     );
                 } else {
-                    log::debug!(
-                        "API key verified (account={}, index={}). public_key={}…{}",
-                        self.account_index,
-                        self.api_key_index,
-                        &srv[..8],
-                        &srv[srv.len() - 8..]
-                    );
                 }
             }
 
@@ -332,8 +299,6 @@ impl LighterConnector {
                     "API key validation failed: {}",
                     error_msg
                 )));
-            } else {
-                log::debug!("API key validation successful");
             }
 
             Ok(())
@@ -528,19 +493,18 @@ impl LighterConnector {
         let trigger_price = 0u64; // no trigger
         let order_expiry = 1762543091693u64; // Exact value from Go SDK test
 
-        // Use exact values from Go SDK test to match the signature
-        let test_market_id = 1u64; // Exact value from Go SDK test
-        let test_base_amount = 50u64; // Exact value from Go SDK test
-        let test_price = 4750000u64; // Exact value from Go SDK test
-        let test_side = 0u64; // Exact value from Go SDK test (IsAsk=0)
-                              // Use the actual nonce from API, not hardcoded value
+        // Use actual parameters passed to function instead of hardcoded test values
+        let actual_market_id = market_id as u64;
+        let actual_base_amount = base_amount;
+        let actual_price = price;
+        let actual_side = side as u64;
 
-        let tx_data = [
-            test_market_id,     // market_index
+        let _tx_data = [
+            actual_market_id,   // market_index - actual parameter
             client_order_index, // client_order_index
-            test_base_amount,   // base_amount
-            test_price,         // price
-            test_side,          // is_ask
+            actual_base_amount, // base_amount - actual parameter
+            actual_price,       // price - actual parameter
+            actual_side,        // is_ask - actual parameter
             order_type,         // order_type
             time_in_force,      // time_in_force
             reduce_only,        // reduce_only
@@ -565,11 +529,11 @@ impl LighterConnector {
         // Call Go shared library to generate signature dynamically
         let go_result = self
             .call_go_sign_create_order(
-                test_market_id as i32,
+                actual_market_id as i32,
                 client_order_index as i64,
-                test_base_amount as i64,
-                test_price as i32,
-                test_side as i32,
+                actual_base_amount as i64,
+                actual_price as i32,
+                actual_side as i32,
                 order_type as i32,
                 time_in_force as i32,
                 reduce_only as i32,
@@ -583,10 +547,6 @@ impl LighterConnector {
         log::debug!("Go SDK JSON: {}", go_result);
 
         // Use the exact JSON from Go SDK - it already contains everything correctly
-        log::debug!("=== SIGNATURE DEBUG ===");
-        log::debug!("API nonce: {}", nonce);
-        log::debug!("Transaction data: {:?}", tx_data);
-        log::debug!("Using Go SDK transaction JSON directly");
 
         // Use the complete transaction JSON from Go SDK directly
         let tx_info = go_result;
@@ -786,15 +746,6 @@ impl LighterConnector {
         }
 
         let server_pubkey = &response.api_keys[0].public_key;
-        log::debug!("Server public key: {}", server_pubkey);
-        log::debug!(
-            "  Server public key (first 8): {}",
-            &server_pubkey[..std::cmp::min(8, server_pubkey.len())]
-        );
-        log::debug!(
-            "  Server public key (last 8): {}",
-            &server_pubkey[std::cmp::max(0, server_pubkey.len().saturating_sub(8))..]
-        );
 
         Ok(server_pubkey.clone())
     }
@@ -1291,9 +1242,7 @@ impl DexConnector for LighterConnector {
         #[cfg(feature = "lighter-sdk")]
         {
             match self.create_go_client().await {
-                Ok(()) => {
-                    log::debug!("API key validation successful");
-                }
+                Ok(()) => {}
                 Err(DexError::ApiKeyRegistrationRequired) => {
                     #[cfg(feature = "lighter-sdk")]
                     if let Some(evm_key) = &self.evm_wallet_private_key {
@@ -1328,9 +1277,7 @@ impl DexConnector for LighterConnector {
                                 })?;
 
                             // Retry validation after registration
-                            log::debug!("Retrying API key validation after registration...");
                             self.create_go_client().await?;
-                            log::debug!("API key validation successful after registration");
                         } else {
                             log::error!("Failed to get Go-derived public key for registration");
                             return Err(DexError::Other(
@@ -1490,15 +1437,16 @@ impl DexConnector for LighterConnector {
         let tif = 0; // Default to GTC
 
         // Convert amounts to Lighter's scaled integers
-        // Typically: base_amount in 1e5 scale, price in 1e6 scale
+        // Base amount in 1e5 scale, price scaled to match Go SDK (much smaller scale)
         let base_amount = (size * Decimal::new(100_000, 0))
             .to_u64()
             .ok_or_else(|| DexError::Other("Invalid size amount".to_string()))?;
 
         let price_value = if let Some(p) = price {
-            (p * Decimal::new(1_000_000, 0))
-                .to_u64()
-                .ok_or_else(|| DexError::Other("Invalid price".to_string()))?
+            // Correct scale: DEX shows 40000000 as $4,000,000, so scale is 10 per dollar
+            (p * Decimal::new(10, 0))
+                .to_u32()
+                .ok_or_else(|| DexError::Other("Invalid price".to_string()))? as u64
         } else {
             return Err(DexError::Other(
                 "Market orders not supported yet".to_string(),
@@ -1532,7 +1480,68 @@ impl DexConnector for LighterConnector {
 
     async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
         log::debug!("Cancelling all orders for Lighter connector");
-        // For now, just return success - this is primarily used for testing
+
+        #[cfg(feature = "lighter-sdk")]
+        {
+            // Get nonce from API
+            let nonce = self.get_nonce().await?;
+
+            // Use ImmediateCancelAll (time_in_force=0, time=0)
+            let time_in_force = 0; // ImmediateCancelAll
+            let time = 0; // Not used for immediate cancel
+
+            unsafe {
+                let result = SignCancelAllOrders(time_in_force, time, nonce as i64);
+
+                if !result.err.is_null() {
+                    let error_cstr = CStr::from_ptr(result.err);
+                    let error_msg = error_cstr.to_string_lossy().to_string();
+                    libc::free(result.err as *mut libc::c_void);
+                    return Err(DexError::Other(format!(
+                        "Cancel all orders failed: {}",
+                        error_msg
+                    )));
+                }
+
+                // Get the transaction JSON
+                let result_cstr = CStr::from_ptr(result.str);
+                let tx_json = result_cstr.to_string_lossy().to_string();
+                libc::free(result.str as *mut libc::c_void);
+
+                // Submit the cancel transaction to the API
+                let _timestamp = chrono::Utc::now().timestamp_millis() as u64;
+                let form_data = format!(
+                    "tx_type=16&tx_info={}&price_protection=false",
+                    urlencoding::encode(&tx_json)
+                );
+
+                let response = self
+                    .client
+                    .post("https://mainnet.zklighter.elliot.ai/api/v1/submit")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(form_data)
+                    .send()
+                    .await
+                    .map_err(|e| DexError::Other(format!("Network error: {}", e)))?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(DexError::Other(format!(
+                        "Cancel all orders failed: HTTP {}, {}",
+                        status, body
+                    )));
+                }
+
+                log::debug!("Cancel all orders submitted successfully");
+            }
+        }
+
+        #[cfg(not(feature = "lighter-sdk"))]
+        {
+            log::warn!("Cancel all orders not implemented without lighter-sdk feature");
+        }
+
         Ok(())
     }
 
