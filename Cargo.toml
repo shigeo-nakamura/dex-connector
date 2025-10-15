@@ -10,7 +10,7 @@ repository = "https://github.com/shigeo-nakamura/dex-connector"
 license = "MIT"
 
 [features]
-default = ["lighter-sdk"]
+default = []
 lighter-sdk = ["dep:libc"]
 
 [dependencies]

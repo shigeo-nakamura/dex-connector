@@ -7,11 +7,13 @@ mod dex_connector;
 mod dex_request;
 mod dex_websocket;
 mod hyperliquid_connector;
+#[cfg(feature = "lighter-sdk")]
 pub mod lighter_connector;
 
 pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
 pub use hyperliquid_connector::*;
+#[cfg(feature = "lighter-sdk")]
 pub use lighter_connector::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]

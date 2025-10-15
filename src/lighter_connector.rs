@@ -1,3 +1,5 @@
+#![cfg(feature = "lighter-sdk")]
+
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
     dex_request::{DexError, HttpMethod},

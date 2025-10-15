@@ -10,35 +10,62 @@ A Rust library for connecting to multiple decentralized exchanges (DEX) with con
 
 ## Feature Flags
 
-### `lighter-sdk` (default: enabled)
+### `lighter-sdk` (default: **disabled** for safety)
 Enables Lighter Go SDK integration with external shared library dependency.
 
 **When enabled:**
 - Full Lighter DEX functionality
 - Requires `libsigner.so` shared library
 - Go FFI bindings available
+- **Architecture-specific**: Must match target platform
 
 **When disabled:**
 - Lighter functions return runtime errors
 - No shared library dependencies
 - Reduced binary size
+- Safe for all architectures
 
 ## Build Options
 
-### Default Build (All Features)
+### Default Build (Safe for All Architectures)
 ```bash
 cargo build
 ```
+Builds without native dependencies. Hyperliquid and other connectors work normally.
 
-### Lightweight Build (No Lighter SDK)
+### With Lighter SDK Support
 ```bash
-cargo build --no-default-features
+cargo build --features lighter-sdk
 ```
 
-### Custom Features
+### Cross-Platform Development
+
+**Development Environment (x86_64):**
 ```bash
-cargo build --features lighter-sdk  # Enable only Lighter SDK
+# Install x86_64 Go libraries
+cd /path/to/lighter-go
+go build -buildmode=c-shared -o libsigner.so
+
+# Build with Lighter support
+cargo build --features lighter-sdk
 ```
+
+**Production Environment (ARM64):**
+```bash
+# Build ARM64 Go libraries
+cd /path/to/lighter-go
+GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o libsigner.so
+
+# Or build directly on ARM64 machine:
+go build -buildmode=c-shared -o libsigner.so
+
+# Set environment and build
+export LIGHTER_GO_PATH=/path/to/arm64/lighter-go
+export LD_LIBRARY_PATH=$LIGHTER_GO_PATH:$LD_LIBRARY_PATH
+cargo build --features lighter-sdk
+```
+
+**Important:** Always ensure `libsigner.so` matches your target architecture. Using x86_64 libraries on ARM64 (or vice versa) will cause segmentation faults.
 
 ## Usage Examples
 
@@ -97,9 +124,10 @@ dex-connector/
 ## Integration Notes
 
 ### For Library Users
-- Use default features for full functionality
-- Use `--no-default-features` for minimal dependencies
-- Handle runtime errors gracefully when features are disabled
+- **Default**: Safe build without native dependencies
+- **Enable lighter-sdk**: Only when you have matching architecture libraries
+- **Handle errors**: Gracefully handle disabled feature runtime errors
+- **Cross-platform**: Always rebuild `libsigner.so` for target architecture
 
 ### For Contributors
 - Mark Lighter-specific code with `#[cfg(feature = "lighter-sdk")]`
