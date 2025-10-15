@@ -104,6 +104,15 @@ struct LighterAccountInfo {
     available_balance: String,
     collateral: String,
     total_asset_value: String,
+    positions: Vec<LighterPosition>,
+}
+
+#[derive(Deserialize, Debug)]
+struct LighterPosition {
+    market_id: u8,
+    symbol: String,
+    position: String,
+    sign: i8,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1658,9 +1667,68 @@ impl DexConnector for LighterConnector {
     }
 
     async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
-        Err(DexError::Other(
-            "Close positions not implemented yet".to_string(),
-        ))
+        // Get current account info to check positions
+        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
+
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+
+        if account_response.accounts.is_empty() {
+            return Err(DexError::Other("No account found".to_string()));
+        }
+
+        let account = &account_response.accounts[0];
+
+        // Check if there are any open positions (position != "0.00000")
+        let mut has_positions = false;
+        for position in &account.positions {
+            if let Ok(pos_size) = position.position.parse::<f64>() {
+                if pos_size.abs() > 0.00001 {
+                    // Small threshold for floating point comparison
+                    has_positions = true;
+                    log::info!(
+                        "Found open position: market_id={}, symbol={}, size={}",
+                        position.market_id,
+                        position.symbol,
+                        position.position
+                    );
+                }
+            }
+        }
+
+        if !has_positions {
+            log::info!("No open positions found, nothing to close");
+            return Ok(());
+        }
+
+        // For now, just log that positions exist but don't close them
+        // TODO: Implement actual position closing with market orders
+        log::warn!("Open positions found but automatic closing not implemented yet");
+        log::warn!("Manual position closing required");
+
+        Ok(())
     }
 
     async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
