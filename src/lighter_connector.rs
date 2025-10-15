@@ -1723,11 +1723,52 @@ impl DexConnector for LighterConnector {
             return Ok(());
         }
 
-        // For now, just log that positions exist but don't close them
-        // TODO: Implement actual position closing with market orders
-        log::warn!("Open positions found but automatic closing not implemented yet");
-        log::warn!("Manual position closing required");
+        // Close each open position by placing market orders in opposite direction
+        for position in &account.positions {
+            if let Ok(pos_size) = position.position.parse::<f64>() {
+                if pos_size.abs() > 0.00001 {
+                    log::info!(
+                        "Closing position: market_id={}, symbol={}, size={}, sign={}",
+                        position.market_id,
+                        position.symbol,
+                        position.position,
+                        position.sign
+                    );
 
+                    // Determine order side (opposite to current position)
+                    let order_side = if position.sign > 0 {
+                        // Currently long, so sell to close
+                        1 // Ask/Sell
+                    } else {
+                        // Currently short, so buy to close
+                        0 // Bid/Buy
+                    };
+
+                    let market_id = position.market_id;
+                    let base_amount = (pos_size.abs() * 100000.0) as u64; // Convert to base units
+
+                    // Create market order to close position
+                    match self
+                        .create_market_close_order_internal(market_id, base_amount, order_side)
+                        .await
+                    {
+                        Ok(_) => {
+                            log::info!(
+                                "Successfully submitted close order for {} position in market {}",
+                                position.symbol,
+                                market_id
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("Failed to close position in market {}: {}", market_id, e);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        log::info!("All position close orders submitted successfully");
         Ok(())
     }
 
@@ -1743,10 +1784,11 @@ impl DexConnector for LighterConnector {
         use ethers::signers::{LocalWallet, Signer};
         use std::str::FromStr;
 
-        let cleaned_key = self
-            .api_private_key_hex
-            .strip_prefix("0x")
-            .unwrap_or(&self.api_private_key_hex);
+        let private_key = self
+            .evm_wallet_private_key
+            .as_ref()
+            .ok_or_else(|| DexError::Other("EVM wallet private key not set".to_string()))?;
+        let cleaned_key = private_key.strip_prefix("0x").unwrap_or(private_key);
         let wallet = LocalWallet::from_str(cleaned_key)
             .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
 
@@ -1762,6 +1804,73 @@ impl DexConnector for LighterConnector {
         // EIP-191 adds the prefix "\x19Ethereum Signed Message:\n" + message.len() + message
         let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
         self.sign_evm_65b(&prefixed).await
+    }
+}
+
+impl LighterConnector {
+    async fn create_market_close_order_internal(
+        &self,
+        market_id: u8,
+        base_amount: u64,
+        is_ask: u8,
+    ) -> Result<String, DexError> {
+        // Get current market price for the market order
+        let current_price = if market_id == 1 {
+            // For BTC market, get current price from recent trades
+            let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=1", market_id);
+            let url = format!("{}{}", self.base_url, endpoint);
+            let response = self
+                .client
+                .get(&url)
+                .header("X-API-KEY", &self.api_key_public)
+                .send()
+                .await
+                .map_err(|e| DexError::Other(format!("Failed to get current price: {}", e)))?;
+
+            let response_text = response
+                .text()
+                .await
+                .map_err(|e| DexError::Other(format!("Failed to read price response: {}", e)))?;
+
+            let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
+                .map_err(|e| DexError::Other(format!("Failed to parse trades response: {}", e)))?;
+
+            if let Some(trade) = trades_response.trades.first() {
+                let price_decimal = string_to_decimal(Some(trade.price.clone()))?;
+
+                // Add/subtract buffer for market order execution
+                let buffer_multiplier = if is_ask == 1 {
+                    Decimal::new(95, 2) // 0.95
+                } else {
+                    Decimal::new(105, 2) // 1.05
+                };
+                let market_price = price_decimal * buffer_multiplier;
+                (market_price * Decimal::new(100, 0)).to_u64().unwrap_or(0) // Convert to price units
+            } else {
+                return Err(DexError::Other(
+                    "No recent trades found for pricing".to_string(),
+                ));
+            }
+        } else {
+            return Err(DexError::Other(format!(
+                "Market ID {} not supported yet",
+                market_id
+            )));
+        };
+
+        // Create market order using existing native order infrastructure
+        let response = self
+            .create_order_native(
+                market_id as u32,
+                is_ask as u32,
+                1, // IOC time in force
+                base_amount,
+                current_price,
+                None, // No specific client order index
+            )
+            .await?;
+
+        Ok(response.order_id)
     }
 }
 
