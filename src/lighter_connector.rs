@@ -93,10 +93,17 @@ pub struct LighterConnector {
 
 #[derive(Deserialize, Debug)]
 struct LighterAccountResponse {
-    #[serde(rename = "totalEquity")]
-    total_equity: String,
-    #[serde(rename = "availableBalance")]
+    code: i32,
+    total: i32,
+    accounts: Vec<LighterAccountInfo>,
+}
+
+#[derive(Deserialize, Debug)]
+struct LighterAccountInfo {
+    account_index: i64,
     available_balance: String,
+    collateral: String,
+    total_asset_value: String,
 }
 
 #[allow(dead_code)]
@@ -1369,17 +1376,48 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
-        let endpoint = format!(
-            "/api/v1/account?account_index={}&api_key_index={}",
-            self.account_index, self.api_key_index
+        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
+
+        // First, get the raw response text for debugging
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+        log::debug!(
+            "Account API response (status: {}): {}",
+            status,
+            response_text
         );
 
-        let account_response: LighterAccountResponse =
-            self.make_request(&endpoint, HttpMethod::Get, None).await?;
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "HTTP {}: {}",
+                status, response_text
+            )));
+        }
 
+        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+
+        if account_response.accounts.is_empty() {
+            return Err(DexError::Other("No account found".to_string()));
+        }
+
+        let account = &account_response.accounts[0];
         Ok(BalanceResponse {
-            equity: string_to_decimal(Some(account_response.total_equity))?,
-            balance: string_to_decimal(Some(account_response.available_balance))?,
+            equity: string_to_decimal(Some(account.total_asset_value.clone()))?,
+            balance: string_to_decimal(Some(account.available_balance.clone()))?,
         })
     }
 
