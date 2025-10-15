@@ -3,7 +3,7 @@ use crate::{
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CreateOrderResponse, FilledOrder,
-    FilledOrdersResponse, OrderSide, TickerResponse, TpSl,
+    FilledOrdersResponse, LastTradesResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1485,6 +1485,13 @@ impl DexConnector for HyperliquidConnector {
             equity: total_equity,
             balance: total_balance,
         })
+    }
+
+    async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradesResponse, DexError> {
+        // TODO: Implement HyperLiquid last trades functionality
+        Err(DexError::Other(
+            "get_last_trades not implemented for HyperLiquid".to_string(),
+        ))
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {

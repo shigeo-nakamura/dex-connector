@@ -5,7 +5,7 @@ use crate::{
     dex_request::{DexError, HttpMethod},
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CreateOrderResponse, FilledOrder,
-    FilledOrdersResponse, OrderSide, TickerResponse, TpSl,
+    FilledOrdersResponse, LastTrade, LastTradesResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -1490,6 +1490,58 @@ impl DexConnector for LighterConnector {
             equity: string_to_decimal(Some(account.total_asset_value.clone()))?,
             balance: string_to_decimal(Some(account.available_balance.clone()))?,
         })
+    }
+
+    async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
+        // Get market_id for the symbol
+        let market_id = match symbol {
+            "BTC" => 1,
+            _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
+        };
+
+        // Query recent trades
+        let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=10", market_id);
+
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+        log::debug!(
+            "Last trades API response (status: {}): {}",
+            status,
+            response_text
+        );
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+
+        let trades = trades_response
+            .trades
+            .into_iter()
+            .map(|t| LastTrade {
+                price: string_to_decimal(Some(t.price)).unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(LastTradesResponse { trades })
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {

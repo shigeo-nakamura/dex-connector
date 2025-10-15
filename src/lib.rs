@@ -95,6 +95,11 @@ pub struct LastTrade {
     pub price: Decimal,
 }
 
+#[derive(Deserialize, Debug, Default)]
+pub struct LastTradesResponse {
+    pub trades: Vec<LastTrade>,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Trigger {
