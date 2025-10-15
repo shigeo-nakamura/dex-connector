@@ -44,9 +44,11 @@ cargo build --features lighter-sdk
 ```bash
 # Install x86_64 Go libraries
 cd /path/to/lighter-go
-go build -buildmode=c-shared -o libsigner.so
+go build -buildmode=c-shared -trimpath -o ./build/signer-amd64.so ./sharedlib/sharedlib.go
 
 # Build with Lighter support
+export LIGHTER_GO_PATH=/path/to/lighter-go/build
+export LD_LIBRARY_PATH=$LIGHTER_GO_PATH:$LD_LIBRARY_PATH
 cargo build --features lighter-sdk
 ```
 
@@ -54,13 +56,10 @@ cargo build --features lighter-sdk
 ```bash
 # Build ARM64 Go libraries
 cd /path/to/lighter-go
-GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o libsigner.so
-
-# Or build directly on ARM64 machine:
-go build -buildmode=c-shared -o libsigner.so
+go build -buildmode=c-shared -trimpath -o ./build/signer-arm64.so ./sharedlib/sharedlib.go
 
 # Set environment and build
-export LIGHTER_GO_PATH=/path/to/arm64/lighter-go
+export LIGHTER_GO_PATH=/path/to/lighter-go/build
 export LD_LIBRARY_PATH=$LIGHTER_GO_PATH:$LD_LIBRARY_PATH
 cargo build --features lighter-sdk
 ```
