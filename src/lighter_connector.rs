@@ -570,6 +570,7 @@ impl LighterConnector {
             price,
             client_order_id,
             0,
+            false,
         )
         .await
     }
@@ -583,6 +584,7 @@ impl LighterConnector {
         price: u64,
         client_order_id: Option<String>,
         order_type: u32,
+        reduce_only: bool,
     ) -> Result<CreateOrderResponse, DexError> {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         let client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
@@ -596,23 +598,23 @@ impl LighterConnector {
             price
         );
 
-        // Match the exact parameters used in Go SDK test to validate signature
-        let client_order_index = 12345u64; // Exact value from Go SDK test
+        // Use timestamp as unique client_order_index instead of hardcoded value
+        let client_order_index = timestamp; // Use unique timestamp for each order
         let order_type_param = order_type as u64; // Use passed order type
         let time_in_force = tif as u64; // Use passed time in force
-        let reduce_only = 1u64; // true - this is for position closing orders
+        let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price = 0u64; // no trigger
-                                  // For market orders (IOC), use 0 as expiry. For limit orders, use current timestamp + duration
-        let order_expiry = if order_type == 1 {
-            // ORDER_TYPE_MARKET
-            0u64 // DEFAULT_IOC_EXPIRY for immediate-or-cancel orders
+                                  // For market orders and IOC orders, use 0 as expiry. For GTC orders, use future timestamp
+        let order_expiry = if order_type == 1 || tif == 0 {
+            // ORDER_TYPE_MARKET or IOC orders
+            0i64 // NilOrderExpiry for immediate-or-cancel orders
         } else {
-            // For limit orders, use current timestamp + 28 days in milliseconds
+            // For GTC limit orders, use current timestamp + 24 hours
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_millis() as u64;
-            now_ms + (28 * 24 * 60 * 60 * 1000) // 28 days in milliseconds
+                .as_millis() as i64;
+            now_ms + (24 * 60 * 60 * 1000) // 24 hours in milliseconds
         };
 
         // Use actual parameters passed to function instead of hardcoded test values
@@ -622,17 +624,17 @@ impl LighterConnector {
         let actual_side = side as u64;
 
         let _tx_data = [
-            actual_market_id,   // market_index - actual parameter
-            client_order_index, // client_order_index
-            actual_base_amount, // base_amount - actual parameter
-            actual_price,       // price - actual parameter
-            actual_side,        // is_ask - actual parameter
-            order_type_param,   // order_type
-            time_in_force,      // time_in_force
-            reduce_only,        // reduce_only
-            trigger_price,      // trigger_price
-            order_expiry,       // order_expiry
-            nonce,              // nonce - use actual API nonce
+            actual_market_id,    // market_index - actual parameter
+            client_order_index,  // client_order_index
+            actual_base_amount,  // base_amount - actual parameter
+            actual_price,        // price - actual parameter
+            actual_side,         // is_ask - actual parameter
+            order_type_param,    // order_type
+            time_in_force,       // time_in_force
+            reduce_only_param,   // reduce_only
+            trigger_price,       // trigger_price
+            order_expiry as u64, // order_expiry
+            nonce,               // nonce - use actual API nonce
         ];
 
         // Extract private key bytes (40 bytes for Goldilocks quintic extension)
@@ -1809,20 +1811,54 @@ impl DexConnector for LighterConnector {
             .to_u64()
             .ok_or_else(|| DexError::Other("Invalid size amount".to_string()))?;
 
-        let price_value = if let Some(p) = price {
-            // Correct scale: DEX shows 40000000 as $4,000,000, so scale is 10 per dollar
-            (p * Decimal::new(10, 0))
+        let (price_value, order_type, tif) = if let Some(p) = price {
+            // Limit order
+            let price_val = (p * Decimal::new(10, 0))
                 .to_u32()
-                .ok_or_else(|| DexError::Other("Invalid price".to_string()))? as u64
+                .ok_or_else(|| DexError::Other("Invalid price".to_string()))?
+                as u64;
+            (price_val, 0u32, 1u32) // order_type=0 (limit), tif=1 (GTC like Hyperliquid)
         } else {
-            return Err(DexError::Other(
-                "Market orders not supported yet".to_string(),
-            ));
+            // Market order - get current price and set protection price
+            let ticker = self.get_ticker(symbol, None).await?;
+            let current_price = ticker.price;
+
+            // Set protection price with large buffer for market orders
+            let protection_price = if side_value == 1 {
+                // SELL
+                current_price * Decimal::new(800, 3) // 20% below market (protection price)
+            } else {
+                // BUY
+                current_price * Decimal::new(1200, 3) // 20% above market (protection price)
+            };
+
+            let price_val = (protection_price * Decimal::new(10, 0))
+                .to_u32()
+                .ok_or_else(|| DexError::Other("Invalid protection price".to_string()))?
+                as u64;
+
+            log::debug!(
+                "Market order: current_price={}, protection_price={}, side={}",
+                current_price,
+                protection_price,
+                side_value
+            );
+
+            (price_val, 1u32, 0u32) // order_type=1 (market), tif=0 (IOC)
         };
 
         // Use native Rust implementation for Lighter signatures
-        self.create_order_native(market_id, side_value, tif, base_amount, price_value, None)
-            .await
+        self.create_order_native_with_type(
+            market_id,
+            side_value,
+            tif,
+            base_amount,
+            price_value,
+            None,
+            order_type,
+            false,
+        )
+        .await
     }
 
     async fn create_trigger_order(
@@ -1914,12 +1950,37 @@ impl DexConnector for LighterConnector {
 
     async fn cancel_orders(
         &self,
-        _symbol: Option<String>,
-        _order_ids: Vec<String>,
+        symbol: Option<String>,
+        order_ids: Vec<String>,
     ) -> Result<(), DexError> {
-        Err(DexError::Other(
-            "Bulk cancel orders not implemented yet".to_string(),
-        ))
+        log::debug!(
+            "Cancelling {} orders for Lighter connector",
+            order_ids.len()
+        );
+
+        // For now, use cancel_all_orders as a workaround since individual order cancellation
+        // requires order_index which we don't have a direct mapping for from order_id
+        // This is a limitation of the current implementation
+        log::warn!("Using cancel_all_orders as workaround for cancel_orders");
+
+        // First, call cancel_all_orders
+        self.cancel_all_orders(symbol.clone()).await?;
+
+        // Then manually add the canceled orders to our tracking
+        if let Some(sym) = symbol.as_ref() {
+            let mut canceled_orders = self.canceled_orders.write().await;
+            let symbol_orders = canceled_orders.entry(sym.clone()).or_insert_with(Vec::new);
+
+            for order_id in order_ids {
+                let canceled_order = CanceledOrder {
+                    order_id: order_id.clone(),
+                    canceled_timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                };
+                symbol_orders.push(canceled_order);
+            }
+        }
+
+        Ok(())
     }
 
     async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
@@ -2470,6 +2531,7 @@ impl LighterConnector {
                 current_price,
                 None, // No specific client order index
                 1,    // ORDER_TYPE_MARKET
+                true, // reduce_only=true for position closing
             )
             .await?;
 
