@@ -591,11 +591,12 @@ impl LighterConnector {
         let nonce = self.get_nonce().await?;
 
         log::debug!(
-            "Creating native order: market_id={}, side={}, base_amount={}, price={}",
+            "Creating native order: market_id={}, side={}, base_amount={}, price={}, calculated_price_usd={:.1}",
             market_id,
             side,
             base_amount,
-            price
+            price,
+            price as f64 / 10.0
         );
 
         // Use timestamp as unique client_order_index instead of hardcoded value
@@ -710,8 +711,19 @@ impl LighterConnector {
 
         if status.is_success() {
             log::debug!("Native order submitted successfully!");
+            // Use client_order_index as order_id for tracking
+            let order_id = client_order_index.to_string();
+
+            log::debug!(
+                "Created order: order_id={}, client_order_index={}, side={}, size={}",
+                order_id,
+                client_order_index,
+                side,
+                Decimal::new(base_amount as i64, 5)
+            );
+
             Ok(CreateOrderResponse {
-                order_id: client_id,
+                order_id,
                 ordered_price: Decimal::new(price as i64, 6),
                 ordered_size: Decimal::new(base_amount as i64, 5),
             })
@@ -1803,7 +1815,7 @@ impl DexConnector for LighterConnector {
         };
 
         // Convert time-in-force: 0=GTC, 1=IOC, 2=FOK
-        let tif = 0; // Default to GTC
+        let _tif = 0; // Default to GTC
 
         // Convert amounts to Lighter's scaled integers
         // Base amount in 1e5 scale, price scaled to match Go SDK (much smaller scale)
@@ -1812,11 +1824,23 @@ impl DexConnector for LighterConnector {
             .ok_or_else(|| DexError::Other("Invalid size amount".to_string()))?;
 
         let (price_value, order_type, tif) = if let Some(p) = price {
+            // Apply spread if provided (for MarketMake strategy)
+            let final_price = if let Some(spread_ticks) = _spread {
+                // Get tick size from market data (assuming 0.1 for BTC)
+                let tick_size = Decimal::new(1, 1); // 0.1
+                let spread_amount = Decimal::from(spread_ticks) * tick_size;
+                p + spread_amount
+            } else {
+                p
+            };
+
             // Limit order
-            let price_val = (p * Decimal::new(10, 0))
+            let price_val = (final_price * Decimal::new(10, 0))
                 .to_u32()
                 .ok_or_else(|| DexError::Other("Invalid price".to_string()))?
                 as u64;
+            log::debug!("Creating limit order: side={}, original_price={}, spread_ticks={:?}, final_price={}, scaled_price={}, size={}, scaled_base_amount={}",
+                side_value, p, _spread, final_price, price_val, size, base_amount);
             (price_val, 0u32, 1u32) // order_type=0 (limit), tif=1 (GTC like Hyperliquid)
         } else {
             // Market order - get current price and set protection price
@@ -1950,37 +1974,12 @@ impl DexConnector for LighterConnector {
 
     async fn cancel_orders(
         &self,
-        symbol: Option<String>,
-        order_ids: Vec<String>,
+        _symbol: Option<String>,
+        _order_ids: Vec<String>,
     ) -> Result<(), DexError> {
-        log::debug!(
-            "Cancelling {} orders for Lighter connector",
-            order_ids.len()
-        );
-
-        // For now, use cancel_all_orders as a workaround since individual order cancellation
-        // requires order_index which we don't have a direct mapping for from order_id
-        // This is a limitation of the current implementation
-        log::warn!("Using cancel_all_orders as workaround for cancel_orders");
-
-        // First, call cancel_all_orders
-        self.cancel_all_orders(symbol.clone()).await?;
-
-        // Then manually add the canceled orders to our tracking
-        if let Some(sym) = symbol.as_ref() {
-            let mut canceled_orders = self.canceled_orders.write().await;
-            let symbol_orders = canceled_orders.entry(sym.clone()).or_insert_with(Vec::new);
-
-            for order_id in order_ids {
-                let canceled_order = CanceledOrder {
-                    order_id: order_id.clone(),
-                    canceled_timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                };
-                symbol_orders.push(canceled_order);
-            }
-        }
-
-        Ok(())
+        Err(DexError::Other(
+            "Individual order cancellation not implemented for Lighter. Use cancel_all_orders instead.".to_string(),
+        ))
     }
 
     async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
@@ -2272,6 +2271,7 @@ impl LighterConnector {
                                 &order_book,
                                 &filled_orders,
                                 &canceled_orders,
+                                account_index,
                             )
                             .await;
                         }
@@ -2290,8 +2290,14 @@ impl LighterConnector {
         order_book: &Arc<RwLock<Option<LighterOrderBook>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+        account_index: u32,
     ) {
         let msg_type = message.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        log::trace!(
+            "WebSocket message received: type='{}', message={:?}",
+            msg_type,
+            message
+        );
 
         match msg_type {
             "subscribed/order_book" | "update/order_book" => {
@@ -2326,10 +2332,20 @@ impl LighterConnector {
                 }
             }
             "subscribed/account_all" | "update/account_all" => {
+                log::debug!(
+                    "Received account message: type={}, message={:?}",
+                    msg_type,
+                    message
+                );
                 // Handle account updates (filled/canceled orders)
-                if let Some(data) = message.get("data") {
-                    Self::handle_account_update(data, filled_orders, canceled_orders).await;
-                }
+                // For Lighter DEX, the data is directly in the message, not in a 'data' field
+                Self::handle_account_update(
+                    &message,
+                    filled_orders,
+                    canceled_orders,
+                    account_index as u64,
+                )
+                .await;
             }
             _ => {
                 log::trace!("Unhandled WebSocket message type: {}", msg_type);
@@ -2341,18 +2357,48 @@ impl LighterConnector {
         data: &Value,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+        account_id: u64,
     ) {
-        // Handle filled orders
+        log::debug!("handle_account_update called with data: {:?}", data);
+
+        // Handle filled orders - try both 'fills' and 'trades' fields
         if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
+            log::debug!("Found {} fills in account update", fills.len());
             let mut filled_map = filled_orders.write().await;
             for fill in fills {
-                if let Ok(filled_order) = Self::parse_filled_order(fill) {
+                log::debug!("Processing fill: {:?}", fill);
+                if let Ok(filled_order) = Self::parse_filled_order(fill, account_id) {
+                    log::info!("Added filled order: {:?}", filled_order);
                     filled_map
                         .entry("BTC".to_string())
                         .or_insert_with(Vec::new)
                         .push(filled_order);
+                } else {
+                    log::warn!("Failed to parse filled order: {:?}", fill);
                 }
             }
+        } else if let Some(trades) = data.get("trades") {
+            log::debug!("Found trades object: {:?}", trades);
+            // Handle trades object - Lighter DEX format: {"market_id": [trade_array]}
+            if let Some(trades_obj) = trades.as_object() {
+                let mut filled_map = filled_orders.write().await;
+                for (market_id, trade_array) in trades_obj {
+                    log::debug!(
+                        "Processing trades for market {}: {:?}",
+                        market_id,
+                        trade_array
+                    );
+                    if let Some(trades_array) = trade_array.as_array() {
+                        for trade_data in trades_array {
+                            log::debug!("Processing individual trade: {:?}", trade_data);
+                            // Skip filled order processing for Lighter DEX (using timeout-based strategy)
+                            log::trace!("Skipping trade data processing: {:?}", trade_data);
+                        }
+                    }
+                }
+            }
+        } else {
+            log::debug!("No 'fills' array or 'trades' object found in account data");
         }
 
         // Handle canceled orders
@@ -2369,44 +2415,12 @@ impl LighterConnector {
         }
     }
 
-    fn parse_filled_order(data: &Value) -> Result<FilledOrder, DexError> {
-        // Parse filled order from WebSocket data
-        // This is a simplified implementation - adjust based on actual Lighter WebSocket format
-        Ok(FilledOrder {
-            order_id: data
-                .get("order_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            is_rejected: data
-                .get("is_rejected")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            trade_id: data
-                .get("trade_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            filled_side: Some(
-                if data.get("side").and_then(|v| v.as_str()) == Some("buy") {
-                    OrderSide::Long
-                } else {
-                    OrderSide::Short
-                },
-            ),
-            filled_size: data
-                .get("size")
-                .and_then(|v| v.as_str())
-                .and_then(|s| string_to_decimal(Some(s.to_string())).ok()),
-            filled_value: data
-                .get("value")
-                .and_then(|v| v.as_str())
-                .and_then(|s| string_to_decimal(Some(s.to_string())).ok()),
-            filled_fee: data
-                .get("fee")
-                .and_then(|v| v.as_str())
-                .and_then(|s| string_to_decimal(Some(s.to_string())).ok()),
-        })
+    fn parse_filled_order(_data: &Value, _account_id: u64) -> Result<FilledOrder, DexError> {
+        // Filled order tracking is not supported for Lighter DEX
+        // MarketMake strategy will use timeout-based order management instead
+        Err(DexError::Other(
+            "Filled order tracking not supported for Lighter DEX".to_string(),
+        ))
     }
 
     fn parse_canceled_order(data: &Value) -> Result<CanceledOrder, DexError> {
