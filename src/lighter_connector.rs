@@ -2148,7 +2148,7 @@ impl LighterConnector {
             )));
         }
 
-        log::debug!("Exchange stats response: {}", response_text);
+        log::trace!("Exchange stats response: {}", response_text);
 
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse exchange stats: {}", e)))
