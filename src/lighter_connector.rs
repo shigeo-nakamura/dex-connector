@@ -148,6 +148,38 @@ struct LighterTrade {
     market_id: u8,
 }
 
+#[derive(Deserialize, Debug)]
+struct LighterExchangeStats {
+    code: i32,
+    order_book_stats: Vec<LighterOrderBookStats>,
+    daily_usd_volume: f64,
+    daily_trades_count: u32,
+}
+
+#[derive(Deserialize, Debug)]
+struct LighterOrderBookStats {
+    symbol: String,
+    last_trade_price: f64,
+    daily_trades_count: u32,
+    daily_base_token_volume: f64,
+    daily_quote_token_volume: f64,
+    daily_price_change: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct LighterFundingRates {
+    code: i32,
+    funding_rates: Vec<LighterFundingRate>,
+}
+
+#[derive(Deserialize, Debug)]
+struct LighterFundingRate {
+    market_id: u32,
+    exchange: String,
+    symbol: String,
+    rate: f64,
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct LighterNonceResponse {
@@ -525,10 +557,32 @@ impl LighterConnector {
         &self,
         market_id: u32,
         side: u32,
-        _tif: u32,
+        tif: u32,
         base_amount: u64,
         price: u64,
         client_order_id: Option<String>,
+    ) -> Result<CreateOrderResponse, DexError> {
+        self.create_order_native_with_type(
+            market_id,
+            side,
+            tif,
+            base_amount,
+            price,
+            client_order_id,
+            0,
+        )
+        .await
+    }
+
+    async fn create_order_native_with_type(
+        &self,
+        market_id: u32,
+        side: u32,
+        tif: u32,
+        base_amount: u64,
+        price: u64,
+        client_order_id: Option<String>,
+        order_type: u32,
     ) -> Result<CreateOrderResponse, DexError> {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         let client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
@@ -544,11 +598,22 @@ impl LighterConnector {
 
         // Match the exact parameters used in Go SDK test to validate signature
         let client_order_index = 12345u64; // Exact value from Go SDK test
-        let order_type = 0u64; // ORDER_TYPE_LIMIT
-        let time_in_force = 1u64; // ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
-        let reduce_only = 0u64; // false
+        let order_type_param = order_type as u64; // Use passed order type
+        let time_in_force = tif as u64; // Use passed time in force
+        let reduce_only = 1u64; // true - this is for position closing orders
         let trigger_price = 0u64; // no trigger
-        let order_expiry = 1762543091693u64; // Exact value from Go SDK test
+                                  // For market orders (IOC), use 0 as expiry. For limit orders, use current timestamp + duration
+        let order_expiry = if order_type == 1 {
+            // ORDER_TYPE_MARKET
+            0u64 // DEFAULT_IOC_EXPIRY for immediate-or-cancel orders
+        } else {
+            // For limit orders, use current timestamp + 28 days in milliseconds
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            now_ms + (28 * 24 * 60 * 60 * 1000) // 28 days in milliseconds
+        };
 
         // Use actual parameters passed to function instead of hardcoded test values
         let actual_market_id = market_id as u64;
@@ -562,7 +627,7 @@ impl LighterConnector {
             actual_base_amount, // base_amount - actual parameter
             actual_price,       // price - actual parameter
             actual_side,        // is_ask - actual parameter
-            order_type,         // order_type
+            order_type_param,   // order_type
             time_in_force,      // time_in_force
             reduce_only,        // reduce_only
             trigger_price,      // trigger_price
@@ -591,7 +656,7 @@ impl LighterConnector {
                 actual_base_amount as i64,
                 actual_price as i32,
                 actual_side as i32,
-                order_type as i32,
+                order_type_param as i32,
                 time_in_force as i32,
                 reduce_only as i32,
                 trigger_price as i32,
@@ -1395,15 +1460,49 @@ impl DexConnector for LighterConnector {
             });
         }
 
-        // Try to get data from WebSocket first
+        // Get statistics data from API
+        let stats_data = self.get_exchange_stats().await.ok();
+        let funding_data = self.get_funding_rates().await.ok();
+
+        // Try to get price from WebSocket first, but use API stats for volume/trades
         if let Some(ws_price) = *self.current_price.read().await {
-            let ws_volume = self.current_volume.read().await.unwrap_or(Decimal::ZERO);
             let min_tick = Self::calculate_min_tick(ws_price, 3, false);
 
+            let (volume, num_trades) = if let Some(stats) = &stats_data {
+                if let Some(btc_stats) = stats
+                    .order_book_stats
+                    .iter()
+                    .find(|s| s.symbol == "BTC" || s.symbol == "BTCUSD")
+                {
+                    (
+                        Some(
+                            Decimal::from_f64_retain(btc_stats.daily_base_token_volume)
+                                .unwrap_or(Decimal::ZERO),
+                        ),
+                        Some(btc_stats.daily_trades_count as u64),
+                    )
+                } else {
+                    (Some(Decimal::ZERO), None)
+                }
+            } else {
+                (Some(Decimal::ZERO), None)
+            };
+
+            let funding_rate = if let Some(funding) = &funding_data {
+                funding
+                    .funding_rates
+                    .iter()
+                    .find(|f| f.symbol == "BTC" || f.symbol == "BTCUSD")
+                    .and_then(|f| Decimal::from_f64_retain(f.rate))
+            } else {
+                None
+            };
+
             log::debug!(
-                "Using WebSocket data: price={}, volume={}",
+                "Using WebSocket price with API stats: price={}, volume={:?}, trades={:?}",
                 ws_price,
-                ws_volume
+                volume,
+                num_trades
             );
 
             return Ok(TickerResponse {
@@ -1411,10 +1510,10 @@ impl DexConnector for LighterConnector {
                 price: ws_price,
                 min_tick: Some(min_tick),
                 min_order: None,
-                volume: Some(ws_volume),
-                num_trades: None,
+                volume,
+                num_trades,
                 open_interest: None,
-                funding_rate: None,
+                funding_rate,
                 oracle_price: None,
             });
         }
@@ -1470,25 +1569,65 @@ impl DexConnector for LighterConnector {
             Decimal::new(50000, 0)
         };
 
-        let volume = trades_response
-            .trades
-            .iter()
-            .map(|trade| string_to_decimal(Some(trade.size.clone())))
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .sum();
-
         let min_tick = Self::calculate_min_tick(price, 3, false); // BTC perpetual with 3 decimals
+
+        // Get funding rate
+        let funding_rate = if let Some(funding) = &funding_data {
+            funding
+                .funding_rates
+                .iter()
+                .find(|f| f.symbol == "BTC" || f.symbol == "BTCUSD")
+                .and_then(|f| Decimal::from_f64_retain(f.rate))
+        } else {
+            None
+        };
+
+        // Use stats data if available, otherwise fallback to trades data
+        let (volume, num_trades) = if let Some(stats) = &stats_data {
+            if let Some(btc_stats) = stats
+                .order_book_stats
+                .iter()
+                .find(|s| s.symbol == "BTC" || s.symbol == "BTCUSD")
+            {
+                (
+                    Some(
+                        Decimal::from_f64_retain(btc_stats.daily_base_token_volume)
+                            .unwrap_or(Decimal::ZERO),
+                    ),
+                    Some(btc_stats.daily_trades_count as u64),
+                )
+            } else {
+                // Fallback to trades data
+                let volume = trades_response
+                    .trades
+                    .iter()
+                    .map(|trade| string_to_decimal(Some(trade.size.clone())))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .sum();
+                (Some(volume), Some(trades_response.trades.len() as u64))
+            }
+        } else {
+            // Fallback to trades data
+            let volume = trades_response
+                .trades
+                .iter()
+                .map(|trade| string_to_decimal(Some(trade.size.clone())))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .sum();
+            (Some(volume), Some(trades_response.trades.len() as u64))
+        };
 
         Ok(TickerResponse {
             symbol: symbol.to_string(),
             price,
             min_tick: Some(min_tick),
             min_order: None,
-            volume: Some(volume),
-            num_trades: Some(trades_response.trades.len() as u64),
+            volume,
+            num_trades,
             open_interest: None,
-            funding_rate: None,
+            funding_rate,
             oracle_price: None,
         })
     }
@@ -1925,6 +2064,64 @@ impl DexConnector for LighterConnector {
 }
 
 impl LighterConnector {
+    async fn get_exchange_stats(&self) -> Result<LighterExchangeStats, DexError> {
+        let url = format!("{}/api/v1/exchangeStats", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to get exchange stats: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            DexError::Other(format!("Failed to read exchange stats response: {}", e))
+        })?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "Exchange stats HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        log::debug!("Exchange stats response: {}", response_text);
+
+        serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse exchange stats: {}", e)))
+    }
+
+    async fn get_funding_rates(&self) -> Result<LighterFundingRates, DexError> {
+        let url = format!("{}/api/v1/funding-rates", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to get funding rates: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            DexError::Other(format!("Failed to read funding rates response: {}", e))
+        })?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "Funding rates HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        log::debug!("Funding rates response: {}", response_text);
+
+        serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse funding rates: {}", e)))
+    }
+
     async fn start_websocket(&self) -> Result<(), DexError> {
         let websocket_url = self
             .websocket_url
@@ -2192,43 +2389,62 @@ impl LighterConnector {
         base_amount: u64,
         is_ask: u8,
     ) -> Result<String, DexError> {
-        // Get current market price for the market order
+        // Get current market price - prefer WebSocket data if available
         let current_price = if market_id == 1 {
-            // For BTC market, get current price from recent trades
-            let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=1", market_id);
-            let url = format!("{}{}", self.base_url, endpoint);
-            let response = self
-                .client
-                .get(&url)
-                .header("X-API-KEY", &self.api_key_public)
-                .send()
-                .await
-                .map_err(|e| DexError::Other(format!("Failed to get current price: {}", e)))?;
+            // First try to get price from WebSocket (more recent)
+            let ws_price = *self.current_price.read().await;
 
-            let response_text = response
-                .text()
-                .await
-                .map_err(|e| DexError::Other(format!("Failed to read price response: {}", e)))?;
-
-            let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
-                .map_err(|e| DexError::Other(format!("Failed to parse trades response: {}", e)))?;
-
-            if let Some(trade) = trades_response.trades.first() {
-                let price_decimal = string_to_decimal(Some(trade.price.clone()))?;
-
-                // Add/subtract buffer for market order execution
-                let buffer_multiplier = if is_ask == 1 {
-                    Decimal::new(95, 2) // 0.95
-                } else {
-                    Decimal::new(105, 2) // 1.05
-                };
-                let market_price = price_decimal * buffer_multiplier;
-                (market_price * Decimal::new(100, 0)).to_u64().unwrap_or(0) // Convert to price units
+            let price_decimal = if let Some(ws_price) = ws_price {
+                log::debug!("Using WebSocket price for close order: {}", ws_price);
+                ws_price
             } else {
-                return Err(DexError::Other(
-                    "No recent trades found for pricing".to_string(),
-                ));
-            }
+                // Fallback to REST API
+                log::debug!("WebSocket price not available, using REST API");
+                let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=1", market_id);
+                let url = format!("{}{}", self.base_url, endpoint);
+                let response = self
+                    .client
+                    .get(&url)
+                    .header("X-API-KEY", &self.api_key_public)
+                    .send()
+                    .await
+                    .map_err(|e| DexError::Other(format!("Failed to get current price: {}", e)))?;
+
+                let response_text = response.text().await.map_err(|e| {
+                    DexError::Other(format!("Failed to read price response: {}", e))
+                })?;
+
+                let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
+                    .map_err(|e| {
+                    DexError::Other(format!("Failed to parse trades response: {}", e))
+                })?;
+
+                if let Some(trade) = trades_response.trades.first() {
+                    string_to_decimal(Some(trade.price.clone()))?
+                } else {
+                    return Err(DexError::Other(
+                        "No recent trades found for pricing".to_string(),
+                    ));
+                }
+            };
+
+            // Use very large buffer for market orders - this is protection price, not execution price
+            let buffer_multiplier = if is_ask == 1 {
+                Decimal::new(800, 3) // 0.800 (20% buffer for market sells - worst acceptable price)
+            } else {
+                Decimal::new(1200, 3) // 1.200 (20% buffer for market buys - worst acceptable price)
+            };
+            let market_price = price_decimal * buffer_multiplier;
+
+            log::debug!(
+                "Close order pricing: original={}, buffer={}, final={}",
+                price_decimal,
+                buffer_multiplier,
+                market_price
+            );
+
+            // Convert to Lighter's price format (multiply by 10, same as create_order)
+            (market_price * Decimal::new(10, 0)).to_u64().unwrap_or(0)
         } else {
             return Err(DexError::Other(format!(
                 "Market ID {} not supported yet",
@@ -2236,15 +2452,24 @@ impl LighterConnector {
             )));
         };
 
+        log::debug!(
+            "Creating market order: market_id={}, side={}, base_amount={}, price={}",
+            market_id,
+            is_ask,
+            base_amount,
+            current_price
+        );
+
         // Create market order using existing native order infrastructure
         let response = self
-            .create_order_native(
+            .create_order_native_with_type(
                 market_id as u32,
                 is_ask as u32,
-                1, // IOC time in force
+                0, // IOC time in force (immediate or cancel)
                 base_amount,
                 current_price,
                 None, // No specific client order index
+                1,    // ORDER_TYPE_MARKET
             )
             .await?;
 
