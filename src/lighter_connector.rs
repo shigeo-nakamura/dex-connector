@@ -8,10 +8,12 @@ use crate::{
     FilledOrdersResponse, LastTrade, LastTradesResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{
@@ -89,6 +91,22 @@ pub struct LighterConnector {
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
     is_running: Arc<AtomicBool>,
     _ws: Option<DexWebSocket>, // Reserved for future WebSocket implementation
+    // WebSocket data storage
+    current_price: Arc<RwLock<Option<Decimal>>>,
+    current_volume: Arc<RwLock<Option<Decimal>>>,
+    order_book: Arc<RwLock<Option<LighterOrderBook>>>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct LighterOrderBook {
+    bids: Vec<LighterOrderBookEntry>,
+    asks: Vec<LighterOrderBookEntry>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct LighterOrderBookEntry {
+    price: String,
+    size: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -458,6 +476,9 @@ impl LighterConnector {
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
             _ws: Some(DexWebSocket::new(websocket_url)),
+            current_price: Arc::new(RwLock::new(None)),
+            current_volume: Arc::new(RwLock::new(None)),
+            order_book: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -493,6 +514,9 @@ impl LighterConnector {
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
             _ws: Some(DexWebSocket::new(websocket_url)),
+            current_price: Arc::new(RwLock::new(None)),
+            current_volume: Arc::new(RwLock::new(None)),
+            order_book: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1328,6 +1352,9 @@ impl DexConnector for LighterConnector {
             }
         }
 
+        // Start WebSocket connection
+        self.start_websocket().await?;
+
         Ok(())
     }
 
@@ -1354,12 +1381,13 @@ impl DexConnector for LighterConnector {
         test_price: Option<Decimal>,
     ) -> Result<TickerResponse, DexError> {
         if let Some(price) = test_price {
+            let min_tick = Self::calculate_min_tick(price, 3, false); // BTC perpetual with 3 decimals
             return Ok(TickerResponse {
                 symbol: symbol.to_string(),
                 price,
-                min_tick: None,
+                min_tick: Some(min_tick),
                 min_order: None,
-                volume: None,
+                volume: Some(Decimal::ZERO),
                 num_trades: None,
                 open_interest: None,
                 funding_rate: None,
@@ -1367,14 +1395,41 @@ impl DexConnector for LighterConnector {
             });
         }
 
+        // Try to get data from WebSocket first
+        if let Some(ws_price) = *self.current_price.read().await {
+            let ws_volume = self.current_volume.read().await.unwrap_or(Decimal::ZERO);
+            let min_tick = Self::calculate_min_tick(ws_price, 3, false);
+
+            log::debug!(
+                "Using WebSocket data: price={}, volume={}",
+                ws_price,
+                ws_volume
+            );
+
+            return Ok(TickerResponse {
+                symbol: symbol.to_string(),
+                price: ws_price,
+                min_tick: Some(min_tick),
+                min_order: None,
+                volume: Some(ws_volume),
+                num_trades: None,
+                open_interest: None,
+                funding_rate: None,
+                oracle_price: None,
+            });
+        }
+
+        // Fallback to REST API if WebSocket data is not available
+        log::warn!("WebSocket data not available, falling back to REST API");
+
         // Get market_id for the symbol
         let market_id = match symbol {
             "BTC" => 1,
             _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
         };
 
-        // Query recent trades to get current price
-        let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=1", market_id);
+        // Query recent trades to get current price and volume
+        let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=100", market_id);
 
         // Debug the raw response first
         let url = format!("{}{}", self.base_url, endpoint);
@@ -1415,12 +1470,22 @@ impl DexConnector for LighterConnector {
             Decimal::new(50000, 0)
         };
 
+        let volume = trades_response
+            .trades
+            .iter()
+            .map(|trade| string_to_decimal(Some(trade.size.clone())))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .sum();
+
+        let min_tick = Self::calculate_min_tick(price, 3, false); // BTC perpetual with 3 decimals
+
         Ok(TickerResponse {
             symbol: symbol.to_string(),
             price,
-            min_tick: None,
+            min_tick: Some(min_tick),
             min_order: None,
-            volume: None,
+            volume: Some(volume),
             num_trades: Some(trades_response.trades.len() as u64),
             open_interest: None,
             funding_rate: None,
@@ -1860,6 +1925,267 @@ impl DexConnector for LighterConnector {
 }
 
 impl LighterConnector {
+    async fn start_websocket(&self) -> Result<(), DexError> {
+        let websocket_url = self
+            .websocket_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+        let ws_url = format!("{}/stream", websocket_url);
+
+        log::info!("Connecting to WebSocket: {}", ws_url);
+
+        let ws = match self._ws.as_ref() {
+            Some(ws) => ws,
+            None => return Err(DexError::Other("WebSocket not initialized".to_string())),
+        };
+
+        let (mut sink, mut stream) = ws
+            .connect()
+            .await
+            .map_err(|_| DexError::Other("Failed to connect to WebSocket".to_string()))?;
+
+        // Clone necessary data for the WebSocket task
+        let current_price = self.current_price.clone();
+        let current_volume = self.current_volume.clone();
+        let order_book = self.order_book.clone();
+        let filled_orders = self.filled_orders.clone();
+        let canceled_orders = self.canceled_orders.clone();
+        let is_running = self.is_running.clone();
+        let account_index = self.account_index;
+
+        // Spawn WebSocket handler task
+        tokio::spawn(async move {
+            // Wait for connection message
+            if let Some(message) = stream.next().await {
+                if let Ok(message) = message {
+                    if let Ok(text) = message.to_text() {
+                        log::debug!("WebSocket connected: {}", text);
+
+                        // Subscribe to order book for market 1 (BTC)
+                        let subscribe_orderbook = serde_json::json!({
+                            "type": "subscribe",
+                            "channel": "order_book/1"
+                        });
+
+                        // Subscribe to account updates
+                        let subscribe_account = serde_json::json!({
+                            "type": "subscribe",
+                            "channel": format!("account_all/{}", account_index)
+                        });
+
+                        if let Err(e) = sink
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                subscribe_orderbook.to_string(),
+                            ))
+                            .await
+                        {
+                            log::error!("Failed to send orderbook subscription: {}", e);
+                            return;
+                        }
+
+                        if let Err(e) = sink
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                subscribe_account.to_string(),
+                            ))
+                            .await
+                        {
+                            log::error!("Failed to send account subscription: {}", e);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Handle incoming messages
+            while let Some(message) = stream.next().await {
+                if !is_running.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                if let Ok(message) = message {
+                    if let Ok(text) = message.to_text() {
+                        log::trace!("WebSocket message: {}", text);
+
+                        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                            Self::handle_websocket_message(
+                                parsed,
+                                &current_price,
+                                &current_volume,
+                                &order_book,
+                                &filled_orders,
+                                &canceled_orders,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn handle_websocket_message(
+        message: Value,
+        current_price: &Arc<RwLock<Option<Decimal>>>,
+        current_volume: &Arc<RwLock<Option<Decimal>>>,
+        order_book: &Arc<RwLock<Option<LighterOrderBook>>>,
+        filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
+        canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+    ) {
+        let msg_type = message.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match msg_type {
+            "subscribed/order_book" | "update/order_book" => {
+                if let Some(order_book_data) = message.get("order_book") {
+                    if let Ok(ob) =
+                        serde_json::from_value::<LighterOrderBook>(order_book_data.clone())
+                    {
+                        // Update current price from best bid/ask
+                        if let (Some(best_bid), Some(best_ask)) = (ob.bids.first(), ob.asks.first())
+                        {
+                            if let (Ok(bid_price), Ok(ask_price)) = (
+                                string_to_decimal(Some(best_bid.price.clone())),
+                                string_to_decimal(Some(best_ask.price.clone())),
+                            ) {
+                                let mid_price = (bid_price + ask_price) / Decimal::from(2);
+                                *current_price.write().await = Some(mid_price);
+                                log::trace!("Updated price from WebSocket: {}", mid_price);
+                            }
+                        }
+
+                        // Calculate volume from order book
+                        let total_volume: Decimal = ob
+                            .bids
+                            .iter()
+                            .chain(ob.asks.iter())
+                            .filter_map(|entry| string_to_decimal(Some(entry.size.clone())).ok())
+                            .sum();
+                        *current_volume.write().await = Some(total_volume);
+
+                        *order_book.write().await = Some(ob);
+                    }
+                }
+            }
+            "subscribed/account_all" | "update/account_all" => {
+                // Handle account updates (filled/canceled orders)
+                if let Some(data) = message.get("data") {
+                    Self::handle_account_update(data, filled_orders, canceled_orders).await;
+                }
+            }
+            _ => {
+                log::trace!("Unhandled WebSocket message type: {}", msg_type);
+            }
+        }
+    }
+
+    async fn handle_account_update(
+        data: &Value,
+        filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
+        canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+    ) {
+        // Handle filled orders
+        if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
+            let mut filled_map = filled_orders.write().await;
+            for fill in fills {
+                if let Ok(filled_order) = Self::parse_filled_order(fill) {
+                    filled_map
+                        .entry("BTC".to_string())
+                        .or_insert_with(Vec::new)
+                        .push(filled_order);
+                }
+            }
+        }
+
+        // Handle canceled orders
+        if let Some(cancels) = data.get("cancels").and_then(|c| c.as_array()) {
+            let mut canceled_map = canceled_orders.write().await;
+            for cancel in cancels {
+                if let Ok(canceled_order) = Self::parse_canceled_order(cancel) {
+                    canceled_map
+                        .entry("BTC".to_string())
+                        .or_insert_with(Vec::new)
+                        .push(canceled_order);
+                }
+            }
+        }
+    }
+
+    fn parse_filled_order(data: &Value) -> Result<FilledOrder, DexError> {
+        // Parse filled order from WebSocket data
+        // This is a simplified implementation - adjust based on actual Lighter WebSocket format
+        Ok(FilledOrder {
+            order_id: data
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            is_rejected: data
+                .get("is_rejected")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            trade_id: data
+                .get("trade_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            filled_side: Some(
+                if data.get("side").and_then(|v| v.as_str()) == Some("buy") {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                },
+            ),
+            filled_size: data
+                .get("size")
+                .and_then(|v| v.as_str())
+                .and_then(|s| string_to_decimal(Some(s.to_string())).ok()),
+            filled_value: data
+                .get("value")
+                .and_then(|v| v.as_str())
+                .and_then(|s| string_to_decimal(Some(s.to_string())).ok()),
+            filled_fee: data
+                .get("fee")
+                .and_then(|v| v.as_str())
+                .and_then(|s| string_to_decimal(Some(s.to_string())).ok()),
+        })
+    }
+
+    fn parse_canceled_order(data: &Value) -> Result<CanceledOrder, DexError> {
+        // Parse canceled order from WebSocket data
+        // This is a simplified implementation - adjust based on actual Lighter WebSocket format
+        Ok(CanceledOrder {
+            order_id: data
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            canceled_timestamp: data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
+        })
+    }
+
+    fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decimal {
+        let price_str = price.to_string();
+        let integer_part = price_str.split('.').next().unwrap_or("");
+        let integer_digits = if integer_part == "0" {
+            0
+        } else {
+            integer_part.len()
+        };
+
+        let scale_by_sig: u32 = if integer_digits >= 5 {
+            0
+        } else {
+            (5 - integer_digits) as u32
+        };
+
+        let max_decimals: u32 = if is_spot { 8u32 } else { 6u32 };
+        let scale_by_dec: u32 = max_decimals.saturating_sub(sz_decimals);
+        let scale: u32 = scale_by_sig.min(scale_by_dec);
+
+        Decimal::new(1, scale)
+    }
+
     async fn create_market_close_order_internal(
         &self,
         market_id: u8,
