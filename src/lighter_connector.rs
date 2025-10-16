@@ -2177,7 +2177,7 @@ impl LighterConnector {
             )));
         }
 
-        log::debug!("Funding rates response: {}", response_text);
+        log::trace!("Funding rates response: {}", response_text);
 
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse funding rates: {}", e)))
