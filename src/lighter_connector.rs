@@ -112,6 +112,7 @@ struct LighterOrderBookEntry {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterAccountResponse {
     code: i32,
     total: i32,
@@ -119,6 +120,7 @@ struct LighterAccountResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterAccountInfo {
     account_index: i64,
     available_balance: String,
@@ -136,12 +138,14 @@ struct LighterPosition {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterTradesResponse {
     code: i32,
     trades: Vec<LighterTrade>,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterTrade {
     trade_id: u64,
     price: String,
@@ -151,6 +155,7 @@ struct LighterTrade {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterExchangeStats {
     code: i32,
     order_book_stats: Vec<LighterOrderBookStats>,
@@ -159,6 +164,7 @@ struct LighterExchangeStats {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterOrderBookStats {
     symbol: String,
     last_trade_price: f64,
@@ -169,12 +175,14 @@ struct LighterOrderBookStats {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterFundingRates {
     code: i32,
     funding_rates: Vec<LighterFundingRate>,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterFundingRate {
     market_id: u32,
     exchange: String,
@@ -555,6 +563,7 @@ impl LighterConnector {
     }
 
     /// Create native order without Python SDK
+    #[allow(dead_code)]
     async fn create_order_native(
         &self,
         market_id: u32,
@@ -589,7 +598,7 @@ impl LighterConnector {
         reduce_only: bool,
     ) -> Result<CreateOrderResponse, DexError> {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
-        let client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
+        let _client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
         let nonce = self.get_nonce().await?;
 
         log::debug!(
@@ -2212,7 +2221,7 @@ impl LighterConnector {
             None => return Err(DexError::Other("WebSocket not initialized".to_string())),
         };
 
-        let (mut sink, mut stream) = ws
+        let (_sink, _stream) = ws
             .connect()
             .await
             .map_err(|_| DexError::Other("Failed to connect to WebSocket".to_string()))?;
@@ -2465,7 +2474,7 @@ impl LighterConnector {
             log::debug!("Found trades object: {:?}", trades);
             // Handle trades object - Lighter DEX format: {"market_id": [trade_array]}
             if let Some(trades_obj) = trades.as_object() {
-                let mut filled_map = filled_orders.write().await;
+                let _filled_map = filled_orders.write().await;
                 for (market_id, trade_array) in trades_obj {
                     log::debug!(
                         "Processing trades for market {}: {:?}",
