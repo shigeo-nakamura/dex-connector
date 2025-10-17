@@ -2294,11 +2294,11 @@ impl LighterConnector {
                         let (pong_tx, mut pong_rx) =
                             tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-                        // Create ping/write task with 5-second interval
+                        // Create ping/write task with 3-second interval
                         let ping_is_running = is_running.clone();
                         let ping_task = tokio::spawn(async move {
                             let mut ping_interval =
-                                tokio::time::interval(std::time::Duration::from_secs(5));
+                                tokio::time::interval(std::time::Duration::from_secs(3));
                             ping_interval
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2310,12 +2310,12 @@ impl LighterConnector {
                                             break;
                                         }
 
-                                        // Send ping every 5 seconds
+                                        // Send ping every 3 seconds
                                         if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await {
                                             log::warn!("Failed to send ping: {:?}", e);
                                             break;
                                         }
-                                        log::debug!("Sent WebSocket ping (5s interval)");
+                                        log::debug!("Sent WebSocket ping (3s interval)");
                                     }
                                     // Handle pong responses
                                     Some(pong_data) = pong_rx.recv() => {
@@ -2330,6 +2330,7 @@ impl LighterConnector {
                         });
 
                         // Handle messages in this connection
+                        log::debug!("Starting WebSocket message handling loop");
                         while let Some(message) = read.next().await {
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
@@ -2389,8 +2390,8 @@ impl LighterConnector {
                                 },
                                 Err(e) => {
                                     log::error!(
-                                        "WebSocket error: {}. Will attempt reconnection.",
-                                        e
+                                        "WebSocket error: {} (type: {:?}). Will attempt reconnection.",
+                                        e, std::any::type_name_of_val(&e)
                                     );
                                     break; // Break inner loop to attempt reconnection
                                 }
@@ -2401,7 +2402,7 @@ impl LighterConnector {
                         ping_task.abort();
 
                         log::warn!(
-                            "WebSocket connection lost. Will attempt reconnection in 5 seconds."
+                            "WebSocket message loop ended. Connection lost - will attempt reconnection in 5 seconds."
                         );
                     }
                     Err(e) => {
