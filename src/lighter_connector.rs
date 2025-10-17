@@ -2247,6 +2247,7 @@ impl LighterConnector {
                 log::info!("Attempting WebSocket connection to: {}", ws_url_clone);
 
                 // Try to establish connection
+                // Use default configuration as config is causing issues
                 let connection_result = tokio_tungstenite::connect_async(&ws_url_clone).await;
 
                 match connection_result {
@@ -2286,8 +2287,50 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
+                        // Split the stream for separate reading and writing
+                        let (mut write, mut read) = ws_stream.split();
+
+                        // Create channel for sending pong messages
+                        let (pong_tx, mut pong_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+                        // Create ping/write task with 5-second interval
+                        let ping_is_running = is_running.clone();
+                        let ping_task = tokio::spawn(async move {
+                            let mut ping_interval =
+                                tokio::time::interval(std::time::Duration::from_secs(5));
+                            ping_interval
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                            loop {
+                                tokio::select! {
+                                    // Handle ping interval
+                                    _ = ping_interval.tick() => {
+                                        if !ping_is_running.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+
+                                        // Send ping every 5 seconds
+                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await {
+                                            log::warn!("Failed to send ping: {:?}", e);
+                                            break;
+                                        }
+                                        log::debug!("Sent WebSocket ping (5s interval)");
+                                    }
+                                    // Handle pong responses
+                                    Some(pong_data) = pong_rx.recv() => {
+                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_data)).await {
+                                            log::error!("Failed to send pong response: {:?}", e);
+                                            break;
+                                        }
+                                        log::debug!("Sent WebSocket pong response");
+                                    }
+                                }
+                            }
+                        });
+
                         // Handle messages in this connection
-                        while let Some(message) = ws_stream.next().await {
+                        while let Some(message) = read.next().await {
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
@@ -2316,11 +2359,19 @@ impl LighterConnector {
                                             );
                                         }
                                     }
-                                    tokio_tungstenite::tungstenite::Message::Ping(_) => {
-                                        log::trace!("Received WebSocket ping");
+                                    tokio_tungstenite::tungstenite::Message::Ping(data) => {
+                                        log::debug!(
+                                            "Received WebSocket ping, sending pong response"
+                                        );
+
+                                        // Send pong data through channel to write task
+                                        if let Err(_) = pong_tx.send(data) {
+                                            log::error!("Failed to send pong through channel");
+                                            break;
+                                        }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(_) => {
-                                        log::trace!("Received WebSocket pong - connection healthy");
+                                        log::debug!("Received WebSocket pong - connection healthy");
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
                                         log::info!("WebSocket close frame received: {:?}", frame);
@@ -2345,6 +2396,9 @@ impl LighterConnector {
                                 }
                             }
                         }
+
+                        // Stop ping task when message loop ends
+                        ping_task.abort();
 
                         log::warn!(
                             "WebSocket connection lost. Will attempt reconnection in 5 seconds."
