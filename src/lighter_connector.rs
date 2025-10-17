@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -31,6 +32,7 @@ use sha3::{Digest, Keccak256};
 #[cfg(feature = "lighter-sdk")]
 use std::ffi::{CStr, CString};
 use tokio::{sync::RwLock, time::sleep};
+use tokio_tungstenite;
 
 // FFI bindings for Go shared library (only with lighter-sdk feature)
 #[cfg(feature = "lighter-sdk")]
@@ -92,7 +94,7 @@ pub struct LighterConnector {
     is_running: Arc<AtomicBool>,
     _ws: Option<DexWebSocket>, // Reserved for future WebSocket implementation
     // WebSocket data storage
-    current_price: Arc<RwLock<Option<Decimal>>>,
+    current_price: Arc<RwLock<Option<(Decimal, u64)>>>, // (price, timestamp)
     current_volume: Arc<RwLock<Option<Decimal>>>,
     order_book: Arc<RwLock<Option<LighterOrderBook>>>,
 }
@@ -1478,58 +1480,73 @@ impl DexConnector for LighterConnector {
         let stats_data = self.get_exchange_stats().await.ok();
         let funding_data = self.get_funding_rates().await.ok();
 
-        // Try to get price from WebSocket first, but use API stats for volume/trades
-        if let Some(ws_price) = *self.current_price.read().await {
-            let min_tick = Self::calculate_min_tick(ws_price, 3, false);
+        // Try to get price from WebSocket first, but check if it's recent
+        if let Some((ws_price, price_timestamp)) = *self.current_price.read().await {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
-            let (volume, num_trades) = if let Some(stats) = &stats_data {
-                if let Some(btc_stats) = stats
-                    .order_book_stats
-                    .iter()
-                    .find(|s| s.symbol == "BTC" || s.symbol == "BTCUSD")
-                {
-                    (
-                        Some(
-                            Decimal::from_f64_retain(btc_stats.daily_base_token_volume)
-                                .unwrap_or(Decimal::ZERO),
-                        ),
-                        Some(btc_stats.daily_trades_count as u64),
-                    )
+            // Check if WebSocket price is stale (older than 30 seconds)
+            let price_age = current_time.saturating_sub(price_timestamp);
+            if price_age > 30 {
+                log::warn!(
+                    "WebSocket price is stale ({}s old), falling back to REST API",
+                    price_age
+                );
+                // Fall through to REST API fallback below
+            } else {
+                let min_tick = Self::calculate_min_tick(ws_price, 3, false);
+
+                let (volume, num_trades) = if let Some(stats) = &stats_data {
+                    if let Some(btc_stats) = stats
+                        .order_book_stats
+                        .iter()
+                        .find(|s| s.symbol == "BTC" || s.symbol == "BTCUSD")
+                    {
+                        (
+                            Some(
+                                Decimal::from_f64_retain(btc_stats.daily_base_token_volume)
+                                    .unwrap_or(Decimal::ZERO),
+                            ),
+                            Some(btc_stats.daily_trades_count as u64),
+                        )
+                    } else {
+                        (Some(Decimal::ZERO), None)
+                    }
                 } else {
                     (Some(Decimal::ZERO), None)
-                }
-            } else {
-                (Some(Decimal::ZERO), None)
-            };
+                };
 
-            let funding_rate = if let Some(funding) = &funding_data {
-                funding
-                    .funding_rates
-                    .iter()
-                    .find(|f| f.symbol == "BTC" || f.symbol == "BTCUSD")
-                    .and_then(|f| Decimal::from_f64_retain(f.rate))
-            } else {
-                None
-            };
+                let funding_rate = if let Some(funding) = &funding_data {
+                    funding
+                        .funding_rates
+                        .iter()
+                        .find(|f| f.symbol == "BTC" || f.symbol == "BTCUSD")
+                        .and_then(|f| Decimal::from_f64_retain(f.rate))
+                } else {
+                    None
+                };
 
-            log::debug!(
-                "Using WebSocket price with API stats: price={}, volume={:?}, trades={:?}",
-                ws_price,
-                volume,
-                num_trades
-            );
+                log::debug!(
+                    "Using WebSocket price with API stats: price={}, volume={:?}, trades={:?}",
+                    ws_price,
+                    volume,
+                    num_trades
+                );
 
-            return Ok(TickerResponse {
-                symbol: symbol.to_string(),
-                price: ws_price,
-                min_tick: Some(min_tick),
-                min_order: None,
-                volume,
-                num_trades,
-                open_interest: None,
-                funding_rate,
-                oracle_price: None,
-            });
+                return Ok(TickerResponse {
+                    symbol: symbol.to_string(),
+                    price: ws_price,
+                    min_tick: Some(min_tick),
+                    min_order: None,
+                    volume,
+                    num_trades,
+                    open_interest: None,
+                    funding_rate,
+                    oracle_price: None,
+                });
+            }
         }
 
         // Fallback to REST API if WebSocket data is not available
@@ -2183,11 +2200,10 @@ impl LighterConnector {
     }
 
     async fn start_websocket(&self) -> Result<(), DexError> {
-        let websocket_url = self
+        let ws_url = self
             .websocket_url
             .replace("https://", "wss://")
             .replace("http://", "ws://");
-        let ws_url = format!("{}/stream", websocket_url);
 
         log::info!("Connecting to WebSocket: {}", ws_url);
 
@@ -2210,74 +2226,120 @@ impl LighterConnector {
         let is_running = self.is_running.clone();
         let account_index = self.account_index;
 
-        // Spawn WebSocket handler task
+        // Spawn WebSocket handler task with reconnection logic
+        let ws_url_clone = ws_url.clone();
         tokio::spawn(async move {
-            // Wait for connection message
-            if let Some(message) = stream.next().await {
-                if let Ok(message) = message {
-                    if let Ok(text) = message.to_text() {
-                        log::debug!("WebSocket connected: {}", text);
+            loop {
+                if !is_running.load(Ordering::SeqCst) {
+                    log::info!("WebSocket task stopping due to is_running flag");
+                    break;
+                }
 
-                        // Subscribe to order book for market 1 (BTC)
+                log::info!("Attempting WebSocket connection to: {}", ws_url_clone);
+
+                // Try to establish connection
+                let connection_result = tokio_tungstenite::connect_async(&ws_url_clone).await;
+
+                match connection_result {
+                    Ok((mut ws_stream, _)) => {
+                        log::info!("WebSocket connected successfully");
+
+                        // Send subscription messages
                         let subscribe_orderbook = serde_json::json!({
                             "type": "subscribe",
                             "channel": "order_book/1"
                         });
 
-                        // Subscribe to account updates
                         let subscribe_account = serde_json::json!({
                             "type": "subscribe",
                             "channel": format!("account_all/{}", account_index)
                         });
 
-                        if let Err(e) = sink
+                        if let Err(e) = ws_stream
                             .send(tokio_tungstenite::tungstenite::Message::Text(
                                 subscribe_orderbook.to_string(),
                             ))
                             .await
                         {
                             log::error!("Failed to send orderbook subscription: {}", e);
-                            return;
+                            continue;
                         }
 
-                        if let Err(e) = sink
+                        if let Err(e) = ws_stream
                             .send(tokio_tungstenite::tungstenite::Message::Text(
                                 subscribe_account.to_string(),
                             ))
                             .await
                         {
                             log::error!("Failed to send account subscription: {}", e);
-                            return;
+                            continue;
                         }
+
+                        log::info!("WebSocket subscriptions sent successfully");
+
+                        // Handle messages in this connection
+                        while let Some(message) = ws_stream.next().await {
+                            if !is_running.load(Ordering::SeqCst) {
+                                log::info!("WebSocket stopping due to is_running flag");
+                                break;
+                            }
+
+                            match message {
+                                Ok(message) => {
+                                    if let Ok(text) = message.to_text() {
+                                        log::trace!("WebSocket message: {}", text);
+
+                                        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                                            Self::handle_websocket_message(
+                                                parsed,
+                                                &current_price,
+                                                &current_volume,
+                                                &order_book,
+                                                &filled_orders,
+                                                &canceled_orders,
+                                                account_index,
+                                            )
+                                            .await;
+                                        } else {
+                                            log::warn!(
+                                                "Failed to parse WebSocket message as JSON: {}",
+                                                text
+                                            );
+                                        }
+                                    } else {
+                                        log::debug!(
+                                            "Received non-text WebSocket message: {:?}",
+                                            message
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "WebSocket error: {}. Will attempt reconnection.",
+                                        e
+                                    );
+                                    break; // Break inner loop to attempt reconnection
+                                }
+                            }
+                        }
+
+                        log::warn!(
+                            "WebSocket connection lost. Will attempt reconnection in 5 seconds."
+                        );
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to connect to WebSocket: {}. Will retry in 5 seconds.",
+                            e
+                        );
                     }
                 }
+
+                // Wait before reconnection attempt
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
 
-            // Handle incoming messages
-            while let Some(message) = stream.next().await {
-                if !is_running.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                if let Ok(message) = message {
-                    if let Ok(text) = message.to_text() {
-                        log::trace!("WebSocket message: {}", text);
-
-                        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                            Self::handle_websocket_message(
-                                parsed,
-                                &current_price,
-                                &current_volume,
-                                &order_book,
-                                &filled_orders,
-                                &canceled_orders,
-                                account_index,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
+            log::info!("WebSocket task ended");
         });
 
         Ok(())
@@ -2285,7 +2347,7 @@ impl LighterConnector {
 
     async fn handle_websocket_message(
         message: Value,
-        current_price: &Arc<RwLock<Option<Decimal>>>,
+        current_price: &Arc<RwLock<Option<(Decimal, u64)>>>,
         current_volume: &Arc<RwLock<Option<Decimal>>>,
         order_book: &Arc<RwLock<Option<LighterOrderBook>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
@@ -2313,8 +2375,16 @@ impl LighterConnector {
                                 string_to_decimal(Some(best_ask.price.clone())),
                             ) {
                                 let mid_price = (bid_price + ask_price) / Decimal::from(2);
-                                *current_price.write().await = Some(mid_price);
-                                log::trace!("Updated price from WebSocket: {}", mid_price);
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                *current_price.write().await = Some((mid_price, timestamp));
+                                log::trace!(
+                                    "Updated price from WebSocket: {} at {}",
+                                    mid_price,
+                                    timestamp
+                                );
                             }
                         }
 
@@ -2467,11 +2537,55 @@ impl LighterConnector {
         // Get current market price - prefer WebSocket data if available
         let current_price = if market_id == 1 {
             // First try to get price from WebSocket (more recent)
-            let ws_price = *self.current_price.read().await;
+            let ws_price_data = *self.current_price.read().await;
 
-            let price_decimal = if let Some(ws_price) = ws_price {
-                log::debug!("Using WebSocket price for close order: {}", ws_price);
-                ws_price
+            let price_decimal = if let Some((ws_price, price_timestamp)) = ws_price_data {
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let price_age = current_time.saturating_sub(price_timestamp);
+
+                if price_age <= 30 {
+                    log::debug!("Using WebSocket price for close order: {}", ws_price);
+                    ws_price
+                } else {
+                    log::warn!(
+                        "WebSocket price is stale ({}s old) for close order, using REST API",
+                        price_age
+                    );
+                    // Fallback to REST API
+                    let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=1", market_id);
+                    let url = format!("{}{}", self.base_url, endpoint);
+                    let response = self
+                        .client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map_err(|e| DexError::Reqwest(e))?;
+
+                    if response.status().is_success() {
+                        let trades: Vec<serde_json::Value> = response
+                            .json()
+                            .await
+                            .map_err(|e| DexError::Other(e.to_string()))?;
+
+                        if let Some(trade) = trades.first() {
+                            if let Some(price_str) = trade.get("price").and_then(|p| p.as_str()) {
+                                Decimal::from_str(price_str)
+                                    .map_err(|e| DexError::Other(e.to_string()))?
+                            } else {
+                                return Err(DexError::Other(
+                                    "No price in recent trade".to_string(),
+                                ));
+                            }
+                        } else {
+                            return Err(DexError::Other("No recent trades available".to_string()));
+                        }
+                    } else {
+                        return Err(DexError::Other("Failed to get recent trades".to_string()));
+                    }
+                }
             } else {
                 // Fallback to REST API
                 log::debug!("WebSocket price not available, using REST API");
