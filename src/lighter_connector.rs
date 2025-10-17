@@ -2402,12 +2402,12 @@ impl LighterConnector {
                         ping_task.abort();
 
                         log::warn!(
-                            "WebSocket message loop ended. Connection lost - will attempt reconnection in 5 seconds."
+                            "WebSocket message loop ended. Connection lost - will attempt reconnection in 3 seconds."
                         );
                     }
                     Err(e) => {
                         log::error!(
-                            "Failed to connect to WebSocket: {}. Will retry in 5 seconds.",
+                            "Failed to connect to WebSocket: {}. Will retry in 3 seconds.",
                             e
                         );
                     }
