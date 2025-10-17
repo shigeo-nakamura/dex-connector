@@ -2285,11 +2285,11 @@ impl LighterConnector {
                             }
 
                             match message {
-                                Ok(message) => {
-                                    if let Ok(text) = message.to_text() {
-                                        log::trace!("WebSocket message: {}", text);
+                                Ok(message) => match message {
+                                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                                        log::trace!("WebSocket text message: {}", text);
 
-                                        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                                        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
                                             Self::handle_websocket_message(
                                                 parsed,
                                                 &current_price,
@@ -2306,13 +2306,27 @@ impl LighterConnector {
                                                 text
                                             );
                                         }
-                                    } else {
+                                    }
+                                    tokio_tungstenite::tungstenite::Message::Ping(_) => {
+                                        log::trace!("Received WebSocket ping");
+                                    }
+                                    tokio_tungstenite::tungstenite::Message::Pong(_) => {
+                                        log::trace!("Received WebSocket pong - connection healthy");
+                                    }
+                                    tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                                        log::info!("WebSocket close frame received: {:?}", frame);
+                                        break;
+                                    }
+                                    tokio_tungstenite::tungstenite::Message::Binary(data) => {
                                         log::debug!(
-                                            "Received non-text WebSocket message: {:?}",
-                                            message
+                                            "Received binary WebSocket message: {} bytes",
+                                            data.len()
                                         );
                                     }
-                                }
+                                    tokio_tungstenite::tungstenite::Message::Frame(_) => {
+                                        log::trace!("Received raw WebSocket frame");
+                                    }
+                                },
                                 Err(e) => {
                                     log::error!(
                                         "WebSocket error: {}. Will attempt reconnection.",
