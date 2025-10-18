@@ -2315,7 +2315,7 @@ impl LighterConnector {
                                             log::warn!("Failed to send ping: {:?}", e);
                                             break;
                                         }
-                                        log::debug!("Sent WebSocket ping (3s interval)");
+                                        log::trace!("Sent WebSocket ping (3s interval)");
                                     }
                                     // Handle pong responses
                                     Some(pong_data) = pong_rx.recv() => {
@@ -2372,7 +2372,7 @@ impl LighterConnector {
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(_) => {
-                                        log::debug!("Received WebSocket pong - connection healthy");
+                                        log::trace!("Received WebSocket pong - connection healthy");
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
                                         log::info!("WebSocket close frame received: {:?}", frame);
