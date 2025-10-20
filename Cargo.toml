@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "2.6.1"
+version = "3.0.0"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -10,7 +10,7 @@ repository = "https://github.com/shigeo-nakamura/dex-connector"
 license = "MIT"
 
 [features]
-default = []
+default = ["lighter-sdk"]
 lighter-sdk = ["dep:libc"]
 
 [dependencies]
