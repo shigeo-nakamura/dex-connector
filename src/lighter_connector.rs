@@ -1780,11 +1780,20 @@ impl DexConnector for LighterConnector {
             });
         }
 
-        // If no symbol specified, return account-level balances
-        log::debug!("No symbol specified, returning account-level balances");
+        // If no symbol specified, return account-level balances (USD)
+        log::debug!("No symbol specified, returning account-level USD balances");
+        let total_asset_value = string_to_decimal(Some(account.total_asset_value.clone()))?;
+        let available_balance = string_to_decimal(Some(account.available_balance.clone()))?;
+
+        log::debug!(
+            "Account balances: total_asset_value={}, available_balance={}",
+            total_asset_value,
+            available_balance
+        );
+
         Ok(BalanceResponse {
-            equity: string_to_decimal(Some(account.total_asset_value.clone()))?,
-            balance: string_to_decimal(Some(account.available_balance.clone()))?,
+            equity: total_asset_value,  // Total account value in USD
+            balance: available_balance, // Available balance in USD
         })
     }
 
