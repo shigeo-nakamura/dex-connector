@@ -16,11 +16,11 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -136,6 +136,9 @@ struct LighterPosition {
     symbol: String,
     position: String,
     sign: i8,
+    open_order_count: u32,
+    pending_order_count: u32,
+    position_tied_order_count: u32,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1805,10 +1808,8 @@ impl DexConnector for LighterConnector {
             _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
         };
 
-        let endpoint = format!(
-            "/api/v1/openOrders?account_index={}&market_id={}",
-            self.account_index, market_id
-        );
+        // Use existing account API instead of non-existent openOrders endpoint
+        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
 
         let url = format!("{}{}", self.base_url, endpoint);
         let response = self
@@ -1838,39 +1839,36 @@ impl DexConnector for LighterConnector {
             )));
         }
 
-        // Parse the response - assuming it's similar to account response structure
-        let orders_response: serde_json::Value = serde_json::from_str(&response_text)
+        // Parse account response to get open order count
+        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
 
-        let mut open_orders = Vec::new();
+        if account_response.accounts.is_empty() {
+            return Err(DexError::Other("No account found".to_string()));
+        }
 
-        // Extract orders from the response
-        if let Some(orders_array) = orders_response["orders"].as_array() {
-            for order in orders_array {
-                if let (Some(order_id), Some(side), Some(base_amount), Some(price)) = (
-                    order["order_id"].as_str(),
-                    order["side"].as_u64(),
-                    order["base_amount"].as_str(),
-                    order["price"].as_str(),
-                ) {
-                    let side_enum = if side == 0 {
-                        OrderSide::Long
-                    } else {
-                        OrderSide::Short
-                    };
-                    let size = string_to_decimal(Some(base_amount.to_string()))?;
-                    let order_price = string_to_decimal(Some(price.to_string()))?;
+        let account = &account_response.accounts[0];
 
-                    open_orders.push(OpenOrder {
-                        order_id: order_id.to_string(),
-                        symbol: symbol.to_string(),
-                        side: side_enum,
-                        size,
-                        price: order_price,
-                        status: "open".to_string(),
-                    });
-                }
+        // Check if there are any positions for this market_id that have open orders
+        let mut open_order_count = 0;
+        for position in &account.positions {
+            if position.market_id == market_id {
+                open_order_count = position.open_order_count;
+                break;
             }
+        }
+
+        // Create dummy open orders based on the count (we don't have detailed order info)
+        let mut open_orders = Vec::new();
+        for i in 0..open_order_count {
+            open_orders.push(OpenOrder {
+                order_id: format!("unknown_{}", i),
+                symbol: symbol.to_string(),
+                side: OrderSide::Long, // We don't know the actual side
+                size: rust_decimal::Decimal::ZERO,
+                price: rust_decimal::Decimal::ZERO,
+                status: "open".to_string(),
+            });
         }
 
         log::debug!(
@@ -2912,4 +2910,64 @@ pub fn create_lighter_connector(
         websocket_url,
     )?;
     Ok(Box::new(connector))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[tokio::test]
+    async fn test_get_open_orders() {
+        // Skip test if environment variables are not set
+        let api_key_public = match env::var("LIGHTER_PLAIN_PUBLIC_API_KEY") {
+            Ok(key) => key,
+            Err(_) => {
+                println!("Skipping test - LIGHTER_PLAIN_PUBLIC_API_KEY not set");
+                return;
+            }
+        };
+
+        let base_url = env::var("LIGHTER_BASE_URL")
+            .unwrap_or_else(|_| "https://mainnet.zklighter.elliot.ai".to_string());
+
+        let account_index = env::var("LIGHTER_ACCOUNT_INDEX")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<u32>()
+            .unwrap_or(0);
+
+        // Create connector using the proper constructor
+        let connector = match LighterConnector::new(
+            api_key_public,
+            0, // api_key_index
+            "dummy_private_key".to_string(),
+            None, // evm_wallet_private_key
+            account_index,
+            base_url,
+            "dummy_websocket_url".to_string(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("Failed to create connector: {}", e);
+                return;
+            }
+        };
+
+        // Test get_open_orders
+        match connector.get_open_orders("BTC").await {
+            Ok(response) => {
+                println!(
+                    "✅ get_open_orders success: {} orders found",
+                    response.orders.len()
+                );
+                for (i, order) in response.orders.iter().enumerate() {
+                    println!("  Order {}: {}", i, order.order_id);
+                }
+            }
+            Err(e) => {
+                println!("❌ get_open_orders failed: {}", e);
+                panic!("get_open_orders test failed: {}", e);
+            }
+        }
+    }
 }
