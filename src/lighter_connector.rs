@@ -11,7 +11,7 @@ use crate::{
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{ToPrimitive, FromStr};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1802,11 +1802,16 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+        log::debug!("get_open_orders called for symbol: {}, API key index: {}, account index: {}",
+                   symbol, self.api_key_index, self.account_index);
+
         // Get market_id for the symbol
         let market_id = match symbol {
             "BTC" => 1,
             _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
         };
+
+        log::debug!("Using market_id: {} for symbol: {}", market_id, symbol);
 
         // Use existing account API instead of non-existent openOrders endpoint
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
@@ -1826,7 +1831,7 @@ impl DexConnector for LighterConnector {
             .await
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-        log::trace!(
+        log::debug!(
             "Open orders API response (status: {}): {}",
             status,
             response_text
@@ -1848,14 +1853,22 @@ impl DexConnector for LighterConnector {
         }
 
         let account = &account_response.accounts[0];
+        log::debug!("Account positions found: {}", account.positions.len());
 
         // Check if there are any positions for this market_id that have open orders
         let mut open_order_count = 0;
         for position in &account.positions {
+            log::debug!("Position - market_id: {}, open_order_count: {}, balance: {}",
+                       position.market_id, position.open_order_count, position.balance);
             if position.market_id == market_id {
                 open_order_count = position.open_order_count;
+                log::info!("Found position for market_id {}: {} open orders", market_id, open_order_count);
                 break;
             }
+        }
+
+        if open_order_count == 0 {
+            log::debug!("No position found for market_id {} or no open orders", market_id);
         }
 
         // Create dummy open orders based on the count (we don't have detailed order info)
@@ -1871,10 +1884,9 @@ impl DexConnector for LighterConnector {
             });
         }
 
-        log::debug!(
-            "[OpenOrders] Found {} open orders for {}",
-            open_orders.len(),
-            symbol
+        log::info!(
+            "[OpenOrders] {} - Found {} open orders (market_id: {}, account_index: {})",
+            symbol, open_orders.len(), market_id, self.account_index
         );
 
         Ok(OpenOrdersResponse {
@@ -2071,23 +2083,30 @@ impl DexConnector for LighterConnector {
         ))
     }
 
-    async fn cancel_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
+    async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
+        log::warn!("cancel_order called for symbol: {}, order_id: {} - Individual order cancellation not implemented for Lighter, use cancel_all_orders instead", symbol, order_id);
         Err(DexError::Other(
             "Order cancellation not implemented yet".to_string(),
         ))
     }
 
     async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
-        log::debug!("Cancelling all orders for Lighter connector");
+        log::info!("Starting cancel_all_orders for symbol: {:?}, API key index: {}, account index: {}",
+                   _symbol, self.api_key_index, self.account_index);
 
         #[cfg(feature = "lighter-sdk")]
         {
             // Get nonce from API
+            log::debug!("Getting nonce for cancel_all_orders");
             let nonce = self.get_nonce().await?;
+            log::debug!("Retrieved nonce: {}", nonce);
 
             // Use ImmediateCancelAll (time_in_force=0, time=0)
             let time_in_force = 0; // ImmediateCancelAll
             let time = 0; // Not used for immediate cancel
+
+            log::debug!("Signing cancel_all_orders transaction with time_in_force: {}, time: {}, nonce: {}",
+                        time_in_force, time, nonce);
 
             unsafe {
                 let result = SignCancelAllOrders(time_in_force, time, nonce as i64);
@@ -2114,6 +2133,8 @@ impl DexConnector for LighterConnector {
                     urlencoding::encode(&tx_json)
                 );
 
+                log::debug!("Submitting cancel_all_orders transaction to API: {}/api/v1/sendTx", self.base_url);
+
                 let response = self
                     .client
                     .post(&format!("{}/api/v1/sendTx", self.base_url))
@@ -2123,22 +2144,67 @@ impl DexConnector for LighterConnector {
                     .await
                     .map_err(|e| DexError::Other(format!("Network error: {}", e)))?;
 
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+
+                if !status.is_success() {
+                    log::error!("Cancel all orders failed: HTTP {}, Body: {}", status, body);
                     return Err(DexError::Other(format!(
                         "Cancel all orders failed: HTTP {}, {}",
                         status, body
                     )));
                 }
 
-                log::debug!("Cancel all orders submitted successfully");
+                log::info!("Cancel all orders submitted successfully, Response: {}", body);
+
+                // Wait a moment for the cancellation to process
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Verify cancellation by checking open orders
+                let max_retries = 3;
+                let check_symbol = _symbol.as_deref().unwrap_or("BTC"); // Use provided symbol or default to BTC
+                log::info!("Verifying cancellation by checking open orders for symbol: {}", check_symbol);
+                for attempt in 1..=max_retries {
+                    match self.get_open_orders(check_symbol).await {
+                        Ok(response) => {
+                            if response.orders.is_empty() {
+                                log::info!("Verified: All orders successfully cancelled (attempt {})", attempt);
+                                return Ok(());
+                            } else {
+                                log::warn!(
+                                    "Attempt {}/{}: {} orders still open after cancellation. Order IDs: {:?}",
+                                    attempt, max_retries, response.orders.len(),
+                                    response.orders.iter().map(|o| &o.order_id).collect::<Vec<_>>()
+                                );
+
+                                if attempt < max_retries {
+                                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                                } else {
+                                    return Err(DexError::Other(format!(
+                                        "Failed to cancel all orders: {} orders still remain after {} attempts",
+                                        response.orders.len(), max_retries
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to verify order cancellation (attempt {}/{}): {}", attempt, max_retries, e);
+                            if attempt == max_retries {
+                                return Err(DexError::Other(format!(
+                                    "Cannot verify order cancellation status after {} attempts: {}", max_retries, e
+                                )));
+                            }
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                        }
+                    }
+                }
             }
         }
 
         #[cfg(not(feature = "lighter-sdk"))]
         {
-            log::warn!("Cancel all orders not implemented without lighter-sdk feature");
+            log::error!("Cancel all orders called but lighter-sdk feature is not enabled. Symbol: {:?}, API key index: {}, Account index: {}",
+                       _symbol, self.api_key_index, self.account_index);
         }
 
         Ok(())
@@ -2146,9 +2212,10 @@ impl DexConnector for LighterConnector {
 
     async fn cancel_orders(
         &self,
-        _symbol: Option<String>,
-        _order_ids: Vec<String>,
+        symbol: Option<String>,
+        order_ids: Vec<String>,
     ) -> Result<(), DexError> {
+        log::warn!("cancel_orders called for symbol: {:?}, order_ids: {:?} - Individual order cancellation not implemented for Lighter, use cancel_all_orders instead", symbol, order_ids);
         Err(DexError::Other(
             "Individual order cancellation not implemented for Lighter. Use cancel_all_orders instead.".to_string(),
         ))
@@ -2193,8 +2260,8 @@ impl DexConnector for LighterConnector {
         let mut has_positions = false;
         for position in &account.positions {
             if let Ok(pos_size) = position.position.parse::<f64>() {
-                if pos_size.abs() > 0.00001 {
-                    // Small threshold for floating point comparison
+                if pos_size.abs() > 0.0 {
+                    // Close any position greater than 0
                     has_positions = true;
                     log::info!(
                         "Found open position: market_id={}, symbol={}, size={}",
@@ -2207,14 +2274,23 @@ impl DexConnector for LighterConnector {
         }
 
         if !has_positions {
-            log::info!("No open positions found, nothing to close");
+            log::info!("No open positions found (threshold: > 0.0), nothing to close");
+            // Log all positions for debugging
+            for position in &account.positions {
+                if let Ok(pos_size) = position.position.parse::<f64>() {
+                    if pos_size.abs() > 0.0 {
+                        log::debug!("Small position below threshold: market_id={}, symbol={}, size={} (abs: {})",
+                                   position.market_id, position.symbol, position.position, pos_size.abs());
+                    }
+                }
+            }
             return Ok(());
         }
 
         // Close each open position by placing market orders in opposite direction
         for position in &account.positions {
             if let Ok(pos_size) = position.position.parse::<f64>() {
-                if pos_size.abs() > 0.00001 {
+                if pos_size.abs() > 0.0 {
                     log::info!(
                         "Closing position: market_id={}, symbol={}, size={}, sign={}",
                         position.market_id,
@@ -2233,7 +2309,22 @@ impl DexConnector for LighterConnector {
                     };
 
                     let market_id = position.market_id;
-                    let base_amount = (pos_size.abs() * 100000.0) as u64; // Convert to base units
+
+                    // Use rust_decimal for precise conversion to avoid floating point errors
+                    let pos_decimal = rust_decimal::Decimal::from_str(&position.position.replace('-', ""))
+                        .unwrap_or_else(|_| rust_decimal::Decimal::from_f64(pos_size.abs()).unwrap_or_default());
+                    let mut base_amount = (pos_decimal * rust_decimal::Decimal::new(100000, 0))
+                        .to_u64()
+                        .unwrap_or((pos_size.abs() * 100000.0) as u64);
+
+                    // Ensure minimum of 1 unit for very small positions
+                    if base_amount == 0 && pos_size.abs() > 0.0 {
+                        base_amount = 1;
+                        log::debug!("Position too small for conversion, using minimum base_amount=1");
+                    }
+
+                    log::debug!("Converting position {} to base_amount: {} (original: {}, decimal: {})",
+                               position.position, base_amount, pos_size, pos_decimal);
 
                     // Create market order to close position
                     match self
