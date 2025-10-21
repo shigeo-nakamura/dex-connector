@@ -16,11 +16,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
@@ -1858,8 +1857,8 @@ impl DexConnector for LighterConnector {
         // Check if there are any positions for this market_id that have open orders
         let mut open_order_count = 0;
         for position in &account.positions {
-            log::debug!("Position - market_id: {}, open_order_count: {}, balance: {}",
-                       position.market_id, position.open_order_count, position.balance);
+            log::debug!("Position - market_id: {}, open_order_count: {}, position: {}",
+                       position.market_id, position.open_order_count, position.position);
             if position.market_id == market_id {
                 open_order_count = position.open_order_count;
                 log::info!("Found position for market_id {}: {} open orders", market_id, open_order_count);
@@ -2312,7 +2311,11 @@ impl DexConnector for LighterConnector {
 
                     // Use rust_decimal for precise conversion to avoid floating point errors
                     let pos_decimal = rust_decimal::Decimal::from_str(&position.position.replace('-', ""))
-                        .unwrap_or_else(|_| rust_decimal::Decimal::from_f64(pos_size.abs()).unwrap_or_default());
+                        .unwrap_or_else(|_| {
+                            // Fallback: convert to string first then parse
+                            let pos_str = format!("{:.8}", pos_size.abs());
+                            rust_decimal::Decimal::from_str(&pos_str).unwrap_or(rust_decimal::Decimal::ZERO)
+                        });
                     let mut base_amount = (pos_decimal * rust_decimal::Decimal::new(100000, 0))
                         .to_u64()
                         .unwrap_or((pos_size.abs() * 100000.0) as u64);
