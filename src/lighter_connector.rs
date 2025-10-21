@@ -1709,7 +1709,7 @@ impl DexConnector for LighterConnector {
             .await
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-        log::debug!(
+        log::trace!(
             "Account API response (status: {}): {}",
             status,
             response_text
@@ -1732,16 +1732,16 @@ impl DexConnector for LighterConnector {
         let account = &account_response.accounts[0];
 
         // Debug log account information
-        log::debug!("Account balance info:");
-        log::debug!("  - Account Index: {}", account.account_index);
-        log::debug!("  - Available Balance: {} USD", account.available_balance);
-        log::debug!("  - Collateral: {} USD", account.collateral);
-        log::debug!("  - Total Asset Value: {} USD", account.total_asset_value);
-        log::debug!("  - Positions count: {}", account.positions.len());
+        log::trace!("Account balance info:");
+        log::trace!("  - Account Index: {}", account.account_index);
+        log::trace!("  - Available Balance: {} USD", account.available_balance);
+        log::trace!("  - Collateral: {} USD", account.collateral);
+        log::trace!("  - Total Asset Value: {} USD", account.total_asset_value);
+        log::trace!("  - Positions count: {}", account.positions.len());
 
         // Debug log all positions
         for (i, position) in account.positions.iter().enumerate() {
-            log::debug!(
+            log::trace!(
                 "  Position [{}]: market_id={}, symbol={}, position={}, sign={}",
                 i,
                 position.market_id,
@@ -1753,12 +1753,12 @@ impl DexConnector for LighterConnector {
 
         // If symbol is specified, look for that specific token position
         if let Some(token_symbol) = symbol {
-            log::debug!("Looking for position with symbol: {}", token_symbol);
+            log::trace!("Looking for position with symbol: {}", token_symbol);
 
             // Find position for the specific token
             for position in &account.positions {
                 if position.symbol == token_symbol {
-                    log::debug!(
+                    log::trace!(
                         "✓ Found position for {}: {} (sign: {})",
                         token_symbol,
                         position.position,
@@ -1773,7 +1773,7 @@ impl DexConnector for LighterConnector {
             }
 
             // If token not found in positions, return zero
-            log::debug!("✗ No position found for {}, returning zero", token_symbol);
+            log::trace!("✗ No position found for {}, returning zero", token_symbol);
             return Ok(BalanceResponse {
                 equity: rust_decimal::Decimal::ZERO,
                 balance: rust_decimal::Decimal::ZERO,
@@ -1781,11 +1781,11 @@ impl DexConnector for LighterConnector {
         }
 
         // If no symbol specified, return account-level balances (USD)
-        log::debug!("No symbol specified, returning account-level USD balances");
+        log::trace!("No symbol specified, returning account-level USD balances");
         let total_asset_value = string_to_decimal(Some(account.total_asset_value.clone()))?;
         let available_balance = string_to_decimal(Some(account.available_balance.clone()))?;
 
-        log::debug!(
+        log::trace!(
             "Account balances: total_asset_value={}, available_balance={}",
             total_asset_value,
             available_balance
