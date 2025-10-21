@@ -5,7 +5,8 @@ use crate::{
     dex_request::{DexError, HttpMethod},
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CreateOrderResponse, FilledOrder,
-    FilledOrdersResponse, LastTrade, LastTradesResponse, OrderSide, TickerResponse, TpSl,
+    FilledOrdersResponse, LastTrade, LastTradesResponse, OpenOrder, OpenOrdersResponse, OrderSide,
+    TickerResponse, TpSl,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -1794,6 +1795,92 @@ impl DexConnector for LighterConnector {
         Ok(BalanceResponse {
             equity: total_asset_value,  // Total account value in USD
             balance: available_balance, // Available balance in USD
+        })
+    }
+
+    async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+        // Get market_id for the symbol
+        let market_id = match symbol {
+            "BTC" => 1,
+            _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
+        };
+
+        let endpoint = format!(
+            "/api/v1/openOrders?account_index={}&market_id={}",
+            self.account_index, market_id
+        );
+
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+        log::trace!(
+            "Open orders API response (status: {}): {}",
+            status,
+            response_text
+        );
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        // Parse the response - assuming it's similar to account response structure
+        let orders_response: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+
+        let mut open_orders = Vec::new();
+
+        // Extract orders from the response
+        if let Some(orders_array) = orders_response["orders"].as_array() {
+            for order in orders_array {
+                if let (Some(order_id), Some(side), Some(base_amount), Some(price)) = (
+                    order["order_id"].as_str(),
+                    order["side"].as_u64(),
+                    order["base_amount"].as_str(),
+                    order["price"].as_str(),
+                ) {
+                    let side_enum = if side == 0 {
+                        OrderSide::Long
+                    } else {
+                        OrderSide::Short
+                    };
+                    let size = string_to_decimal(Some(base_amount.to_string()))?;
+                    let order_price = string_to_decimal(Some(price.to_string()))?;
+
+                    open_orders.push(OpenOrder {
+                        order_id: order_id.to_string(),
+                        symbol: symbol.to_string(),
+                        side: side_enum,
+                        size,
+                        price: order_price,
+                        status: "open".to_string(),
+                    });
+                }
+            }
+        }
+
+        log::debug!(
+            "[OpenOrders] Found {} open orders for {}",
+            open_orders.len(),
+            symbol
+        );
+
+        Ok(OpenOrdersResponse {
+            orders: open_orders,
         })
     }
 

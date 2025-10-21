@@ -77,6 +77,21 @@ pub struct CanceledOrdersResponse {
     pub orders: Vec<CanceledOrder>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenOrder {
+    pub order_id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub size: Decimal,
+    pub price: Decimal,
+    pub status: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct OpenOrdersResponse {
+    pub orders: Vec<OpenOrder>,
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct BalanceResponse {
     pub equity: Decimal,
