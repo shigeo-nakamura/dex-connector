@@ -2541,7 +2541,7 @@ impl LighterConnector {
                 }
             }
             "subscribed/account_all" | "update/account_all" => {
-                log::debug!(
+                log::trace!(
                     "Received account message: type={}, message={:?}",
                     msg_type,
                     message
@@ -2568,7 +2568,7 @@ impl LighterConnector {
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         account_id: u64,
     ) {
-        log::debug!("handle_account_update called with data: {:?}", data);
+        log::trace!("handle_account_update called with data: {:?}", data);
 
         // Handle filled orders - try both 'fills' and 'trades' fields
         if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
