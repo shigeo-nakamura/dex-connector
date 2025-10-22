@@ -1361,11 +1361,32 @@ impl DexConnector for HyperliquidConnector {
         Ok(CanceledOrdersResponse { orders: resp })
     }
 
-    async fn get_open_orders(&self, _symbol: &str) -> Result<OpenOrdersResponse, DexError> {
-        // Hyperliquid connector does not support get_open_orders yet
-        Err(DexError::Other(
-            "get_open_orders not implemented for Hyperliquid".to_string(),
-        ))
+    async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+        let all_orders = self.get_orders().await?;
+
+        // Convert symbol to internal representation if needed
+        let target_coin = if let Some(internal_id) = self.spot_index_map.get(symbol) {
+            format!("@{}", internal_id)
+        } else {
+            symbol.to_string()
+        };
+
+        let filtered_orders: Vec<crate::OpenOrder> = all_orders
+            .into_iter()
+            .filter(|order| order.coin == target_coin || order.coin == symbol)
+            .map(|hyperliquid_order| crate::OpenOrder {
+                order_id: hyperliquid_order.oid.to_string(),
+                symbol: symbol.to_string(),
+                side: OrderSide::Long, // Default, we need more detailed API to get actual side
+                size: Decimal::ZERO,   // Default, we need more detailed API to get actual size
+                price: Decimal::ZERO,  // Default, we need more detailed API to get actual price
+                status: "open".to_string(),
+            })
+            .collect();
+
+        Ok(OpenOrdersResponse {
+            orders: filtered_orders,
+        })
     }
 
     async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {

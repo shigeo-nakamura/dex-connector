@@ -136,8 +136,8 @@ struct LighterPosition {
     position: String,
     sign: i8,
     open_order_count: u32,
-    pending_order_count: u32,
-    position_tied_order_count: u32,
+    _pending_order_count: u32,
+    _position_tied_order_count: u32,
 }
 
 #[derive(Deserialize, Debug)]
