@@ -2382,16 +2382,30 @@ impl DexConnector for LighterConnector {
                         pos_decimal
                     );
 
-                    // Create market order to close position
-                    match self
-                        .create_market_close_order_internal(market_id, base_amount, order_side)
-                        .await
-                    {
-                        Ok(_) => {
+                    // Create market order to close position using regular market order mechanism
+                    // Convert to regular API format
+                    let symbol = &position.symbol;
+                    let side = if order_side == 1 {
+                        OrderSide::Short
+                    } else {
+                        OrderSide::Long
+                    };
+                    let size = pos_decimal; // Use exact position size
+
+                    log::info!(
+                        "Placing market order to close position: symbol={}, side={:?}, size={}",
+                        symbol,
+                        side,
+                        size
+                    );
+
+                    match self.create_order(symbol, size, side, None, None).await {
+                        Ok(response) => {
                             log::info!(
-                                "Successfully submitted close order for {} position in market {}",
+                                "Successfully submitted close order for {} position in market {}: Order ID {}",
                                 position.symbol,
-                                market_id
+                                market_id,
+                                response.order_id
                             );
                         }
                         Err(e) => {
@@ -2897,144 +2911,6 @@ impl LighterConnector {
         let scale: u32 = scale_by_sig.min(scale_by_dec);
 
         Decimal::new(1, scale)
-    }
-
-    async fn create_market_close_order_internal(
-        &self,
-        market_id: u8,
-        base_amount: u64,
-        is_ask: u8,
-    ) -> Result<String, DexError> {
-        // Get current market price - prefer WebSocket data if available
-        let current_price = if market_id == 1 {
-            // First try to get price from WebSocket (more recent)
-            let ws_price_data = *self.current_price.read().await;
-
-            let price_decimal = if let Some((ws_price, price_timestamp)) = ws_price_data {
-                let current_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let price_age = current_time.saturating_sub(price_timestamp);
-
-                if price_age <= 30 {
-                    log::debug!("Using WebSocket price for close order: {}", ws_price);
-                    ws_price
-                } else {
-                    log::warn!(
-                        "WebSocket price is stale ({}s old) for close order, using REST API",
-                        price_age
-                    );
-                    // Fallback to REST API
-                    let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=1", market_id);
-                    let url = format!("{}{}", self.base_url, endpoint);
-                    let response = self
-                        .client
-                        .get(&url)
-                        .send()
-                        .await
-                        .map_err(|e| DexError::Reqwest(e))?;
-
-                    if response.status().is_success() {
-                        let trades: Vec<serde_json::Value> = response
-                            .json()
-                            .await
-                            .map_err(|e| DexError::Other(e.to_string()))?;
-
-                        if let Some(trade) = trades.first() {
-                            if let Some(price_str) = trade.get("price").and_then(|p| p.as_str()) {
-                                Decimal::from_str(price_str)
-                                    .map_err(|e| DexError::Other(e.to_string()))?
-                            } else {
-                                return Err(DexError::Other(
-                                    "No price in recent trade".to_string(),
-                                ));
-                            }
-                        } else {
-                            return Err(DexError::Other("No recent trades available".to_string()));
-                        }
-                    } else {
-                        return Err(DexError::Other("Failed to get recent trades".to_string()));
-                    }
-                }
-            } else {
-                // Fallback to REST API
-                log::debug!("WebSocket price not available, using REST API");
-                let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=1", market_id);
-                let url = format!("{}{}", self.base_url, endpoint);
-                let response = self
-                    .client
-                    .get(&url)
-                    .header("X-API-KEY", &self.api_key_public)
-                    .send()
-                    .await
-                    .map_err(|e| DexError::Other(format!("Failed to get current price: {}", e)))?;
-
-                let response_text = response.text().await.map_err(|e| {
-                    DexError::Other(format!("Failed to read price response: {}", e))
-                })?;
-
-                let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
-                    .map_err(|e| {
-                    DexError::Other(format!("Failed to parse trades response: {}", e))
-                })?;
-
-                if let Some(trade) = trades_response.trades.first() {
-                    string_to_decimal(Some(trade.price.clone()))?
-                } else {
-                    return Err(DexError::Other(
-                        "No recent trades found for pricing".to_string(),
-                    ));
-                }
-            };
-
-            // Use very large buffer for market orders - this is protection price, not execution price
-            let buffer_multiplier = if is_ask == 1 {
-                Decimal::new(800, 3) // 0.800 (20% buffer for market sells - worst acceptable price)
-            } else {
-                Decimal::new(1200, 3) // 1.200 (20% buffer for market buys - worst acceptable price)
-            };
-            let market_price = price_decimal * buffer_multiplier;
-
-            log::debug!(
-                "Close order pricing: original={}, buffer={}, final={}",
-                price_decimal,
-                buffer_multiplier,
-                market_price
-            );
-
-            // Convert to Lighter's price format (multiply by 10, same as create_order)
-            (market_price * Decimal::new(10, 0)).to_u64().unwrap_or(0)
-        } else {
-            return Err(DexError::Other(format!(
-                "Market ID {} not supported yet",
-                market_id
-            )));
-        };
-
-        log::debug!(
-            "Creating market order: market_id={}, side={}, base_amount={}, price={}",
-            market_id,
-            is_ask,
-            base_amount,
-            current_price
-        );
-
-        // Create market order using existing native order infrastructure
-        let response = self
-            .create_order_native_with_type(
-                market_id as u32,
-                is_ask as u32,
-                0, // IOC time in force (immediate or cancel)
-                base_amount,
-                current_price,
-                None, // No specific client order index
-                1,    // ORDER_TYPE_MARKET
-                true, // reduce_only=true for position closing
-            )
-            .await?;
-
-        Ok(response.order_id)
     }
 }
 
