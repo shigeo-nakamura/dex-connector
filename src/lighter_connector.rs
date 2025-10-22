@@ -1698,6 +1698,7 @@ impl DexConnector for LighterConnector {
 
         // First, get the raw response text for debugging
         let url = format!("{}{}", self.base_url, endpoint);
+        log::info!("get_balance called for symbol: {:?}, requesting URL: {}", symbol, url);
         let response = self
             .client
             .get(&url)
@@ -1712,7 +1713,7 @@ impl DexConnector for LighterConnector {
             .await
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-        log::trace!(
+        log::info!(
             "Account API response (status: {}): {}",
             status,
             response_text
@@ -1735,16 +1736,16 @@ impl DexConnector for LighterConnector {
         let account = &account_response.accounts[0];
 
         // Debug log account information
-        log::trace!("Account balance info:");
-        log::trace!("  - Account Index: {}", account.account_index);
-        log::trace!("  - Available Balance: {} USD", account.available_balance);
-        log::trace!("  - Collateral: {} USD", account.collateral);
-        log::trace!("  - Total Asset Value: {} USD", account.total_asset_value);
-        log::trace!("  - Positions count: {}", account.positions.len());
+        log::info!("Account balance info:");
+        log::info!("  - Account Index: {}", account.account_index);
+        log::info!("  - Available Balance: {} USD", account.available_balance);
+        log::info!("  - Collateral: {} USD", account.collateral);
+        log::info!("  - Total Asset Value: {} USD", account.total_asset_value);
+        log::info!("  - Positions count: {}", account.positions.len());
 
         // Debug log all positions
         for (i, position) in account.positions.iter().enumerate() {
-            log::trace!(
+            log::info!(
                 "  Position [{}]: market_id={}, symbol={}, position={}, sign={}",
                 i,
                 position.market_id,
@@ -1788,7 +1789,7 @@ impl DexConnector for LighterConnector {
         let total_asset_value = string_to_decimal(Some(account.total_asset_value.clone()))?;
         let available_balance = string_to_decimal(Some(account.available_balance.clone()))?;
 
-        log::trace!(
+        log::info!(
             "Account balances: total_asset_value={}, available_balance={}",
             total_asset_value,
             available_balance
@@ -2382,27 +2383,71 @@ impl DexConnector for LighterConnector {
                         pos_decimal
                     );
 
-                    // Create market order to close position using regular market order mechanism
-                    // Convert to regular API format
-                    let symbol = &position.symbol;
-                    let side = if order_side == 1 {
-                        OrderSide::Short
-                    } else {
-                        OrderSide::Long
-                    };
-                    let size = pos_decimal; // Use exact position size
-
+                    // Create reduce-only market order to close position (requires less margin)
                     log::info!(
-                        "Placing market order to close position: symbol={}, side={:?}, size={}",
-                        symbol,
-                        side,
-                        size
+                        "Placing reduce-only market order to close position: market_id={}, side={}, size={}",
+                        market_id, order_side, pos_decimal
                     );
 
-                    match self.create_order(symbol, size, side, None, None).await {
+                    // Get current price for market order
+                    let current_price = if market_id == 1 {
+                        // Try WebSocket price first
+                        let ws_price_data = *self.current_price.read().await;
+
+                        let price_decimal = if let Some((ws_price, price_timestamp)) = ws_price_data {
+                            let current_time = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let price_age = current_time.saturating_sub(price_timestamp);
+
+                            if price_age <= 30 {
+                                log::debug!("Using WebSocket price for close order: {}", ws_price);
+                                ws_price
+                            } else {
+                                // Fallback to API
+                                log::warn!("WebSocket price stale, using API fallback");
+                                match self.get_ticker(&position.symbol, None).await {
+                                    Ok(ticker) => ticker.price,
+                                    Err(_) => rust_decimal::Decimal::new(50000, 0), // Safe fallback
+                                }
+                            }
+                        } else {
+                            // Fallback to API
+                            match self.get_ticker(&position.symbol, None).await {
+                                Ok(ticker) => ticker.price,
+                                Err(_) => rust_decimal::Decimal::new(50000, 0), // Safe fallback
+                            }
+                        };
+
+                        // Wide price protection for market orders
+                        let protection_price = if order_side == 1 {
+                            // Sell: set low protection price
+                            price_decimal * rust_decimal::Decimal::new(700, 3) // 30% below market
+                        } else {
+                            // Buy: set high protection price
+                            price_decimal * rust_decimal::Decimal::new(1300, 3) // 30% above market
+                        };
+
+                        (protection_price * rust_decimal::Decimal::new(10, 0)).to_u64().unwrap_or(0)
+                    } else {
+                        return Err(DexError::Other(format!("Market ID {} not supported", market_id)));
+                    };
+
+                    // Create reduce-only market order directly
+                    match self.create_order_native_with_type(
+                        market_id as u32,
+                        order_side as u32,
+                        0, // IOC time in force
+                        base_amount,
+                        current_price,
+                        None,
+                        1, // Market order type
+                        true, // reduce_only=true for position closing (prevents overshooting)
+                    ).await {
                         Ok(response) => {
                             log::info!(
-                                "Successfully submitted close order for {} position in market {}: Order ID {}",
+                                "Successfully submitted reduce-only close order for {} position in market {}: Order ID {}",
                                 position.symbol,
                                 market_id,
                                 response.order_id
