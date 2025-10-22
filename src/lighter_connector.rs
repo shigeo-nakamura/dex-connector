@@ -1773,9 +1773,12 @@ impl DexConnector for LighterConnector {
                         position.sign
                     );
                     let position_decimal = string_to_decimal(Some(position.position.clone()))?;
+                    // Note: LighterPosition doesn't provide entry price, set to None for now
                     return Ok(BalanceResponse {
                         equity: position_decimal,
                         balance: position_decimal,
+                        position_entry_price: None,
+                        position_sign: Some(position.sign.into()),
                     });
                 }
             }
@@ -1785,6 +1788,8 @@ impl DexConnector for LighterConnector {
             return Ok(BalanceResponse {
                 equity: rust_decimal::Decimal::ZERO,
                 balance: rust_decimal::Decimal::ZERO,
+                position_entry_price: None,
+                position_sign: None,
             });
         }
 
@@ -1802,6 +1807,8 @@ impl DexConnector for LighterConnector {
         Ok(BalanceResponse {
             equity: total_asset_value,  // Total account value in USD
             balance: available_balance, // Available balance in USD
+            position_entry_price: None, // Account-level call doesn't have position info
+            position_sign: None,
         })
     }
 

@@ -96,6 +96,8 @@ pub struct OpenOrdersResponse {
 pub struct BalanceResponse {
     pub equity: Decimal,
     pub balance: Decimal,
+    pub position_entry_price: Option<Decimal>,
+    pub position_sign: Option<i32>,
 }
 
 #[derive(Deserialize, Debug, Default)]

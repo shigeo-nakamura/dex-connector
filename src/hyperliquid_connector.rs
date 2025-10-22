@@ -1448,6 +1448,8 @@ impl DexConnector for HyperliquidConnector {
             return Ok(BalanceResponse {
                 equity: total_equity,
                 balance: total_balance,
+                position_entry_price: None,
+                position_sign: None,
             });
         }
 
@@ -1491,6 +1493,8 @@ impl DexConnector for HyperliquidConnector {
         Ok(BalanceResponse {
             equity: total_equity,
             balance: total_balance,
+            position_entry_price: None,
+            position_sign: None,
         })
     }
 
