@@ -1698,7 +1698,11 @@ impl DexConnector for LighterConnector {
 
         // First, get the raw response text for debugging
         let url = format!("{}{}", self.base_url, endpoint);
-        log::info!("get_balance called for symbol: {:?}, requesting URL: {}", symbol, url);
+        log::info!(
+            "get_balance called for symbol: {:?}, requesting URL: {}",
+            symbol,
+            url
+        );
         let response = self
             .client
             .get(&url)
@@ -2394,7 +2398,8 @@ impl DexConnector for LighterConnector {
                         // Try WebSocket price first
                         let ws_price_data = *self.current_price.read().await;
 
-                        let price_decimal = if let Some((ws_price, price_timestamp)) = ws_price_data {
+                        let price_decimal = if let Some((ws_price, price_timestamp)) = ws_price_data
+                        {
                             let current_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
@@ -2429,22 +2434,30 @@ impl DexConnector for LighterConnector {
                             price_decimal * rust_decimal::Decimal::new(1300, 3) // 30% above market
                         };
 
-                        (protection_price * rust_decimal::Decimal::new(10, 0)).to_u64().unwrap_or(0)
+                        (protection_price * rust_decimal::Decimal::new(10, 0))
+                            .to_u64()
+                            .unwrap_or(0)
                     } else {
-                        return Err(DexError::Other(format!("Market ID {} not supported", market_id)));
+                        return Err(DexError::Other(format!(
+                            "Market ID {} not supported",
+                            market_id
+                        )));
                     };
 
                     // Create reduce-only market order directly
-                    match self.create_order_native_with_type(
-                        market_id as u32,
-                        order_side as u32,
-                        0, // IOC time in force
-                        base_amount,
-                        current_price,
-                        None,
-                        1, // Market order type
-                        true, // reduce_only=true for position closing (prevents overshooting)
-                    ).await {
+                    match self
+                        .create_order_native_with_type(
+                            market_id as u32,
+                            order_side as u32,
+                            0, // IOC time in force
+                            base_amount,
+                            current_price,
+                            None,
+                            1,    // Market order type
+                            true, // reduce_only=true for position closing (prevents overshooting)
+                        )
+                        .await
+                    {
                         Ok(response) => {
                             log::info!(
                                 "Successfully submitted reduce-only close order for {} position in market {}: Order ID {}",
