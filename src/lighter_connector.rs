@@ -136,6 +136,7 @@ struct LighterPosition {
     position: String,
     sign: i8,
     open_order_count: u32,
+    avg_entry_price: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1771,11 +1772,11 @@ impl DexConnector for LighterConnector {
                         position.sign
                     );
                     let position_decimal = string_to_decimal(Some(position.position.clone()))?;
-                    // Note: LighterPosition doesn't provide entry price, set to None for now
+                    let entry_price = string_to_decimal(Some(position.avg_entry_price.clone()))?;
                     return Ok(BalanceResponse {
                         equity: position_decimal,
                         balance: position_decimal,
-                        position_entry_price: None,
+                        position_entry_price: Some(entry_price),
                         position_sign: Some(position.sign.into()),
                     });
                 }
