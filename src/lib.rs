@@ -100,6 +100,12 @@ pub struct BalanceResponse {
     pub position_sign: Option<i32>,
 }
 
+#[derive(Debug, Default)]
+pub struct CombinedBalanceResponse {
+    pub usd_balance: Decimal,
+    pub token_balances: std::collections::HashMap<String, BalanceResponse>,
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct CreateOrderResponse {
     pub order_id: String,

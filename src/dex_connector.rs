@@ -1,6 +1,7 @@
 use crate::{
-    dex_request::DexError, BalanceResponse, CanceledOrdersResponse, CreateOrderResponse,
-    FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse, OrderSide, TickerResponse, TpSl,
+    dex_request::DexError, BalanceResponse, CanceledOrdersResponse, CombinedBalanceResponse,
+    CreateOrderResponse, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse, OrderSide,
+    TickerResponse, TpSl,
 };
 use async_trait::async_trait;
 use debot_utils::parse_to_decimal;
@@ -52,6 +53,8 @@ pub trait DexConnector: Send + Sync {
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError>;
 
     async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError>;
+
+    async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError>;
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError>;
 

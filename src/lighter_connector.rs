@@ -4,9 +4,9 @@ use crate::{
     dex_connector::{string_to_decimal, DexConnector},
     dex_request::{DexError, HttpMethod},
     dex_websocket::DexWebSocket,
-    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CreateOrderResponse, FilledOrder,
-    FilledOrdersResponse, LastTrade, LastTradesResponse, OpenOrder, OpenOrdersResponse, OrderSide,
-    TickerResponse, TpSl,
+    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
+    CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
+    OpenOrder, OpenOrdersResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -1808,6 +1808,74 @@ impl DexConnector for LighterConnector {
             balance: available_balance, // Available balance in USD
             position_entry_price: None, // Account-level call doesn't have position info
             position_sign: None,
+        })
+    }
+
+    async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
+        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
+        let url = format!("{}{}", self.base_url, endpoint);
+
+        log::info!("get_combined_balance called, requesting URL: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+
+        if account_response.accounts.is_empty() {
+            return Err(DexError::Other("No account found".to_string()));
+        }
+
+        let account = &account_response.accounts[0];
+
+        // Extract USD balance
+        let usd_balance = string_to_decimal(Some(account.available_balance.clone()))?;
+
+        // Extract all token balances
+        let mut token_balances = std::collections::HashMap::new();
+        for position in &account.positions {
+            let position_decimal = string_to_decimal(Some(position.position.clone()))?;
+            let entry_price = string_to_decimal(Some(position.avg_entry_price.clone()))?;
+
+            token_balances.insert(
+                position.symbol.clone(),
+                BalanceResponse {
+                    equity: position_decimal,
+                    balance: position_decimal,
+                    position_entry_price: Some(entry_price),
+                    position_sign: Some(position.sign.into()),
+                },
+            );
+        }
+
+        log::debug!(
+            "Combined balance: USD={}, tokens={} positions",
+            usd_balance,
+            token_balances.len()
+        );
+
+        Ok(CombinedBalanceResponse {
+            usd_balance,
+            token_balances,
         })
     }
 
