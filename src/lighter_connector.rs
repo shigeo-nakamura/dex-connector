@@ -135,6 +135,8 @@ pub struct LighterConnector {
     current_price: Arc<RwLock<Option<(Decimal, u64)>>>, // (price, timestamp)
     current_volume: Arc<RwLock<Option<Decimal>>>,
     order_book: Arc<RwLock<Option<LighterOrderBook>>>,
+    // WebSocket-based order tracking (no API calls)
+    cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -168,6 +170,7 @@ struct LighterAccountInfo {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct LighterPosition {
     market_id: u8,
     symbol: String,
@@ -562,6 +565,8 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
+            // WebSocket-based order tracking (no API calls)
+            cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -601,6 +606,8 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
+            // WebSocket-based order tracking (no API calls)
+            cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -823,6 +830,149 @@ impl LighterConnector {
         } else {
             Err(DexError::Other(format!(
                 "Order failed: HTTP {}, {}",
+                status, response_text
+            )))
+        }
+    }
+
+    async fn create_order_native_with_trigger(
+        &self,
+        market_id: u32,
+        side: u32,
+        tif: u32,
+        base_amount: u64,
+        price: u64,
+        trigger_price: u64,
+        client_order_id: Option<String>,
+        order_type: u32,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+        let _client_id = client_order_id.unwrap_or_else(|| format!("rust-trigger-{}", timestamp));
+        let nonce = self.get_nonce().await?;
+
+        log::debug!(
+            "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}",
+            market_id,
+            side,
+            base_amount,
+            price,
+            trigger_price,
+            order_type
+        );
+
+        let client_order_index = timestamp;
+        let order_type_param = order_type as u64;
+        let time_in_force = tif as u64;
+        let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
+        let trigger_price_param = trigger_price;
+
+        // Trigger orders require expiry timestamp
+        let order_expiry = {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            now_ms + (24 * 60 * 60 * 1000) // 24 hours in milliseconds
+        };
+
+        let actual_market_id = market_id as u64;
+        let actual_base_amount = base_amount;
+        let actual_price = price;
+        let actual_side = side as u64;
+
+        // Extract private key bytes
+        let private_key_hex = self
+            .api_private_key_hex
+            .strip_prefix("0x")
+            .unwrap_or(&self.api_private_key_hex);
+        let private_key_bytes = hex::decode(private_key_hex)
+            .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))?;
+
+        let mut key_bytes = [0u8; 40];
+        let copy_len = std::cmp::min(private_key_bytes.len(), 40);
+        key_bytes[..copy_len].copy_from_slice(&private_key_bytes[..copy_len]);
+
+        // Call Go shared library for trigger order signature
+        let go_result = self
+            .call_go_sign_create_order(
+                actual_market_id as i32,
+                client_order_index as i64,
+                actual_base_amount as i64,
+                actual_price as i32,
+                actual_side as i32,
+                order_type_param as i32,
+                time_in_force as i32,
+                reduce_only_param as i32,
+                trigger_price_param as i32,
+                order_expiry,
+                nonce as i64,
+            )
+            .await;
+
+        let signature = match go_result {
+            Ok(sig) => sig,
+            Err(e) => {
+                log::error!("Failed to sign trigger order via Go SDK: {}", e);
+                return Err(DexError::Other(format!(
+                    "Signature generation failed: {}",
+                    e
+                )));
+            }
+        };
+
+        // Prepare HTTP request for trigger order
+        let order_request = serde_json::json!({
+            "market_index": actual_market_id,
+            "client_order_index": client_order_index,
+            "base_amount": actual_base_amount.to_string(),
+            "price": actual_price.to_string(),
+            "is_ask": actual_side != 0,
+            "order_type": order_type_param,
+            "time_in_force": time_in_force,
+            "reduce_only": reduce_only_param != 0,
+            "trigger_price": trigger_price_param.to_string(),
+            "order_expiry": order_expiry,
+            "signature": signature,
+            "nonce": nonce
+        });
+
+        let client = &self.client;
+        let url = format!("{}/api/v1/orders", self.base_url);
+
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&order_request)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(e.to_string()))?;
+
+        log::debug!("Trigger order response: HTTP {}, {}", status, response_text);
+
+        if status.is_success() {
+            let order_id = format!("trigger-{}-{}", timestamp, market_id);
+            log::info!(
+                "✅ [TRIGGER_ORDER] Successfully created trigger order: {} (type={}, trigger_price={})",
+                order_id,
+                order_type,
+                trigger_price_param
+            );
+
+            Ok(CreateOrderResponse {
+                order_id,
+                ordered_price: Decimal::new(price as i64, 6),
+                ordered_size: Decimal::new(base_amount as i64, 5),
+            })
+        } else {
+            Err(DexError::Other(format!(
+                "Trigger order failed: HTTP {}, {}",
                 status, response_text
             )))
         }
@@ -1963,113 +2113,21 @@ impl DexConnector for LighterConnector {
 
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
         log::debug!(
-            "get_open_orders called for symbol: {}, API key index: {}, account index: {}",
-            symbol,
-            self.api_key_index,
-            self.account_index
+            "[WS_ORDER_TRACKING] get_open_orders called for symbol: {} (WebSocket-only)",
+            symbol
         );
 
-        // Get market_id for the symbol
-        let market_id = match symbol {
-            "BTC" => 1,
-            _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
-        };
-
-        log::debug!("Using market_id: {} for symbol: {}", market_id, symbol);
-
-        // Use existing account API instead of non-existent openOrders endpoint
-        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
-
-        let url = format!("{}{}", self.base_url, endpoint);
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+        // Return WebSocket-tracked orders only (no API fallback)
+        let orders_guard = self.cached_open_orders.read().await;
+        let orders = orders_guard.get(symbol).cloned().unwrap_or_default();
 
         log::debug!(
-            "Open orders API response (status: {}): {}",
-            status,
-            response_text
+            "[WS_ORDER_TRACKING] Returning {} orders for {} from WebSocket tracking",
+            orders.len(),
+            symbol
         );
 
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "HTTP {}: {}",
-                status, response_text
-            )));
-        }
-
-        // Parse account response to get open order count
-        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
-
-        if account_response.accounts.is_empty() {
-            return Err(DexError::Other("No account found".to_string()));
-        }
-
-        let account = &account_response.accounts[0];
-        log::debug!("Account positions found: {}", account.positions.len());
-
-        // Check if there are any positions for this market_id that have open orders
-        let mut open_order_count = 0;
-        for position in &account.positions {
-            log::debug!(
-                "Position - market_id: {}, open_order_count: {}, position: {}",
-                position.market_id,
-                position.open_order_count,
-                position.position
-            );
-            if position.market_id == market_id {
-                open_order_count = position.open_order_count;
-                log::info!(
-                    "Found position for market_id {}: {} open orders",
-                    market_id,
-                    open_order_count
-                );
-                break;
-            }
-        }
-
-        if open_order_count == 0 {
-            log::debug!(
-                "No position found for market_id {} or no open orders",
-                market_id
-            );
-        }
-
-        // Create dummy open orders based on the count (we don't have detailed order info)
-        let mut open_orders = Vec::new();
-        for i in 0..open_order_count {
-            open_orders.push(OpenOrder {
-                order_id: format!("unknown_{}", i),
-                symbol: symbol.to_string(),
-                side: OrderSide::Long, // We don't know the actual side
-                size: rust_decimal::Decimal::ZERO,
-                price: rust_decimal::Decimal::ZERO,
-                status: "open".to_string(),
-            });
-        }
-
-        log::info!(
-            "[OpenOrders] {} - Found {} open orders (market_id: {}, account_index: {})",
-            symbol,
-            open_orders.len(),
-            market_id,
-            self.account_index
-        );
-
-        Ok(OpenOrdersResponse {
-            orders: open_orders,
-        })
+        Ok(OpenOrdersResponse { orders })
     }
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
@@ -2234,31 +2292,104 @@ impl DexConnector for LighterConnector {
         };
 
         // Use native Rust implementation for Lighter signatures
-        self.create_order_native_with_type(
-            market_id,
-            side_value,
-            tif,
-            base_amount,
-            price_value,
-            None,
-            order_type,
-            false,
-        )
-        .await
+        let result = self
+            .create_order_native_with_type(
+                market_id,
+                side_value,
+                tif,
+                base_amount,
+                price_value,
+                None,
+                order_type,
+                false,
+            )
+            .await;
+
+        // Update order tracking if order creation was successful
+        if let Ok(ref response) = result {
+            let actual_price = price.unwrap_or(Decimal::ZERO);
+            self.update_order_tracking_after_create(
+                symbol,
+                &response.order_id,
+                side,
+                size,
+                actual_price,
+            )
+            .await;
+        }
+
+        result
     }
 
     async fn create_trigger_order(
         &self,
-        _symbol: &str,
-        _size: Decimal,
-        _side: OrderSide,
-        _trigger_px: Decimal,
-        _is_market: bool,
-        _tpsl: TpSl,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        trigger_px: Decimal,
+        is_market: bool,
+        tpsl: TpSl,
     ) -> Result<CreateOrderResponse, DexError> {
-        Err(DexError::Other(
-            "Trigger orders not implemented yet".to_string(),
-        ))
+        log::info!(
+            "🎯 [TRIGGER_ORDER] Creating {} trigger order for {}: size={}, trigger_price={}, is_market={}",
+            match tpsl { TpSl::Sl => "stop loss", TpSl::Tp => "take profit" },
+            symbol,
+            size,
+            trigger_px,
+            is_market
+        );
+
+        // Convert symbol to market_id
+        let market_id = match symbol {
+            "BTC-USD" | "BTC" => 1,
+            "ETH-USD" | "ETH" => 2,
+            _ => {
+                log::warn!("Unknown symbol {}, using market_id=1", symbol);
+                1
+            }
+        };
+
+        // Convert side: Long=0(BUY), Short=1(SELL) for Lighter API
+        let side_value = match side {
+            OrderSide::Long => 0,
+            OrderSide::Short => 1,
+        };
+
+        // Determine order type: StopLoss=2, TakeProfit=1, StopLossLimit=3, TakeProfitLimit=4
+        let order_type = match (tpsl, is_market) {
+            (TpSl::Sl, true) => 2,  // StopLossOrder
+            (TpSl::Sl, false) => 3, // StopLossLimitOrder
+            (TpSl::Tp, true) => 1,  // TakeProfitOrder
+            (TpSl::Tp, false) => 4, // TakeProfitLimitOrder
+        };
+
+        // Convert to native units
+        let base_amount = (size * rust_decimal::Decimal::new(100000, 0))
+            .to_u64()
+            .unwrap_or(0);
+        let trigger_price_native = (trigger_px * rust_decimal::Decimal::new(1000000, 0))
+            .to_u64()
+            .unwrap_or(0);
+
+        // For market orders, use trigger price as execution price
+        let execution_price = if is_market {
+            trigger_price_native
+        } else {
+            trigger_price_native // For limit orders, could use different logic
+        };
+
+        self.create_order_native_with_trigger(
+            market_id,
+            side_value,
+            1, // ImmediateOrCancel for trigger orders
+            base_amount,
+            execution_price,
+            trigger_price_native,
+            None,
+            order_type,
+            false, // reduce_only
+        )
+        .await
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
@@ -2411,6 +2542,45 @@ impl DexConnector for LighterConnector {
         {
             log::error!("Cancel all orders called but lighter-sdk feature is not enabled. Symbol: {:?}, API key index: {}, Account index: {}",
                        _symbol, self.api_key_index, self.account_index);
+        }
+
+        // Clear order tracking for all symbols (or specific symbol if provided)
+        // Call update_order_tracking_after_cancel for each order to maintain consistency
+        {
+            let orders_guard = self.cached_open_orders.read().await;
+            if let Some(ref symbol) = _symbol {
+                if let Some(orders) = orders_guard.get(symbol) {
+                    for order in orders {
+                        log::debug!(
+                            "[WS_ORDER_TRACKING] Marking order {} as cancelled for symbol {}",
+                            order.order_id,
+                            symbol
+                        );
+                    }
+                }
+            } else {
+                for (symbol, orders) in orders_guard.iter() {
+                    for order in orders {
+                        log::debug!(
+                            "[WS_ORDER_TRACKING] Marking order {} as cancelled for symbol {}",
+                            order.order_id,
+                            symbol
+                        );
+                    }
+                }
+            }
+        }
+
+        // Now actually clear the tracking (after we've logged the individual cancellations)
+        {
+            let mut orders_guard = self.cached_open_orders.write().await;
+            if let Some(symbol) = _symbol {
+                orders_guard.remove(&symbol);
+                log::debug!("[WS_ORDER_TRACKING] Cleared orders for symbol: {}", symbol);
+            } else {
+                orders_guard.clear();
+                log::debug!("[WS_ORDER_TRACKING] Cleared all orders from tracking");
+            }
         }
 
         Ok(())
@@ -2669,6 +2839,57 @@ impl DexConnector for LighterConnector {
         // EIP-191 adds the prefix "\x19Ethereum Signed Message:\n" + message.len() + message
         let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
         self.sign_evm_65b(&prefixed).await
+    }
+}
+
+impl LighterConnector {
+    /// Update order tracking after order creation
+    async fn update_order_tracking_after_create(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        side: OrderSide,
+        size: Decimal,
+        price: Decimal,
+    ) {
+        let mut orders_guard = self.cached_open_orders.write().await;
+        let orders = orders_guard
+            .entry(symbol.to_string())
+            .or_insert_with(Vec::new);
+
+        let new_order = OpenOrder {
+            order_id: order_id.to_string(),
+            symbol: symbol.to_string(),
+            side,
+            size,
+            price,
+            status: "open".to_string(),
+        };
+
+        orders.push(new_order);
+
+        log::debug!(
+            "[WS_ORDER_TRACKING] Added order {} to tracking for {} (total: {} orders)",
+            order_id,
+            symbol,
+            orders.len()
+        );
+    }
+
+    /// Update order tracking after order cancellation
+    #[allow(dead_code)]
+    async fn update_order_tracking_after_cancel(&self, symbol: &str, order_id: &str) {
+        let mut orders_guard = self.cached_open_orders.write().await;
+        if let Some(orders) = orders_guard.get_mut(symbol) {
+            orders.retain(|order| order.order_id != order_id);
+
+            log::debug!(
+                "[WS_ORDER_TRACKING] Removed order {} from tracking for {} (remaining: {} orders)",
+                order_id,
+                symbol,
+                orders.len()
+            );
+        }
     }
 }
 
