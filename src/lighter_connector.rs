@@ -2897,19 +2897,19 @@ impl LighterConnector {
                 }
             }
         } else if let Some(trades) = data.get("trades") {
-            log::debug!("Found trades object: {:?}", trades);
+            log::trace!("Found trades object: {:?}", trades);
             // Handle trades object - Lighter DEX format: {"market_id": [trade_array]}
             if let Some(trades_obj) = trades.as_object() {
                 let _filled_map = filled_orders.write().await;
                 for (market_id, trade_array) in trades_obj {
-                    log::debug!(
+                    log::trace!(
                         "Processing trades for market {}: {:?}",
                         market_id,
                         trade_array
                     );
                     if let Some(trades_array) = trade_array.as_array() {
                         for trade_data in trades_array {
-                            log::debug!("Processing individual trade: {:?}", trade_data);
+                            log::trace!("Processing individual trade: {:?}", trade_data);
                             // Skip filled order processing for Lighter DEX (using timeout-based strategy)
                             log::trace!("Skipping trade data processing: {:?}", trade_data);
                         }
@@ -2917,7 +2917,7 @@ impl LighterConnector {
                 }
             }
         } else {
-            log::debug!("No 'fills' array or 'trades' object found in account data");
+            log::trace!("No 'fills' array or 'trades' object found in account data");
         }
 
         // Handle canceled orders
