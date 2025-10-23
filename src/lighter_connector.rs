@@ -18,10 +18,10 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // Cryptographic imports
@@ -75,6 +75,42 @@ extern "C" {
     fn SignCancelAllOrders(time_in_force: c_int, time: c_longlong, nonce: c_longlong) -> StrOrErr;
 
     fn SignMessageWithEVM(private_key: *const c_char, message: *const c_char) -> StrOrErr;
+}
+
+/// Global API call counter for monitoring Lighter Protocol rate limits
+static API_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
+static API_CALL_TRACKER: std::sync::LazyLock<Mutex<Vec<(Instant, String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Track and log API calls for rate limit monitoring
+fn track_api_call(endpoint: &str, method: &str) {
+    let call_count = API_CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    let now = Instant::now();
+
+    // Clean old entries (older than 60 seconds)
+    {
+        let mut tracker = API_CALL_TRACKER.lock().unwrap();
+        tracker.retain(|(time, _)| now.duration_since(*time) < Duration::from_secs(60));
+        tracker.push((now, format!("{} {}", method, endpoint)));
+
+        let recent_calls = tracker.len();
+        log::info!(
+            "[API_TRACKER] #{} {} {} | Recent calls (60s): {} | Rate: {:.1}/min",
+            call_count,
+            method,
+            endpoint,
+            recent_calls,
+            recent_calls as f64
+        );
+
+        // Warn if approaching rate limit
+        if recent_calls > 45 {
+            log::warn!(
+                "[API_TRACKER] ⚠️  Approaching rate limit: {}/60 calls in last 60s",
+                recent_calls
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -700,6 +736,8 @@ impl LighterConnector {
         log::debug!("TX Info JSON: {}", tx_info);
         log::debug!("Form data: {}", form_data);
 
+        track_api_call("POST /api/v1/sendTx", "POST");
+
         // Use form-urlencoded format same as Go SDK, without X-API-KEY header
         let response = self
             .client
@@ -838,6 +876,9 @@ impl LighterConnector {
         log::debug!("Getting nonce from: {}", url);
         log::debug!("Using API key: {}", api_key);
 
+        // Track API call
+        track_api_call("/api/v1/nextNonce", "GET");
+
         let response = self
             .client
             .get(&url)
@@ -908,6 +949,15 @@ impl LighterConnector {
     where
         T: for<'de> serde::Deserialize<'de>,
     {
+        // Track API call
+        let method_str = match method {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+            HttpMethod::Delete => "DELETE",
+        };
+        track_api_call(endpoint, method_str);
+
         let url = format!("{}{}", self.base_url, endpoint);
 
         let mut request = match method {
@@ -1349,6 +1399,8 @@ impl LighterConnector {
         log::debug!("Sending change API key request to: {}", url);
         log::debug!("Form data: {:?}", form_data);
 
+        track_api_call("POST /api/v1/sendTx (change_api_key)", "POST");
+
         let response = self
             .client
             .post(&url)
@@ -1702,6 +1754,10 @@ impl DexConnector for LighterConnector {
             symbol,
             url
         );
+
+        // Track API call
+        track_api_call(&endpoint, "GET");
+
         let response = self
             .client
             .get(&url)
@@ -2241,6 +2297,8 @@ impl DexConnector for LighterConnector {
                     "Submitting cancel_all_orders transaction to API: {}/api/v1/sendTx",
                     self.base_url
                 );
+
+                track_api_call("POST /api/v1/sendTx (cancel_all_orders)", "POST");
 
                 let response = self
                     .client
