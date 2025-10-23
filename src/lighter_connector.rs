@@ -127,6 +127,8 @@ pub struct LighterConnector {
     client: Client,
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+    // Cache for API key data to avoid repeated requests
+    cached_server_pubkey: Arc<tokio::sync::RwLock<Option<(String, std::time::Instant)>>>,
     is_running: Arc<AtomicBool>,
     _ws: Option<DexWebSocket>, // Reserved for future WebSocket implementation
     // WebSocket data storage
@@ -554,6 +556,7 @@ impl LighterConnector {
             client: Client::new(),
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
+            cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
             _ws: Some(DexWebSocket::new(websocket_url)),
             current_price: Arc::new(RwLock::new(None)),
@@ -592,12 +595,51 @@ impl LighterConnector {
             client: Client::new(),
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
+            cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
             _ws: Some(DexWebSocket::new(websocket_url)),
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Get server public key with caching to reduce API calls
+    async fn get_server_public_key_cached(&self) -> Result<String, DexError> {
+        // Check cache first (valid for 5 minutes)
+        {
+            let cache = self.cached_server_pubkey.read().await;
+            if let Some((pubkey, timestamp)) = &*cache {
+                if timestamp.elapsed() < std::time::Duration::from_secs(300) {
+                    log::debug!("[API_CACHE] Using cached server public key, no API call needed");
+                    return Ok(pubkey.clone());
+                }
+            }
+        }
+
+        // Cache miss or expired - fetch from API
+        let endpoint = format!(
+            "/api/v1/apikeys?account_index={}&api_key_index={}",
+            self.account_index, self.api_key_index
+        );
+        log::debug!("Getting server public key from: {}", endpoint);
+        let response: ApiKeyResponse = self
+            .make_request(&endpoint, crate::dex_request::HttpMethod::Get, None)
+            .await?;
+
+        if response.api_keys.is_empty() {
+            return Err(DexError::Other("No API keys found on server".to_string()));
+        }
+
+        let server_pubkey = response.api_keys[0].public_key.clone();
+
+        // Update cache
+        {
+            let mut cache = self.cached_server_pubkey.write().await;
+            *cache = Some((server_pubkey.clone(), std::time::Instant::now()));
+        }
+
+        Ok(server_pubkey)
     }
 
     /// Create native order without Python SDK
@@ -920,24 +962,8 @@ impl LighterConnector {
     }
 
     async fn get_server_public_key(&self) -> Result<String, DexError> {
-        let endpoint = format!(
-            "/api/v1/apikeys?account_index={}&api_key_index={}",
-            self.account_index, self.api_key_index
-        );
-
-        log::debug!("Getting server public key from: {}", endpoint);
-
-        let response: ApiKeyResponse = self
-            .make_request(&endpoint, crate::dex_request::HttpMethod::Get, None)
-            .await?;
-
-        if response.api_keys.is_empty() {
-            return Err(DexError::Other("No API keys found on server".to_string()));
-        }
-
-        let server_pubkey = &response.api_keys[0].public_key;
-
-        Ok(server_pubkey.clone())
+        // Use cached version to reduce API calls
+        self.get_server_public_key_cached().await
     }
 
     async fn make_request<T>(
