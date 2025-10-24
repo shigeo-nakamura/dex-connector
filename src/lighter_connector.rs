@@ -3367,22 +3367,61 @@ impl LighterConnector {
                     log::warn!("Failed to parse filled order: {:?}", fill);
                 }
             }
-        } else if let Some(trades) = data.get("trades") {
-            log::trace!("Found trades object: {:?}", trades);
-            // Handle trades object - Lighter DEX format: {"market_id": [trade_array]}
-            if let Some(trades_obj) = trades.as_object() {
-                let _filled_map = filled_orders.write().await;
-                for (market_id, trade_array) in trades_obj {
-                    log::trace!(
-                        "Processing trades for market {}: {:?}",
-                        market_id,
-                        trade_array
-                    );
-                    if let Some(trades_array) = trade_array.as_array() {
-                        for trade_data in trades_array {
-                            log::trace!("Processing individual trade: {:?}", trade_data);
-                            // Skip filled order processing for Lighter DEX (using timeout-based strategy)
-                            log::trace!("Skipping trade data processing: {:?}", trade_data);
+        }
+
+        // Process 'trades' field according to Lighter API specification
+        if let Some(trades) = data.get("trades").and_then(|t| t.as_object()) {
+            log::info!("✅ [FILL_DETECTION] Found trades object in account update");
+            let mut filled_map = filled_orders.write().await;
+
+            for (market_id, trade_array) in trades {
+                if let Some(trades_array) = trade_array.as_array() {
+                    for trade in trades_array {
+                        // Parse trade according to Lighter API spec
+                        if let (Some(ask_id), Some(bid_id), Some(size_str), Some(price_str)) = (
+                            trade.get("ask_id").and_then(|v| v.as_u64()),
+                            trade.get("bid_id").and_then(|v| v.as_u64()),
+                            trade.get("size").and_then(|v| v.as_str()),
+                            trade.get("price").and_then(|v| v.as_str()),
+                        ) {
+                            // Determine which order ID belongs to this account
+                            let order_id = if account_id == ask_id { ask_id } else { bid_id };
+
+                            log::info!(
+                                "✅ [FILL_DETECTION] Trade detected: order_id={}, size={}, price={}, market_id={}",
+                                order_id, size_str, price_str, market_id
+                            );
+
+                            // Create FilledOrder from trade data
+                            if let (Ok(size), Ok(price)) = (
+                                size_str.parse::<rust_decimal::Decimal>(),
+                                price_str.parse::<rust_decimal::Decimal>(),
+                            ) {
+                                let filled_order = FilledOrder {
+                                    order_id: order_id.to_string(),
+                                    is_rejected: false,
+                                    trade_id: trade
+                                        .get("trade_id")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                        .to_string(),
+                                    filled_side: if account_id == ask_id {
+                                        Some(OrderSide::Short)
+                                    } else {
+                                        Some(OrderSide::Long)
+                                    },
+                                    filled_size: Some(size),
+                                    filled_value: Some(size * price),
+                                    filled_fee: None, // Fee info not available in trade message
+                                };
+
+                                filled_map
+                                    .entry("BTC".to_string()) // Use BTC as default symbol
+                                    .or_insert_with(Vec::new)
+                                    .push(filled_order);
+
+                                log::info!("✅ [FILL_DETECTION] Added filled order from trade: order_id={}", order_id);
+                            }
                         }
                     }
                 }
