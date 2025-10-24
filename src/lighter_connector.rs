@@ -2479,15 +2479,16 @@ impl DexConnector for LighterConnector {
                 // Wait a moment for the cancellation to process
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
-                // Verify cancellation by checking open orders
+                // Verify cancellation by checking open orders directly from server API
                 let max_retries = 3;
                 let check_symbol = _symbol.as_deref().unwrap_or("BTC"); // Use provided symbol or default to BTC
                 log::info!(
-                    "Verifying cancellation by checking open orders for symbol: {}",
+                    "Verifying cancellation by checking open orders for symbol: {} (server API)",
                     check_symbol
                 );
                 for attempt in 1..=max_retries {
-                    match self.get_open_orders(check_symbol).await {
+                    // Use server API directly instead of WebSocket cache
+                    match self.get_open_orders_from_server(check_symbol).await {
                         Ok(response) => {
                             if response.orders.is_empty() {
                                 log::info!(
@@ -2837,6 +2838,100 @@ impl DexConnector for LighterConnector {
 }
 
 impl LighterConnector {
+    // Get open orders directly from server API (bypassing WebSocket cache)
+    async fn get_open_orders_from_server(
+        &self,
+        symbol: &str,
+    ) -> Result<OpenOrdersResponse, DexError> {
+        log::debug!(
+            "[API_DIRECT] get_open_orders_from_server called for symbol: {} (server API)",
+            symbol
+        );
+
+        // Use /api/v1/accountActiveOrders to get real server state
+        let url = format!(
+            "{}/api/v1/accountActiveOrders?account_index={}&symbol={}",
+            self.base_url, self.account_index, symbol
+        );
+
+        let response = self.client.get(&url).send().await.map_err(|e| {
+            DexError::Other(format!("Failed to get open orders from server: {}", e))
+        })?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read server response: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "Server API error {}: {}",
+                status, response_text
+            )));
+        }
+
+        // Parse response and convert to OpenOrdersResponse format
+        let server_response: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse server response: {}", e)))?;
+
+        log::debug!(
+            "[API_DIRECT] Server response for {}: {}",
+            symbol,
+            response_text
+        );
+
+        // Convert server response to our format
+        let orders =
+            if let Some(orders_array) = server_response.get("orders").and_then(|v| v.as_array()) {
+                orders_array
+                    .iter()
+                    .filter_map(|order| {
+                        // Extract order information from server response
+                        let id = order
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let side_num = order.get("side").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let side = if side_num == 0 {
+                            OrderSide::Long
+                        } else {
+                            OrderSide::Short
+                        };
+                        let size = order
+                            .get("size")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(Decimal::ZERO);
+                        let price = order
+                            .get("price")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(Decimal::ZERO);
+
+                        Some(OpenOrder {
+                            order_id: id,
+                            symbol: symbol.to_string(),
+                            side,
+                            size,
+                            price,
+                            status: "open".to_string(),
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        log::debug!(
+            "[API_DIRECT] Returning {} orders for {} from server API",
+            orders.len(),
+            symbol
+        );
+
+        Ok(OpenOrdersResponse { orders })
+    }
     /// Update order tracking after order creation
     async fn update_order_tracking_after_create(
         &self,
