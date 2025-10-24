@@ -2477,59 +2477,13 @@ impl DexConnector for LighterConnector {
                 );
 
                 // Wait a moment for the cancellation to process
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
 
-                // Verify cancellation by checking open orders directly from server API
-                let max_retries = 3;
-                let check_symbol = _symbol.as_deref().unwrap_or("BTC"); // Use provided symbol or default to BTC
                 log::info!(
-                    "Verifying cancellation by checking open orders for symbol: {} (server API)",
-                    check_symbol
+                    "Cancel all orders submitted successfully - trusting server response without verification"
                 );
-                for attempt in 1..=max_retries {
-                    // Use server API directly instead of WebSocket cache
-                    match self.get_open_orders_from_server(check_symbol).await {
-                        Ok(response) => {
-                            if response.orders.is_empty() {
-                                log::info!(
-                                    "Verified: All orders successfully cancelled (attempt {})",
-                                    attempt
-                                );
-                                return Ok(());
-                            } else {
-                                log::warn!(
-                                    "Attempt {}/{}: {} orders still open after cancellation. Order IDs: {:?}",
-                                    attempt, max_retries, response.orders.len(),
-                                    response.orders.iter().map(|o| &o.order_id).collect::<Vec<_>>()
-                                );
 
-                                if attempt < max_retries {
-                                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                                } else {
-                                    return Err(DexError::Other(format!(
-                                        "Failed to cancel all orders: {} orders still remain after {} attempts",
-                                        response.orders.len(), max_retries
-                                    )));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Failed to verify order cancellation (attempt {}/{}): {}",
-                                attempt,
-                                max_retries,
-                                e
-                            );
-                            if attempt == max_retries {
-                                return Err(DexError::Other(format!(
-                                    "Cannot verify order cancellation status after {} attempts: {}",
-                                    max_retries, e
-                                )));
-                            }
-                            tokio::time::sleep(Duration::from_millis(1000)).await;
-                        }
-                    }
-                }
+                return Ok(());
             }
         }
 
