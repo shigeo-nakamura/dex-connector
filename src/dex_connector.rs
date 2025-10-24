@@ -81,6 +81,7 @@ pub trait DexConnector: Send + Sync {
         trigger_px: Decimal,
         is_market: bool,
         tpsl: TpSl,
+        reduce_only: bool,
     ) -> Result<CreateOrderResponse, DexError>;
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;

@@ -1709,6 +1709,7 @@ impl DexConnector for HyperliquidConnector {
         trigger_px: Decimal,
         is_market: bool,
         tpsl: TpSl,
+        _reduce_only: bool,
     ) -> Result<CreateOrderResponse, DexError> {
         // Resolve the exchange asset code
         let asset = resolve_coin(symbol, &self.spot_index_map);

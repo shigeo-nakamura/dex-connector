@@ -2316,6 +2316,7 @@ impl DexConnector for LighterConnector {
         trigger_px: Decimal,
         is_market: bool,
         tpsl: TpSl,
+        reduce_only: bool,
     ) -> Result<CreateOrderResponse, DexError> {
         log::info!(
             "🎯 [TRIGGER_ORDER] Creating {} trigger order for {}: size={}, trigger_price={}, is_market={}",
@@ -2380,7 +2381,7 @@ impl DexConnector for LighterConnector {
             trigger_price_native,
             None,
             order_type,
-            false, // reduce_only
+            reduce_only,
         )
         .await
     }
