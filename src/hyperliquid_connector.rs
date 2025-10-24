@@ -932,6 +932,7 @@ impl HyperliquidConnector {
 
             match upd.status.as_str() {
                 "canceled" => {
+                    log::debug!("🚫 [FILL_DETECTION] Order canceled: {} ({})", upd.order.oid, symbol);
                     let evt = CancelEvent {
                         order_id: upd.order.oid.to_string(),
                         timestamp: upd.status_timestamp,
@@ -944,6 +945,7 @@ impl HyperliquidConnector {
                         .insert(evt.order_id.clone(), evt);
                 }
                 "rejected" => {
+                    log::debug!("❌ [FILL_DETECTION] Order rejected: {} ({})", upd.order.oid, symbol);
                     let mut trs = trade_results.write().await;
                     let entry = trs.entry(symbol).or_default();
                     entry.insert(
@@ -958,7 +960,15 @@ impl HyperliquidConnector {
                         },
                     );
                 }
-                _ => {}
+                "filled" | "partiallyFilled" => {
+                    log::info!("✅ [FILL_DETECTION] Order {} detected: {} ({})",
+                              upd.status, upd.order.oid, symbol);
+                    // TODO: Add fill event processing here
+                }
+                _ => {
+                    log::debug!("🔍 [FILL_DETECTION] Unknown order status: '{}' for order {} ({})",
+                               upd.status, upd.order.oid, symbol);
+                }
             }
         }
     }

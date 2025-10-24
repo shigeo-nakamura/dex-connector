@@ -3327,12 +3327,13 @@ impl LighterConnector {
 
         // Handle filled orders - try both 'fills' and 'trades' fields
         if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
-            log::debug!("Found {} fills in account update", fills.len());
+            log::info!("✅ [FILL_DETECTION] Found {} fills in account update", fills.len());
             let mut filled_map = filled_orders.write().await;
             for fill in fills {
-                log::debug!("Processing fill: {:?}", fill);
+                log::debug!("🔍 [FILL_DETECTION] Processing fill: {:?}", fill);
                 if let Ok(filled_order) = Self::parse_filled_order(fill, account_id) {
-                    log::info!("Added filled order: {:?}", filled_order);
+                    log::info!("✅ [FILL_DETECTION] Added filled order: order_id={}, size={:?}, value={:?}",
+                              filled_order.order_id, filled_order.filled_size, filled_order.filled_value);
                     filled_map
                         .entry("BTC".to_string())
                         .or_insert_with(Vec::new)
