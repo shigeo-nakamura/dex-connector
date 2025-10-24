@@ -872,9 +872,9 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price_param = trigger_price;
 
-        // For trigger orders, use long expiry (28 days) as Go SDK requires MinOrderExpiry >= 1
-        let order_expiry = if order_type == ORDER_TYPE_TRIGGER {
-            // Use 28 days expiry for trigger orders (in milliseconds)
+        // For trigger orders (StopLoss=2, TakeProfit=4, etc.), use long expiry (28 days) as Go SDK requires MinOrderExpiry >= 1
+        let order_expiry = if order_type == ORDER_TYPE_TRIGGER || order_type == 4 || order_type == 3 || order_type == 5 {
+            // Use 28 days expiry for all trigger orders (in milliseconds)
             let expiry_ms = 28 * 24 * 60 * 60 * 1000; // 28 days
             (chrono::Utc::now().timestamp_millis() as u64 + expiry_ms) as i64
         } else {
@@ -2362,12 +2362,12 @@ impl DexConnector for LighterConnector {
             OrderSide::Short => 1,
         };
 
-        // Determine order type: StopLoss=2, TakeProfit=1, StopLossLimit=3, TakeProfitLimit=4
+        // Determine order type: StopLoss=2, TakeProfit=4, StopLossLimit=3, TakeProfitLimit=5
         let order_type = match (&tpsl, is_market) {
             (TpSl::Sl, true) => 2,  // StopLossOrder
             (TpSl::Sl, false) => 3, // StopLossLimitOrder
-            (TpSl::Tp, true) => 1,  // TakeProfitOrder
-            (TpSl::Tp, false) => 4, // TakeProfitLimitOrder
+            (TpSl::Tp, true) => 4,  // TakeProfitOrder
+            (TpSl::Tp, false) => 5, // TakeProfitLimitOrder
         };
 
         // Convert to native units
