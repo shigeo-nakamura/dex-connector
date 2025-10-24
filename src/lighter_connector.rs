@@ -916,29 +916,21 @@ impl LighterConnector {
             }
         };
 
-        // Prepare HTTP request for trigger order
-        let order_request = serde_json::json!({
-            "market_index": actual_market_id,
-            "client_order_index": client_order_index,
-            "base_amount": actual_base_amount.to_string(),
-            "price": actual_price.to_string(),
-            "is_ask": actual_side != 0,
-            "order_type": order_type_param,
-            "time_in_force": time_in_force,
-            "reduce_only": reduce_only_param != 0,
-            "trigger_price": trigger_price_param.to_string(),
-            "order_expiry": order_expiry,
-            "signature": signature,
-            "nonce": nonce
-        });
+        // Use same form-urlencoded format as regular orders
+        let form_data = format!(
+            "tx_type=14&tx_info={}&price_protection=false",
+            urlencoding::encode(&signature)
+        );
+
+        log::debug!("Trigger order form data: {}", form_data);
 
         let client = &self.client;
-        let url = format!("{}/api/v1/orders", self.base_url);
+        let url = format!("{}/api/v1/sendTx", self.base_url);
 
         let response = client
             .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&order_request)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_data)
             .send()
             .await
             .map_err(|e| DexError::Other(e.to_string()))?;
