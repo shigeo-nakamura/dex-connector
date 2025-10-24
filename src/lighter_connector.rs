@@ -1767,7 +1767,7 @@ impl DexConnector for LighterConnector {
                     None
                 };
 
-                log::debug!(
+                log::trace!(
                     "Using WebSocket price with API stats: price={}, volume={:?}, trades={:?}",
                     ws_price,
                     volume,
