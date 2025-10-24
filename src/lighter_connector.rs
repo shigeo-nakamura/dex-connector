@@ -873,7 +873,11 @@ impl LighterConnector {
         let trigger_price_param = trigger_price;
 
         // For trigger orders (StopLoss=2, TakeProfit=4, etc.), use long expiry (28 days) as Go SDK requires MinOrderExpiry >= 1
-        let order_expiry = if order_type == ORDER_TYPE_TRIGGER || order_type == 4 || order_type == 3 || order_type == 5 {
+        let order_expiry = if order_type == ORDER_TYPE_TRIGGER
+            || order_type == 4
+            || order_type == 3
+            || order_type == 5
+        {
             // Use 28 days expiry for all trigger orders (in milliseconds)
             let expiry_ms = 28 * 24 * 60 * 60 * 1000; // 28 days
             (chrono::Utc::now().timestamp_millis() as u64 + expiry_ms) as i64
@@ -2839,7 +2843,9 @@ impl LighterConnector {
             .header("X-API-KEY", &self.api_key_public)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to get open orders from server: {}", e)))?;
+            .map_err(|e| {
+                DexError::Other(format!("Failed to get open orders from server: {}", e))
+            })?;
 
         let status = response.status();
         let response_text = response
@@ -3081,6 +3087,12 @@ impl LighterConnector {
                             "channel": format!("account_all/{}", account_index)
                         });
 
+                        log::info!(
+                            "🔗 [WS_DEBUG] Sending subscriptions - orderbook: {}, account: {}",
+                            subscribe_orderbook,
+                            subscribe_account
+                        );
+
                         if let Err(e) = ws_stream
                             .send(tokio_tungstenite::tungstenite::Message::Text(
                                 subscribe_orderbook.to_string(),
@@ -3249,11 +3261,21 @@ impl LighterConnector {
         account_index: u32,
     ) {
         let msg_type = message.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        log::trace!(
-            "WebSocket message received: type='{}', message={:?}",
-            msg_type,
-            message
-        );
+
+        // Log all account-related messages at info level for debugging
+        if msg_type.contains("account") {
+            log::info!(
+                "🔍 [WS_DEBUG] Account message received: type='{}', message={:?}",
+                msg_type,
+                message
+            );
+        } else {
+            log::trace!(
+                "WebSocket message received: type='{}', message={:?}",
+                msg_type,
+                message
+            );
+        }
 
         match msg_type {
             "subscribed/order_book" | "update/order_book" => {
@@ -3327,7 +3349,10 @@ impl LighterConnector {
 
         // Handle filled orders - try both 'fills' and 'trades' fields
         if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
-            log::info!("✅ [FILL_DETECTION] Found {} fills in account update", fills.len());
+            log::info!(
+                "✅ [FILL_DETECTION] Found {} fills in account update",
+                fills.len()
+            );
             let mut filled_map = filled_orders.write().await;
             for fill in fills {
                 log::debug!("🔍 [FILL_DETECTION] Processing fill: {:?}", fill);
