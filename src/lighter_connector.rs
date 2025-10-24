@@ -2849,9 +2849,15 @@ impl LighterConnector {
         );
 
         // Use /api/v1/accountActiveOrders to get real server state
+        // Convert symbol to market_id (BTC = 1)
+        let market_id = match symbol {
+            "BTC" => 1,
+            _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
+        };
+
         let url = format!(
-            "{}/api/v1/accountActiveOrders?account_index={}&symbol={}",
-            self.base_url, self.account_index, symbol
+            "{}/api/v1/accountActiveOrders?account_index={}&market_id={}",
+            self.base_url, self.account_index, market_id
         );
 
         let response = self.client.get(&url).send().await.map_err(|e| {
