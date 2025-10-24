@@ -2355,7 +2355,7 @@ impl DexConnector for LighterConnector {
         let base_amount = (size * rust_decimal::Decimal::new(100000, 0))
             .to_u64()
             .unwrap_or(0);
-        let trigger_price_native = (trigger_px * rust_decimal::Decimal::new(1000000, 0))
+        let trigger_price_native = (trigger_px * rust_decimal::Decimal::new(10, 0))
             .to_u64()
             .unwrap_or(0);
 
