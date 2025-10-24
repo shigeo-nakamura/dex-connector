@@ -867,13 +867,17 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price_param = trigger_price;
 
-        // Trigger orders require expiry timestamp
-        let order_expiry = {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            now_ms + (24 * 60 * 60 * 1000) // 24 hours in milliseconds
+        // Set order expiry based on order type (following Python SDK pattern)
+        let order_expiry = match order_type {
+            2 | 4 => 0, // IOC expiry for stop loss market orders (StopLossOrder=2, TakeProfitOrder=4)
+            _ => {
+                // 28-day expiry for limit orders
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                now_ms + (28 * 24 * 60 * 60 * 1000) // 28 days in milliseconds
+            }
         };
 
         let actual_market_id = market_id as u64;
@@ -2356,7 +2360,7 @@ impl DexConnector for LighterConnector {
         };
 
         // Determine order type: StopLoss=2, TakeProfit=1, StopLossLimit=3, TakeProfitLimit=4
-        let order_type = match (tpsl, is_market) {
+        let order_type = match (&tpsl, is_market) {
             (TpSl::Sl, true) => 2,  // StopLossOrder
             (TpSl::Sl, false) => 3, // StopLossLimitOrder
             (TpSl::Tp, true) => 1,  // TakeProfitOrder
@@ -2378,10 +2382,16 @@ impl DexConnector for LighterConnector {
             trigger_price_native // For limit orders, could use different logic
         };
 
+        // Set correct TimeInForce based on order type (following Python SDK)
+        let time_in_force = match (&tpsl, is_market) {
+            (TpSl::Sl, true) | (TpSl::Tp, true) => 0, // IOC for StopLossOrder/TakeProfitOrder (Python: DEFAULT_IOC_EXPIRY = 0)
+            _ => 1,                                   // GTC for limit orders
+        };
+
         self.create_order_native_with_trigger(
             market_id,
             side_value,
-            0, // GTC (Good Till Cancel) for trigger orders - they should remain active until triggered
+            time_in_force,
             base_amount,
             execution_price,
             trigger_price_native,
