@@ -867,16 +867,15 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price_param = trigger_price;
 
-        // Set order expiry based on order type (following Python SDK pattern)
-        let order_expiry = match order_type {
-            2 | 4 => 0, // IOC expiry for stop loss market orders (StopLossOrder=2, TakeProfitOrder=4)
-            _ => {
-                // 28-day expiry for limit orders
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
-                now_ms + (28 * 24 * 60 * 60 * 1000) // 28 days in milliseconds
+        // Set order expiry based on order type (Go SDK requires non-zero for trigger orders)
+        let order_expiry = {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            match order_type {
+                2 | 4 => now_ms + (24 * 60 * 60 * 1000), // 24 hours for StopLoss/TakeProfit market orders
+                _ => now_ms + (28 * 24 * 60 * 60 * 1000), // 28 days for limit orders
             }
         };
 
