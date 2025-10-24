@@ -872,9 +872,11 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price_param = trigger_price;
 
-        // For trigger orders (Type=2), set OrderExpiry=0 per Lighter Protocol specification
+        // For trigger orders, use long expiry (28 days) as Go SDK requires MinOrderExpiry >= 1
         let order_expiry = if order_type == ORDER_TYPE_TRIGGER {
-            0i64  // Trigger orders use OrderExpiry=0
+            // Use 28 days expiry for trigger orders (in milliseconds)
+            let expiry_ms = 28 * 24 * 60 * 60 * 1000; // 28 days
+            (chrono::Utc::now().timestamp_millis() as u64 + expiry_ms) as i64
         } else {
             // For regular orders, set expiry based on TRADING_PERIOD
             let trading_period_secs = std::env::var("TRADING_PERIOD_SECS")
