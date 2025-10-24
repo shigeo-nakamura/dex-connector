@@ -2856,13 +2856,17 @@ impl LighterConnector {
         };
 
         let url = format!(
-            "{}/api/v1/accountActiveOrders?account_index={}&market_id={}",
-            self.base_url, self.account_index, market_id
+            "{}/api/v1/accountActiveOrders?account_index={}&market_id={}&api_key_index={}",
+            self.base_url, self.account_index, market_id, self.api_key_index
         );
 
-        let response = self.client.get(&url).send().await.map_err(|e| {
-            DexError::Other(format!("Failed to get open orders from server: {}", e))
-        })?;
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to get open orders from server: {}", e)))?;
 
         let status = response.status();
         let response_text = response
