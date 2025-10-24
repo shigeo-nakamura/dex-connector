@@ -2381,7 +2381,7 @@ impl DexConnector for LighterConnector {
         self.create_order_native_with_trigger(
             market_id,
             side_value,
-            1, // ImmediateOrCancel for trigger orders
+            0, // GTC (Good Till Cancel) for trigger orders - they should remain active until triggered
             base_amount,
             execution_price,
             trigger_price_native,
