@@ -1,5 +1,10 @@
 #![cfg(feature = "lighter-sdk")]
 
+// Lighter Protocol Order Type constants
+const ORDER_TYPE_LIMIT: u32 = 0;
+const ORDER_TYPE_IOC: u32 = 1;
+const ORDER_TYPE_TRIGGER: u32 = 2;
+
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
     dex_request::{DexError, HttpMethod},
@@ -867,14 +872,21 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price_param = trigger_price;
 
-        // Set order expiry to be 5 seconds before TRADING_PERIOD for better resource efficiency
-        let trading_period_secs = std::env::var("TRADING_PERIOD_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300); // Default to 5 minutes if not set
+        // For trigger orders (Type=2), set OrderExpiry=0 per Lighter Protocol specification
+        let order_expiry = if order_type == ORDER_TYPE_TRIGGER {
+            0i64  // Trigger orders use OrderExpiry=0
+        } else {
+            // For regular orders, set expiry based on TRADING_PERIOD
+            let trading_period_secs = std::env::var("TRADING_PERIOD_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(300); // Default to 5 minutes if not set
 
-        let expiry_duration_ms = (trading_period_secs.saturating_sub(5)) * 1000;
-        let order_expiry = (chrono::Utc::now().timestamp_millis() as u64 + expiry_duration_ms) as i64;
+            let target_expiry_secs = trading_period_secs.saturating_sub(5);
+            let min_expiry_secs = 60;
+            let expiry_duration_ms = std::cmp::max(min_expiry_secs, target_expiry_secs) * 1000;
+            (chrono::Utc::now().timestamp_millis() as u64 + expiry_duration_ms) as i64
+        };
 
         let actual_market_id = market_id as u64;
         let actual_base_amount = base_amount;
