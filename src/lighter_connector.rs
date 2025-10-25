@@ -2192,32 +2192,28 @@ impl DexConnector for LighterConnector {
         Ok(LastTradesResponse { trades })
     }
 
-    async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
-        let mut orders = self.filled_orders.write().await;
-        if let Some(symbol_orders) = orders.get_mut(symbol) {
-            symbol_orders.retain(|order| order.trade_id != trade_id);
-        }
-        Ok(())
+    async fn clear_filled_order(&self, _symbol: &str, _trade_id: &str) -> Result<(), DexError> {
+        Err(DexError::Other(
+            "clear_filled_order not supported for Lighter - filled orders are streamed via WebSocket only".to_string()
+        ))
     }
 
     async fn clear_all_filled_orders(&self) -> Result<(), DexError> {
-        let mut orders = self.filled_orders.write().await;
-        orders.clear();
-        Ok(())
+        Err(DexError::Other(
+            "clear_all_filled_orders not supported for Lighter - filled orders are streamed via WebSocket only".to_string()
+        ))
     }
 
-    async fn clear_canceled_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
-        let mut orders = self.canceled_orders.write().await;
-        if let Some(symbol_orders) = orders.get_mut(symbol) {
-            symbol_orders.retain(|order| order.order_id != order_id);
-        }
-        Ok(())
+    async fn clear_canceled_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
+        Err(DexError::Other(
+            "clear_canceled_order not supported for Lighter - canceled orders are streamed via WebSocket only".to_string()
+        ))
     }
 
     async fn clear_all_canceled_orders(&self) -> Result<(), DexError> {
-        let mut orders = self.canceled_orders.write().await;
-        orders.clear();
-        Ok(())
+        Err(DexError::Other(
+            "clear_all_canceled_orders not supported for Lighter - canceled orders are streamed via WebSocket only".to_string()
+        ))
     }
 
     async fn create_order(
