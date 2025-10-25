@@ -2241,7 +2241,11 @@ impl DexConnector for LighterConnector {
         };
 
         // Convert time-in-force: 0=GTC, 1=IOC, 2=FOK
-        let _tif = 0; // Default to GTC
+        // Use spread parameter to specify TIF when negative values:
+        // spread >= 0: normal spread adjustment
+        // spread = -1: IOC order
+        // spread = -2: FOK order
+        let default_tif = 0; // Default to GTC
 
         // Convert amounts to Lighter's scaled integers
         // Base amount in 1e5 scale, price scaled to match Go SDK (much smaller scale)
@@ -2250,14 +2254,27 @@ impl DexConnector for LighterConnector {
             .ok_or_else(|| DexError::Other("Invalid size amount".to_string()))?;
 
         let (price_value, order_type, tif) = if let Some(p) = price {
-            // Apply spread if provided (for MarketMake strategy)
-            let final_price = if let Some(spread_ticks) = _spread {
-                // Get tick size from market data (assuming 0.1 for BTC)
-                let tick_size = Decimal::new(1, 1); // 0.1
-                let spread_amount = Decimal::from(spread_ticks) * tick_size;
-                p + spread_amount
+            // Handle spread parameter: negative values for TIF, positive for price adjustment
+            let (final_price, order_tif) = if let Some(spread_ticks) = _spread {
+                if spread_ticks < 0 {
+                    // Negative spread values specify TIF
+                    let tif_value = match spread_ticks {
+                        -1 => 1u32, // IOC
+                        -2 => 2u32, // FOK
+                        _ => {
+                            log::warn!("Invalid TIF spread value: {}, using GTC", spread_ticks);
+                            default_tif
+                        }
+                    };
+                    (p, tif_value) // No price adjustment for TIF orders
+                } else {
+                    // Positive spread values adjust price (original behavior)
+                    let tick_size = Decimal::new(1, 1); // 0.1
+                    let spread_amount = Decimal::from(spread_ticks) * tick_size;
+                    (p + spread_amount, default_tif)
+                }
             } else {
-                p
+                (p, default_tif)
             };
 
             // Limit order
@@ -2265,9 +2282,17 @@ impl DexConnector for LighterConnector {
                 .to_u32()
                 .ok_or_else(|| DexError::Other("Invalid price".to_string()))?
                 as u64;
-            log::debug!("Creating limit order: side={}, original_price={}, spread_ticks={:?}, final_price={}, scaled_price={}, size={}, scaled_base_amount={}",
-                side_value, p, _spread, final_price, price_val, size, base_amount);
-            (price_val, 0u32, 1u32) // order_type=0 (limit), tif=1 (GTC like Hyperliquid)
+
+            let tif_name = match order_tif {
+                0 => "GTC",
+                1 => "IOC",
+                2 => "FOK",
+                _ => "UNKNOWN",
+            };
+
+            log::debug!("Creating limit order: side={}, original_price={}, spread_param={:?}, final_price={}, TIF={} ({}), scaled_price={}, size={}, scaled_base_amount={}",
+                side_value, p, _spread, final_price, order_tif, tif_name, price_val, size, base_amount);
+            (price_val, 0u32, order_tif)
         } else {
             // Market order - get current price and set protection price
             let ticker = self.get_ticker(symbol, None).await?;
@@ -3111,48 +3136,9 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
-                        // Split the stream for separate reading and writing
-                        let (mut write, mut read) = ws_stream.split();
-
-                        // Create channel for sending pong messages
-                        let (pong_tx, mut pong_rx) =
-                            tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-                        // Create ping/write task with 3-second interval
-                        let ping_is_running = is_running.clone();
-                        let ping_task = tokio::spawn(async move {
-                            let mut ping_interval =
-                                tokio::time::interval(std::time::Duration::from_secs(3));
-                            ping_interval
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                            loop {
-                                tokio::select! {
-                                    // Handle ping interval (disabled automatic ping)
-                                    _ = ping_interval.tick() => {
-                                        if !ping_is_running.load(Ordering::SeqCst) {
-                                            break;
-                                        }
-
-                                        // Disabled automatic ping - server handles ping/pong timing
-                                        // Only respond to server pings to avoid "no pong" disconnections
-                                        log::trace!("Ping interval tick (automatic ping disabled for server compatibility)");
-                                    }
-                                    // Handle pong responses
-                                    Some(pong_data) = pong_rx.recv() => {
-                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_data)).await {
-                                            log::error!("Failed to send pong response: {:?}", e);
-                                            break;
-                                        }
-                                        log::info!("🏓 [PONG] Sent WebSocket pong response");
-                                    }
-                                }
-                            }
-                        });
-
-                        // Handle messages in this connection
+                        // Handle messages without splitting - allows immediate pong response
                         log::debug!("Starting WebSocket message handling loop");
-                        while let Some(message) = read.next().await {
+                        while let Some(message) = ws_stream.next().await {
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
@@ -3183,16 +3169,23 @@ impl LighterConnector {
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(data) => {
                                         log::info!(
-                                            "🏓 [PING] Received WebSocket ping (size: {}), sending pong response",
+                                            "🏓 [PING] Received WebSocket ping (size: {}), sending immediate pong response",
                                             data.len()
                                         );
 
-                                        // Send pong data through channel to write task
-                                        if let Err(e) = pong_tx.send(data) {
-                                            log::error!("❌ [PING] Failed to send pong through channel: {:?}", e);
+                                        // Send pong immediately to prevent "no pong" disconnections
+                                        if let Err(e) = ws_stream
+                                            .send(tokio_tungstenite::tungstenite::Message::Pong(
+                                                data,
+                                            ))
+                                            .await
+                                        {
+                                            log::error!("❌ [PONG] Failed to send immediate pong response: {:?}", e);
                                             break;
                                         }
-                                        log::debug!("✅ [PING] Pong queued successfully");
+                                        log::info!(
+                                            "🏓 [PONG] Sent immediate WebSocket pong response"
+                                        );
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(_) => {
                                         log::trace!("Received WebSocket pong - connection healthy");
@@ -3220,9 +3213,6 @@ impl LighterConnector {
                                 }
                             }
                         }
-
-                        // Stop ping task when message loop ends
-                        ping_task.abort();
 
                         log::warn!(
                             "WebSocket message loop ended. Connection lost - will attempt reconnection in 3 seconds."
