@@ -3148,7 +3148,7 @@ impl LighterConnector {
                                             log::error!("Failed to send pong response: {:?}", e);
                                             break;
                                         }
-                                        log::debug!("Sent WebSocket pong response");
+                                        log::info!("🏓 [PONG] Sent WebSocket pong response");
                                     }
                                 }
                             }
@@ -3186,15 +3186,17 @@ impl LighterConnector {
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(data) => {
-                                        log::debug!(
-                                            "Received WebSocket ping, sending pong response"
+                                        log::info!(
+                                            "🏓 [PING] Received WebSocket ping (size: {}), sending pong response",
+                                            data.len()
                                         );
 
                                         // Send pong data through channel to write task
-                                        if let Err(_) = pong_tx.send(data) {
-                                            log::error!("Failed to send pong through channel");
+                                        if let Err(e) = pong_tx.send(data) {
+                                            log::error!("❌ [PING] Failed to send pong through channel: {:?}", e);
                                             break;
                                         }
+                                        log::debug!("✅ [PING] Pong queued successfully");
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(_) => {
                                         log::trace!("Received WebSocket pong - connection healthy");
