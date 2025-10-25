@@ -3141,50 +3141,8 @@ impl LighterConnector {
                         // Split stream for ping/pong handling like official SDK
                         let (mut write, mut read) = ws_stream.split();
 
-                        // Create ping task with manual pong timeout (like Python SDK: ping_interval=20, ping_timeout=10)
-                        let ping_is_running = is_running.clone();
-                        let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-                        let ping_task = tokio::spawn(async move {
-                            let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
-                            ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                            loop {
-                                if !ping_is_running.load(Ordering::SeqCst) {
-                                    break;
-                                }
-
-                                ping_interval.tick().await;
-
-                                // Send ping like official Python SDK (every 20 seconds)
-                                if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await {
-                                    log::error!("Failed to send client ping: {:?}", e);
-                                    break;
-                                }
-
-                                if let Err(e) = write.flush().await {
-                                    log::error!("Failed to flush client ping: {:?}", e);
-                                    break;
-                                }
-
-                                log::info!("🏓 [CLIENT_PING] Sent ping to server, waiting for pong (10s timeout)");
-
-                                // Wait for pong response with 10 second timeout (like Python SDK)
-                                match tokio::time::timeout(std::time::Duration::from_secs(10), pong_rx.recv()).await {
-                                    Ok(Some(_)) => {
-                                        log::info!("🏓 [PONG_TIMEOUT] Received pong within timeout");
-                                    }
-                                    Ok(None) => {
-                                        log::error!("🏓 [PONG_TIMEOUT] Pong channel closed");
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        log::error!("🏓 [PONG_TIMEOUT] No pong received within 10 seconds - forcing reconnect");
-                                        break;
-                                    }
-                                }
-                            }
-                        });
+                        // Disable client-side ping - focus on server ping response only
+                        log::info!("🏓 [PING_STRATEGY] Using server-ping-response-only strategy");
 
                         // Handle messages in read loop
                         log::debug!("Starting WebSocket message handling loop");
@@ -3218,14 +3176,24 @@ impl LighterConnector {
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(data) => {
-                                        log::trace!("Received server ping (size: {}), auto-handled by library", data.len());
-                                        // Let the library handle server pings automatically
-                                        // We focus on client-side pings like official Python SDK
+                                        log::info!("🏓 [SERVER_PING] Received ping (size: {}), sending immediate pong", data.len());
+
+                                        // Send immediate pong response to server ping
+                                        use futures::SinkExt;
+                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await {
+                                            log::error!("❌ [PONG] Failed to send pong: {:?}", e);
+                                            break;
+                                        }
+
+                                        if let Err(e) = write.flush().await {
+                                            log::error!("❌ [PONG] Failed to flush pong: {:?}", e);
+                                            break;
+                                        }
+
+                                        log::info!("🏓 [SERVER_PONG] Sent pong response to server");
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(data) => {
-                                        log::info!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", data.len());
-                                        // Notify ping task that pong was received
-                                        let _ = pong_tx.send(());
+                                        log::trace!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", data.len());
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
                                         log::info!("WebSocket close frame received: {:?}", frame);
@@ -3250,9 +3218,6 @@ impl LighterConnector {
                                 }
                             }
                         }
-
-                        // Stop ping task when message loop ends
-                        ping_task.abort();
 
                         log::warn!(
                             "WebSocket message loop ended. Connection lost - will attempt reconnection in 3 seconds."
