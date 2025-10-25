@@ -3090,7 +3090,6 @@ impl LighterConnector {
                 log::info!("Attempting WebSocket connection to: {}", ws_url_clone);
 
                 // Try to establish connection
-                // Use default configuration as config is causing issues
                 let connection_result = tokio_tungstenite::connect_async(&ws_url_clone).await;
 
                 match connection_result {
@@ -3136,9 +3135,12 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
-                        // Handle messages without splitting - allows immediate pong response
+                        // Split stream for proper pong handling with explicit flush
+                        let (mut write, mut read) = ws_stream.split();
+
+                        // Handle messages in read loop with explicit pong handling
                         log::debug!("Starting WebSocket message handling loop");
-                        while let Some(message) = ws_stream.next().await {
+                        while let Some(message) = read.next().await {
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
@@ -3169,23 +3171,24 @@ impl LighterConnector {
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(data) => {
                                         log::info!(
-                                            "🏓 [PING] Received WebSocket ping (size: {}), sending immediate pong response",
+                                            "🏓 [PING] Received WebSocket ping (size: {}), sending pong with explicit flush",
                                             data.len()
                                         );
 
-                                        // Send pong immediately to prevent "no pong" disconnections
-                                        if let Err(e) = ws_stream
-                                            .send(tokio_tungstenite::tungstenite::Message::Pong(
-                                                data,
-                                            ))
-                                            .await
-                                        {
-                                            log::error!("❌ [PONG] Failed to send immediate pong response: {:?}", e);
+                                        // Send pong through separate write stream with explicit flush
+                                        use futures::SinkExt;
+                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await {
+                                            log::error!("❌ [PONG] Failed to send pong: {:?}", e);
                                             break;
                                         }
-                                        log::info!(
-                                            "🏓 [PONG] Sent immediate WebSocket pong response"
-                                        );
+
+                                        // Explicitly flush the write buffer to ensure immediate transmission
+                                        if let Err(e) = write.flush().await {
+                                            log::error!("❌ [PONG] Failed to flush pong: {:?}", e);
+                                            break;
+                                        }
+
+                                        log::info!("🏓 [PONG] Sent and flushed WebSocket pong response");
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(_) => {
                                         log::trace!("Received WebSocket pong - connection healthy");
