@@ -3138,15 +3138,12 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
-                        // Split stream for ping/pong handling like official SDK
-                        let (mut write, mut read) = ws_stream.split();
+                        // Use unified stream - let tokio-tungstenite handle ping/pong automatically
+                        log::info!("🏓 [PING_STRATEGY] Using fully automatic ping/pong handling");
 
-                        // Disable client-side ping - focus on server ping response only
-                        log::info!("🏓 [PING_STRATEGY] Using server-ping-response-only strategy");
-
-                        // Handle messages in read loop
+                        // Handle messages in unified stream loop
                         log::debug!("Starting WebSocket message handling loop");
-                        while let Some(message) = read.next().await {
+                        while let Some(message) = ws_stream.next().await {
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
@@ -3175,22 +3172,10 @@ impl LighterConnector {
                                             );
                                         }
                                     }
-                                    tokio_tungstenite::tungstenite::Message::Ping(data) => {
-                                        log::info!("🏓 [SERVER_PING] Received ping (size: {}), sending immediate pong", data.len());
-
-                                        // Send immediate pong response to server ping
-                                        use futures::SinkExt;
-                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await {
-                                            log::error!("❌ [PONG] Failed to send pong: {:?}", e);
-                                            break;
-                                        }
-
-                                        if let Err(e) = write.flush().await {
-                                            log::error!("❌ [PONG] Failed to flush pong: {:?}", e);
-                                            break;
-                                        }
-
-                                        log::info!("🏓 [SERVER_PONG] Sent pong response to server");
+                                    tokio_tungstenite::tungstenite::Message::Ping(_data) => {
+                                        log::trace!("🏓 [AUTO_PING] Received ping, letting library handle pong automatically");
+                                        // Let tokio-tungstenite handle ping/pong automatically
+                                        // Manual handling may be causing conflicts
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(data) => {
                                         log::trace!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", data.len());
