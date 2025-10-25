@@ -3141,8 +3141,10 @@ impl LighterConnector {
                         // Split stream for ping/pong handling like official SDK
                         let (mut write, mut read) = ws_stream.split();
 
-                        // Create ping task following official Python SDK pattern (20s interval)
+                        // Create ping task with manual pong timeout (like Python SDK: ping_interval=20, ping_timeout=10)
                         let ping_is_running = is_running.clone();
+                        let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
                         let ping_task = tokio::spawn(async move {
                             let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
                             ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3165,7 +3167,22 @@ impl LighterConnector {
                                     break;
                                 }
 
-                                log::info!("🏓 [CLIENT_PING] Sent ping to server (20s interval like Python SDK)");
+                                log::info!("🏓 [CLIENT_PING] Sent ping to server, waiting for pong (10s timeout)");
+
+                                // Wait for pong response with 10 second timeout (like Python SDK)
+                                match tokio::time::timeout(std::time::Duration::from_secs(10), pong_rx.recv()).await {
+                                    Ok(Some(_)) => {
+                                        log::info!("🏓 [PONG_TIMEOUT] Received pong within timeout");
+                                    }
+                                    Ok(None) => {
+                                        log::error!("🏓 [PONG_TIMEOUT] Pong channel closed");
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        log::error!("🏓 [PONG_TIMEOUT] No pong received within 10 seconds - forcing reconnect");
+                                        break;
+                                    }
+                                }
                             }
                         });
 
@@ -3205,8 +3222,10 @@ impl LighterConnector {
                                         // Let the library handle server pings automatically
                                         // We focus on client-side pings like official Python SDK
                                     }
-                                    tokio_tungstenite::tungstenite::Message::Pong(_) => {
-                                        log::trace!("Received WebSocket pong - connection healthy");
+                                    tokio_tungstenite::tungstenite::Message::Pong(data) => {
+                                        log::info!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", data.len());
+                                        // Notify ping task that pong was received
+                                        let _ = pong_tx.send(());
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
                                         log::info!("WebSocket close frame received: {:?}", frame);
