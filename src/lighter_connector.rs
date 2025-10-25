@@ -3132,18 +3132,15 @@ impl LighterConnector {
 
                             loop {
                                 tokio::select! {
-                                    // Handle ping interval
+                                    // Handle ping interval (disabled automatic ping)
                                     _ = ping_interval.tick() => {
                                         if !ping_is_running.load(Ordering::SeqCst) {
                                             break;
                                         }
 
-                                        // Send ping every 3 seconds
-                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await {
-                                            log::warn!("Failed to send ping: {:?}", e);
-                                            break;
-                                        }
-                                        log::trace!("Sent WebSocket ping (3s interval)");
+                                        // Disabled automatic ping - server handles ping/pong timing
+                                        // Only respond to server pings to avoid "no pong" disconnections
+                                        log::trace!("Ping interval tick (automatic ping disabled for server compatibility)");
                                     }
                                     // Handle pong responses
                                     Some(pong_data) = pong_rx.recv() => {
