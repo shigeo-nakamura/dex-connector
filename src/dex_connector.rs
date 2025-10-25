@@ -71,6 +71,7 @@ pub trait DexConnector: Send + Sync {
         side: OrderSide,
         price: Option<Decimal>,
         spread: Option<i64>,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError>;
 
     async fn create_trigger_order(
@@ -82,6 +83,7 @@ pub trait DexConnector: Send + Sync {
         is_market: bool,
         tpsl: TpSl,
         reduce_only: bool,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError>;
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;

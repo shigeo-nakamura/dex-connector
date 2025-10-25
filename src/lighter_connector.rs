@@ -4,6 +4,7 @@
 const ORDER_TYPE_LIMIT: u32 = 0;
 const ORDER_TYPE_IOC: u32 = 1;
 const ORDER_TYPE_TRIGGER: u32 = 2;
+const ORDER_TYPE_FOK: u32 = 2; // Fill-or-Kill (same value as trigger in Lighter Protocol)
 
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
@@ -654,30 +655,6 @@ impl LighterConnector {
         Ok(server_pubkey)
     }
 
-    /// Create native order without Python SDK
-    #[allow(dead_code)]
-    async fn create_order_native(
-        &self,
-        market_id: u32,
-        side: u32,
-        tif: u32,
-        base_amount: u64,
-        price: u64,
-        client_order_id: Option<String>,
-    ) -> Result<CreateOrderResponse, DexError> {
-        self.create_order_native_with_type(
-            market_id,
-            side,
-            tif,
-            base_amount,
-            price,
-            client_order_id,
-            0,
-            false,
-        )
-        .await
-    }
-
     async fn create_order_native_with_type(
         &self,
         market_id: u32,
@@ -688,6 +665,7 @@ impl LighterConnector {
         client_order_id: Option<String>,
         order_type: u32,
         reduce_only: bool,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         let _client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
@@ -709,16 +687,22 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price = 0u64; // no trigger
                                   // For market orders and IOC orders, use 0 as expiry. For GTC orders, use future timestamp
-        let order_expiry = if order_type == 1 || tif == 0 {
+        let order_expiry = if order_type == ORDER_TYPE_IOC || tif == 0 {
             // ORDER_TYPE_MARKET or IOC orders
             0i64 // NilOrderExpiry for immediate-or-cancel orders
         } else {
-            // For GTC limit orders, use current timestamp + 24 hours
+            // For GTC limit orders, use passed expiry_secs or default to 24 hours
+            let expiry_duration_ms = if let Some(expiry_secs) = expiry_secs {
+                expiry_secs * 1000 // Convert seconds to milliseconds
+            } else {
+                24 * 60 * 60 * 1000 // Default 24 hours in milliseconds
+            };
+
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64;
-            now_ms + (24 * 60 * 60 * 1000) // 24 hours in milliseconds
+            now_ms + (expiry_duration_ms as i64)
         };
 
         // Use actual parameters passed to function instead of hardcoded test values
@@ -851,6 +835,7 @@ impl LighterConnector {
         client_order_id: Option<String>,
         order_type: u32,
         reduce_only: bool,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         let _client_id = client_order_id.unwrap_or_else(|| format!("rust-trigger-{}", timestamp));
@@ -872,25 +857,28 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price_param = trigger_price;
 
-        // For trigger orders (StopLoss=2, TakeProfit=4, etc.), use long expiry (28 days) as Go SDK requires MinOrderExpiry >= 1
+        // For trigger orders, use passed expiry_secs or default to 28 days
         let order_expiry = if order_type == ORDER_TYPE_TRIGGER
             || order_type == 4
             || order_type == 3
             || order_type == 5
         {
-            // Use 28 days expiry for all trigger orders (in milliseconds)
-            let expiry_ms = 28 * 24 * 60 * 60 * 1000; // 28 days
-            (chrono::Utc::now().timestamp_millis() as u64 + expiry_ms) as i64
+            // Use passed expiry_secs or default to 28 days for trigger orders
+            let expiry_duration_ms = if let Some(expiry_secs) = expiry_secs {
+                // Minimum 60 seconds for trigger orders as Go SDK requires MinOrderExpiry >= 1
+                let min_expiry_secs = 60;
+                std::cmp::max(min_expiry_secs, expiry_secs) * 1000
+            } else {
+                28 * 24 * 60 * 60 * 1000 // Default 28 days in milliseconds
+            };
+            (chrono::Utc::now().timestamp_millis() as u64 + expiry_duration_ms) as i64
         } else {
-            // For regular orders, set expiry based on TRADING_PERIOD
-            let trading_period_secs = std::env::var("TRADING_PERIOD_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(300); // Default to 5 minutes if not set
-
-            let target_expiry_secs = trading_period_secs.saturating_sub(5);
-            let min_expiry_secs = 60;
-            let expiry_duration_ms = std::cmp::max(min_expiry_secs, target_expiry_secs) * 1000;
+            // For regular orders, use passed expiry_secs or default
+            let expiry_duration_ms = if let Some(expiry_secs) = expiry_secs {
+                expiry_secs * 1000
+            } else {
+                24 * 60 * 60 * 1000 // Default 24 hours in milliseconds
+            };
             (chrono::Utc::now().timestamp_millis() as u64 + expiry_duration_ms) as i64
         };
 
@@ -2223,6 +2211,7 @@ impl DexConnector for LighterConnector {
         side: OrderSide,
         price: Option<Decimal>,
         _spread: Option<i64>,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         // Convert symbol to market_id (this would typically be a lookup)
         let market_id = match symbol {
@@ -2259,8 +2248,8 @@ impl DexConnector for LighterConnector {
                 if spread_ticks < 0 {
                     // Negative spread values specify TIF
                     let tif_value = match spread_ticks {
-                        -1 => 1u32, // IOC
-                        -2 => 2u32, // FOK
+                        -1 => ORDER_TYPE_IOC, // IOC
+                        -2 => ORDER_TYPE_FOK, // FOK
                         _ => {
                             log::warn!("Invalid TIF spread value: {}, using GTC", spread_ticks);
                             default_tif
@@ -2292,7 +2281,7 @@ impl DexConnector for LighterConnector {
 
             log::debug!("Creating limit order: side={}, original_price={}, spread_param={:?}, final_price={}, TIF={} ({}), scaled_price={}, size={}, scaled_base_amount={}",
                 side_value, p, _spread, final_price, order_tif, tif_name, price_val, size, base_amount);
-            (price_val, 0u32, order_tif)
+            (price_val, ORDER_TYPE_LIMIT, order_tif)
         } else {
             // Market order - get current price and set protection price
             let ticker = self.get_ticker(symbol, None).await?;
@@ -2319,7 +2308,7 @@ impl DexConnector for LighterConnector {
                 side_value
             );
 
-            (price_val, 1u32, 0u32) // order_type=1 (market), tif=0 (IOC)
+            (price_val, ORDER_TYPE_IOC, 0u32) // order_type=IOC (market), tif=0 (IOC)
         };
 
         // Use native Rust implementation for Lighter signatures
@@ -2333,6 +2322,7 @@ impl DexConnector for LighterConnector {
                 None,
                 order_type,
                 false,
+                expiry_secs,
             )
             .await;
 
@@ -2361,6 +2351,7 @@ impl DexConnector for LighterConnector {
         is_market: bool,
         tpsl: TpSl,
         reduce_only: bool,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         log::info!(
             "🎯 [TRIGGER_ORDER] Creating {} trigger order for {}: size={}, trigger_price={}, is_market={}",
@@ -2426,6 +2417,7 @@ impl DexConnector for LighterConnector {
             None,
             order_type,
             reduce_only,
+            expiry_secs,
         )
         .await
     }
@@ -2526,8 +2518,6 @@ impl DexConnector for LighterConnector {
                 log::info!(
                     "Cancel all orders submitted successfully - trusting server response without verification"
                 );
-
-                return Ok(());
             }
         }
 
@@ -2776,6 +2766,7 @@ impl DexConnector for LighterConnector {
                             None,
                             1,    // Market order type
                             true, // reduce_only=true for position closing (prevents overshooting)
+                            None, // No expiry for position closing
                         )
                         .await
                     {
@@ -2836,112 +2827,6 @@ impl DexConnector for LighterConnector {
 }
 
 impl LighterConnector {
-    // Get open orders directly from server API (bypassing WebSocket cache)
-    async fn get_open_orders_from_server(
-        &self,
-        symbol: &str,
-    ) -> Result<OpenOrdersResponse, DexError> {
-        log::debug!(
-            "[API_DIRECT] get_open_orders_from_server called for symbol: {} (server API)",
-            symbol
-        );
-
-        // Use /api/v1/accountActiveOrders to get real server state
-        // Convert symbol to market_id (BTC = 1)
-        let market_id = match symbol {
-            "BTC" => 1,
-            _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
-        };
-
-        let url = format!(
-            "{}/api/v1/accountActiveOrders?account_index={}&market_id={}&api_key_index={}",
-            self.base_url, self.account_index, market_id, self.api_key_index
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| {
-                DexError::Other(format!("Failed to get open orders from server: {}", e))
-            })?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to read server response: {}", e)))?;
-
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "Server API error {}: {}",
-                status, response_text
-            )));
-        }
-
-        // Parse response and convert to OpenOrdersResponse format
-        let server_response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse server response: {}", e)))?;
-
-        log::debug!(
-            "[API_DIRECT] Server response for {}: {}",
-            symbol,
-            response_text
-        );
-
-        // Convert server response to our format
-        let orders =
-            if let Some(orders_array) = server_response.get("orders").and_then(|v| v.as_array()) {
-                orders_array
-                    .iter()
-                    .filter_map(|order| {
-                        // Extract order information from server response
-                        let id = order
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let side_num = order.get("side").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let side = if side_num == 0 {
-                            OrderSide::Long
-                        } else {
-                            OrderSide::Short
-                        };
-                        let size = order
-                            .get("size")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(Decimal::ZERO);
-                        let price = order
-                            .get("price")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(Decimal::ZERO);
-
-                        Some(OpenOrder {
-                            order_id: id,
-                            symbol: symbol.to_string(),
-                            side,
-                            size,
-                            price,
-                            status: "open".to_string(),
-                        })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        log::debug!(
-            "[API_DIRECT] Returning {} orders for {} from server API",
-            orders.len(),
-            symbol
-        );
-
-        Ok(OpenOrdersResponse { orders })
-    }
     /// Update order tracking after order creation
     async fn update_order_tracking_after_create(
         &self,
@@ -3093,7 +2978,12 @@ impl LighterConnector {
                 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
                 let config = WebSocketConfig::default();
 
-                let connection_result = tokio_tungstenite::connect_async_with_config(&ws_url_clone, Some(config), false).await;
+                let connection_result = tokio_tungstenite::connect_async_with_config(
+                    &ws_url_clone,
+                    Some(config),
+                    false,
+                )
+                .await;
 
                 match connection_result {
                     Ok((mut ws_stream, _)) => {

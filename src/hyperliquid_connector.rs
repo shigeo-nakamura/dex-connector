@@ -1610,6 +1610,7 @@ impl DexConnector for HyperliquidConnector {
         side: OrderSide,
         price: Option<Decimal>,
         spread: Option<i64>,
+        _expiry_secs: Option<u64>, // Ignored for Hyperliquid
     ) -> Result<CreateOrderResponse, DexError> {
         let (price, time_in_force) = match price {
             Some(v) => {
@@ -1736,6 +1737,7 @@ impl DexConnector for HyperliquidConnector {
         is_market: bool,
         tpsl: TpSl,
         _reduce_only: bool,
+        _expiry_secs: Option<u64>, // Ignored for Hyperliquid
     ) -> Result<CreateOrderResponse, DexError> {
         // Resolve the exchange asset code
         let asset = resolve_coin(symbol, &self.spot_index_map);
@@ -1906,7 +1908,7 @@ impl DexConnector for HyperliquidConnector {
                 };
                 let size = position.szi.abs();
                 let _ = self
-                    .create_order(&external_sym, size, reversed_side, None, None)
+                    .create_order(&external_sym, size, reversed_side, None, None, None) // No expiry for position closing
                     .await;
             }
         }
