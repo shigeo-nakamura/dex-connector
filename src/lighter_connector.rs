@@ -3089,8 +3089,11 @@ impl LighterConnector {
 
                 log::info!("Attempting WebSocket connection to: {}", ws_url_clone);
 
-                // Try to establish connection
-                let connection_result = tokio_tungstenite::connect_async(&ws_url_clone).await;
+                // Try to establish connection with ping configuration like official Python SDK
+                use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+                let config = WebSocketConfig::default();
+
+                let connection_result = tokio_tungstenite::connect_async_with_config(&ws_url_clone, Some(config), false).await;
 
                 match connection_result {
                     Ok((mut ws_stream, _)) => {
@@ -3135,10 +3138,38 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
-                        // Split stream for proper pong handling with explicit flush
+                        // Split stream for ping/pong handling like official SDK
                         let (mut write, mut read) = ws_stream.split();
 
-                        // Handle messages in read loop with explicit pong handling
+                        // Create ping task following official Python SDK pattern (20s interval)
+                        let ping_is_running = is_running.clone();
+                        let ping_task = tokio::spawn(async move {
+                            let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+                            ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                            loop {
+                                if !ping_is_running.load(Ordering::SeqCst) {
+                                    break;
+                                }
+
+                                ping_interval.tick().await;
+
+                                // Send ping like official Python SDK (every 20 seconds)
+                                if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await {
+                                    log::error!("Failed to send client ping: {:?}", e);
+                                    break;
+                                }
+
+                                if let Err(e) = write.flush().await {
+                                    log::error!("Failed to flush client ping: {:?}", e);
+                                    break;
+                                }
+
+                                log::info!("🏓 [CLIENT_PING] Sent ping to server (20s interval like Python SDK)");
+                            }
+                        });
+
+                        // Handle messages in read loop
                         log::debug!("Starting WebSocket message handling loop");
                         while let Some(message) = read.next().await {
                             if !is_running.load(Ordering::SeqCst) {
@@ -3170,25 +3201,9 @@ impl LighterConnector {
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(data) => {
-                                        log::info!(
-                                            "🏓 [PING] Received WebSocket ping (size: {}), sending pong with explicit flush",
-                                            data.len()
-                                        );
-
-                                        // Send pong through separate write stream with explicit flush
-                                        use futures::SinkExt;
-                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await {
-                                            log::error!("❌ [PONG] Failed to send pong: {:?}", e);
-                                            break;
-                                        }
-
-                                        // Explicitly flush the write buffer to ensure immediate transmission
-                                        if let Err(e) = write.flush().await {
-                                            log::error!("❌ [PONG] Failed to flush pong: {:?}", e);
-                                            break;
-                                        }
-
-                                        log::info!("🏓 [PONG] Sent and flushed WebSocket pong response");
+                                        log::trace!("Received server ping (size: {}), auto-handled by library", data.len());
+                                        // Let the library handle server pings automatically
+                                        // We focus on client-side pings like official Python SDK
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(_) => {
                                         log::trace!("Received WebSocket pong - connection healthy");
@@ -3216,6 +3231,9 @@ impl LighterConnector {
                                 }
                             }
                         }
+
+                        // Stop ping task when message loop ends
+                        ping_task.abort();
 
                         log::warn!(
                             "WebSocket message loop ended. Connection lost - will attempt reconnection in 3 seconds."
