@@ -15,7 +15,7 @@ use crate::{
     OpenOrder, OpenOrdersResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
+use futures::stream::StreamExt;
 use reqwest::Client;
 use rust_decimal::prelude::{FromStr, ToPrimitive};
 use rust_decimal::Decimal;
@@ -2966,13 +2966,55 @@ impl LighterConnector {
         // Spawn WebSocket handler task with reconnection logic
         let ws_url_clone = ws_url.clone();
         tokio::spawn(async move {
+            use rand::Rng;
+
+            const BACKOFF_MAX_SECS: u64 = 60;
+            const BACKOFF_BASE: f64 = 1.5;
+
+            let mut reconnect_attempt = 0u32;
+            let mut last_reconnect_time = std::time::SystemTime::now();
+
+            async fn reconnect_backoff(attempt: u32) {
+                let pow = BACKOFF_BASE.powi(attempt.min(12) as i32);
+                let base_secs = (pow as f64).min(BACKOFF_MAX_SECS as f64);
+                let jitter_ms: i64 = rand::thread_rng().gen_range(0..=250);
+                let dur = std::time::Duration::from_secs_f64(base_secs)
+                    + std::time::Duration::from_millis(jitter_ms as u64);
+
+                log::debug!(
+                    "Reconnect backoff: attempt={}, delay={:.1}s",
+                    attempt,
+                    dur.as_secs_f64()
+                );
+                tokio::time::sleep(dur).await;
+            }
+
             loop {
                 if !is_running.load(Ordering::SeqCst) {
                     log::info!("WebSocket task stopping due to is_running flag");
                     break;
                 }
 
-                log::info!("Attempting WebSocket connection to: {}", ws_url_clone);
+                // Reset attempt counter if enough time has passed since last reconnect
+                let now = std::time::SystemTime::now();
+                if let Ok(elapsed) = now.duration_since(last_reconnect_time) {
+                    if elapsed.as_secs() > 300 {
+                        // 5 minutes
+                        reconnect_attempt = 0;
+                        log::debug!("Reset reconnect attempt counter after successful period");
+                    }
+                }
+
+                if reconnect_attempt > 0 {
+                    reconnect_backoff(reconnect_attempt).await;
+                }
+
+                log::info!(
+                    "Attempting WebSocket connection to: {} (attempt: {})",
+                    ws_url_clone,
+                    reconnect_attempt + 1
+                );
+                last_reconnect_time = now;
 
                 // Try to establish connection with ping configuration like official Python SDK
                 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -3028,48 +3070,104 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
-                        // Create channel for sending pong messages
-                        let (pong_tx, mut pong_rx) =
-                            tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                        // Split the WebSocket stream for concurrent read/write operations
+                        use futures::sink::SinkExt;
+                        let (write, mut read) = ws_stream.split();
+                        let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
 
-                        // Create ping/write task with 3-second interval
+                        // Heartbeat strategy: idle-only client ping + immediate server pong
+                        const IDLE_PING_SECS: u64 = 30; // Idle-only client ping interval
+                        const PONG_TIMEOUT_SECS: u64 = 10; // Pong timeout for connection health
+                        const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
+
+                        use parking_lot::Mutex;
+                        use std::sync::atomic::{AtomicBool, AtomicU64};
+                        use std::time::{SystemTime, UNIX_EPOCH};
+
+                        fn now_secs() -> u64 {
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        }
+
+                        let last_rx = std::sync::Arc::new(AtomicU64::new(now_secs()));
+                        let last_tx = std::sync::Arc::new(AtomicU64::new(now_secs()));
+                        let last_server_ping = std::sync::Arc::new(AtomicU64::new(0));
+                        let pending_client_ping = std::sync::Arc::new(AtomicBool::new(false));
+                        let last_client_ping_payload =
+                            std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
+
+                        // Create ping/write task with intelligent heartbeat
                         let ping_is_running = is_running.clone();
-                        let ping_task = tokio::spawn(async move {
-                            let mut ping_interval =
-                                tokio::time::interval(std::time::Duration::from_secs(3));
-                            ping_interval
+                        let ping_last_rx = last_rx.clone();
+                        let ping_last_tx = last_tx.clone();
+                        let ping_last_server_ping = last_server_ping.clone();
+                        let ping_pending_client_ping = pending_client_ping.clone();
+                        let ping_last_client_ping_payload = last_client_ping_payload.clone();
+                        let ping_write = write.clone();
+
+                        let _ping_task = tokio::spawn(async move {
+                            let mut heartbeat_interval = tokio::time::interval(
+                                std::time::Duration::from_secs(HEARTBEAT_CHECK_SECS),
+                            );
+                            heartbeat_interval
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                             loop {
                                 tokio::select! {
-                                    // Handle ping interval
-                                    _ = ping_interval.tick() => {
+                                    // Handle heartbeat check interval
+                                    _ = heartbeat_interval.tick() => {
                                         if !ping_is_running.load(Ordering::SeqCst) {
                                             break;
                                         }
 
-                                        // Send ping every 3 seconds
-                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await {
-                                            log::warn!("Failed to send ping: {:?}", e);
-                                            break;
+                                        let now = now_secs();
+                                        let idle_rx = now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
+                                        let idle_tx = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
+                                        let seen_server_ping_recent =
+                                            now.saturating_sub(ping_last_server_ping.load(Ordering::SeqCst)) < IDLE_PING_SECS;
+
+                                        // Send client ping only if idle and no recent server ping
+                                        if !seen_server_ping_recent
+                                            && !ping_pending_client_ping.load(Ordering::SeqCst)
+                                            && idle_rx >= IDLE_PING_SECS
+                                            && idle_tx >= IDLE_PING_SECS
+                                        {
+                                            // Send ping with timestamp payload for echo verification
+                                            let payload: [u8; 8] = (now as u64).to_be_bytes();
+                                            *ping_last_client_ping_payload.lock() = payload.to_vec();
+
+                                            if let Err(e) = ping_write.lock().await.send(
+                                                tokio_tungstenite::tungstenite::Message::Ping(payload.to_vec())
+                                            ).await {
+                                                log::warn!("Failed to send idle client ping: {:?}", e);
+                                                break;
+                                            }
+
+                                            ping_pending_client_ping.store(true, Ordering::SeqCst);
+                                            ping_last_tx.store(now, Ordering::SeqCst);
+                                            log::trace!("Sent idle client ping (idle_rx: {}s, idle_tx: {}s)", idle_rx, idle_tx);
                                         }
-                                        log::trace!("Sent WebSocket ping (3s interval)");
-                                    }
-                                    // Handle pong responses
-                                    Some(pong_data) = pong_rx.recv() => {
-                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_data)).await {
-                                            log::error!("Failed to send pong response: {:?}", e);
-                                            break;
+
+                                        // Check for pong timeout
+                                        if ping_pending_client_ping.load(Ordering::SeqCst) {
+                                            let waited = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
+                                            if waited >= PONG_TIMEOUT_SECS {
+                                                log::warn!("Pong timeout ({}s) -> closing connection for reconnect", waited);
+                                                let _ = ping_write.lock().await.close().await;
+                                                break;
+                                            }
                                         }
-                                        log::debug!("Sent WebSocket pong response");
                                     }
                                 }
                             }
+                            log::debug!("Heartbeat task ended");
                         });
 
                         // Handle messages in this connection
                         log::debug!("Starting WebSocket message handling loop");
-                        while let Some(message) = ws_stream.next().await {
+                        while let Some(message) = read.next().await {
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
@@ -3079,6 +3177,10 @@ impl LighterConnector {
                                 Ok(message) => match message {
                                     tokio_tungstenite::tungstenite::Message::Text(text) => {
                                         log::trace!("WebSocket text message: {}", text);
+
+                                        // Update last received timestamp for any text message
+                                        let now = now_secs();
+                                        last_rx.store(now, Ordering::SeqCst);
 
                                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
                                             Self::handle_websocket_message(
@@ -3098,13 +3200,47 @@ impl LighterConnector {
                                             );
                                         }
                                     }
-                                    tokio_tungstenite::tungstenite::Message::Ping(_data) => {
-                                        log::trace!("🏓 [AUTO_PING] Received ping, letting library handle pong automatically");
-                                        // Let tokio-tungstenite handle ping/pong automatically
-                                        // Manual handling may be causing conflicts
+                                    tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                                        // Server ping -> immediate pong response
+                                        let now = now_secs();
+                                        last_server_ping.store(now, Ordering::SeqCst);
+                                        last_rx.store(now, Ordering::SeqCst);
+
+                                        if let Err(e) = write
+                                            .lock()
+                                            .await
+                                            .send(tokio_tungstenite::tungstenite::Message::Pong(
+                                                payload.clone(),
+                                            ))
+                                            .await
+                                        {
+                                            log::warn!(
+                                                "Failed to send immediate pong response: {:?}",
+                                                e
+                                            );
+                                            break;
+                                        }
+
+                                        last_tx.store(now, Ordering::SeqCst);
+                                        log::trace!("🏓 [SERVER_PING] Sent immediate pong response to server ping (payload size: {})", payload.len());
                                     }
-                                    tokio_tungstenite::tungstenite::Message::Pong(data) => {
-                                        log::trace!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", data.len());
+                                    tokio_tungstenite::tungstenite::Message::Pong(payload) => {
+                                        // Pong response - check if it matches our client ping
+                                        let now = now_secs();
+                                        last_rx.store(now, Ordering::SeqCst);
+
+                                        let expected_payload =
+                                            last_client_ping_payload.lock().clone();
+                                        if !expected_payload.is_empty()
+                                            && payload == expected_payload
+                                        {
+                                            pending_client_ping.store(false, Ordering::SeqCst);
+                                            let ping_time = last_tx.load(Ordering::SeqCst);
+                                            let rtt = now.saturating_sub(ping_time);
+                                            log::trace!("🏓 [CLIENT_PONG] Matched pong for client ping (RTT: {}s)", rtt);
+                                        } else {
+                                            log::trace!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", payload.len());
+                                        }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
                                         log::info!("WebSocket close frame received: {:?}", frame);
@@ -3131,19 +3267,28 @@ impl LighterConnector {
                         }
 
                         log::warn!(
-                            "WebSocket message loop ended. Connection lost - will attempt reconnection in 3 seconds."
+                            "WebSocket message loop ended. Connection lost - will attempt reconnection with backoff."
                         );
+                        reconnect_attempt += 1;
                     }
                     Err(e) => {
-                        log::error!(
-                            "Failed to connect to WebSocket: {}. Will retry in 3 seconds.",
-                            e
-                        );
+                        reconnect_attempt += 1;
+
+                        // Check for 429 Too Many Requests
+                        let error_str = e.to_string();
+                        if error_str.contains("429") || error_str.contains("Too Many Requests") {
+                            log::error!(
+                                "WebSocket connection failed with rate limit (429): {}. Attempt: {}. Using exponential backoff.",
+                                e, reconnect_attempt
+                            );
+                        } else {
+                            log::error!(
+                                "Failed to connect to WebSocket: {}. Attempt: {}. Will retry with backoff.",
+                                e, reconnect_attempt
+                            );
+                        }
                     }
                 }
-
-                // Wait before reconnection attempt
-                tokio::time::sleep(Duration::from_secs(5)).await;
             }
 
             log::info!("WebSocket task ended");
