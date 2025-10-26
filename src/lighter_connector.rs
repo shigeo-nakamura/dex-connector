@@ -3028,10 +3028,46 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
-                        // Use unified stream - let tokio-tungstenite handle ping/pong automatically
-                        log::info!("🏓 [PING_STRATEGY] Using fully automatic ping/pong handling");
+                        // Create channel for sending pong messages
+                        let (pong_tx, mut pong_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-                        // Handle messages in unified stream loop
+                        // Create ping/write task with 3-second interval
+                        let ping_is_running = is_running.clone();
+                        let ping_task = tokio::spawn(async move {
+                            let mut ping_interval =
+                                tokio::time::interval(std::time::Duration::from_secs(3));
+                            ping_interval
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                            loop {
+                                tokio::select! {
+                                    // Handle ping interval
+                                    _ = ping_interval.tick() => {
+                                        if !ping_is_running.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+
+                                        // Send ping every 3 seconds
+                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await {
+                                            log::warn!("Failed to send ping: {:?}", e);
+                                            break;
+                                        }
+                                        log::trace!("Sent WebSocket ping (3s interval)");
+                                    }
+                                    // Handle pong responses
+                                    Some(pong_data) = pong_rx.recv() => {
+                                        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_data)).await {
+                                            log::error!("Failed to send pong response: {:?}", e);
+                                            break;
+                                        }
+                                        log::debug!("Sent WebSocket pong response");
+                                    }
+                                }
+                            }
+                        });
+
+                        // Handle messages in this connection
                         log::debug!("Starting WebSocket message handling loop");
                         while let Some(message) = ws_stream.next().await {
                             if !is_running.load(Ordering::SeqCst) {
