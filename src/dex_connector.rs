@@ -100,7 +100,7 @@ pub trait DexConnector: Send + Sync {
 
     async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError>;
 
-    async fn is_upcoming_maintenance(&self) -> bool;
+    async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool;
 
     async fn sign_evm_65b(&self, message: &str) -> Result<String, DexError>;
 

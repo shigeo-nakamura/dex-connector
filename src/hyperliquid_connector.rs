@@ -1919,11 +1919,11 @@ impl DexConnector for HyperliquidConnector {
         Ok(())
     }
 
-    async fn is_upcoming_maintenance(&self) -> bool {
+    async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
         let info = self.maintenance.read().await;
         if let Some(start) = info.next_start {
             let now = Utc::now();
-            if now < start && (start - now) <= ChronoDuration::hours(6) {
+            if now < start && (start - now) <= ChronoDuration::hours(hours_ahead) {
                 return true;
             }
         }

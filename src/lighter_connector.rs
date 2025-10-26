@@ -15,6 +15,7 @@ use crate::{
     OpenOrder, OpenOrdersResponse, OrderSide, TickerResponse, TpSl,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::stream::StreamExt;
 use reqwest::Client;
 use rust_decimal::prelude::{FromStr, ToPrimitive};
@@ -29,6 +30,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::sync::RwLock;
+
+struct MaintenanceInfo {
+    next_start: Option<DateTime<Utc>>,
+    fetched_at: DateTime<Utc>,
+}
 
 // Priority message system for WebSocket sending
 #[derive(Debug)]
@@ -58,7 +65,7 @@ use secp256k1::{Message, Secp256k1, SecretKey};
 use sha3::{Digest, Keccak256};
 #[cfg(feature = "lighter-sdk")]
 use std::ffi::{CStr, CString};
-use tokio::{sync::RwLock, time::sleep};
+use tokio::time::sleep;
 use tokio_tungstenite;
 
 // FFI bindings for Go shared library (only with lighter-sdk feature)
@@ -162,6 +169,7 @@ pub struct LighterConnector {
     current_price: Arc<RwLock<Option<(Decimal, u64)>>>, // (price, timestamp)
     current_volume: Arc<RwLock<Option<Decimal>>>,
     order_book: Arc<RwLock<Option<LighterOrderBook>>>,
+    maintenance: Arc<RwLock<MaintenanceInfo>>,
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
 }
@@ -592,6 +600,10 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
+            maintenance: Arc::new(RwLock::new(MaintenanceInfo {
+                next_start: None,
+                fetched_at: Utc::now(),
+            })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -633,6 +645,10 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
+            maintenance: Arc::new(RwLock::new(MaintenanceInfo {
+                next_start: None,
+                fetched_at: Utc::now(),
+            })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -2816,7 +2832,14 @@ impl DexConnector for LighterConnector {
         Ok(())
     }
 
-    async fn is_upcoming_maintenance(&self) -> bool {
+    async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
+        let info = self.maintenance.read().await;
+        if let Some(start) = info.next_start {
+            let now = Utc::now();
+            if now < start && (start - now) <= ChronoDuration::hours(hours_ahead) {
+                return true;
+            }
+        }
         false
     }
 
@@ -3111,7 +3134,8 @@ impl LighterConnector {
                         let (ws_write, mut read) = ws_stream.split();
 
                         // Priority channel system for WebSocket messages
-                        let (tx_ctrl, mut rx_ctrl) = tokio::sync::mpsc::channel::<OutboundMessage>(64);  // Control messages (high priority)
+                        let (tx_ctrl, mut rx_ctrl) =
+                            tokio::sync::mpsc::channel::<OutboundMessage>(64); // Control messages (high priority)
 
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
@@ -3143,12 +3167,21 @@ impl LighterConnector {
                                 if is_pong {
                                     let latency_ms = send_duration.as_millis();
                                     if latency_ms > 50 {
-                                        log::warn!("🚨 [PONG_LATENCY] High pong send latency: {}ms", latency_ms);
+                                        log::warn!(
+                                            "🚨 [PONG_LATENCY] High pong send latency: {}ms",
+                                            latency_ms
+                                        );
                                     } else {
-                                        log::debug!("⚡ [PONG_LATENCY] Pong sent in {}ms", latency_ms);
+                                        log::debug!(
+                                            "⚡ [PONG_LATENCY] Pong sent in {}ms",
+                                            latency_ms
+                                        );
                                     }
                                 } else if is_priority {
-                                    log::trace!("📤 [CTRL_SENT] Control message sent in {}ms", send_duration.as_millis());
+                                    log::trace!(
+                                        "📤 [CTRL_SENT] Control message sent in {}ms",
+                                        send_duration.as_millis()
+                                    );
                                 }
                             }
 
@@ -3291,7 +3324,9 @@ impl LighterConnector {
 
                                         // Send Pong via high-priority control channel (non-blocking)
                                         let pong_msg = OutboundMessage::Control(
-                                            tokio_tungstenite::tungstenite::Message::Pong(payload.clone())
+                                            tokio_tungstenite::tungstenite::Message::Pong(
+                                                payload.clone(),
+                                            ),
                                         );
 
                                         if let Err(e) = tx_ctrl.try_send(pong_msg) {
@@ -3302,7 +3337,8 @@ impl LighterConnector {
                                             break;
                                         }
 
-                                        let queue_time_us = ping_received_time.elapsed().as_micros();
+                                        let queue_time_us =
+                                            ping_received_time.elapsed().as_micros();
                                         last_tx.store(now, Ordering::SeqCst);
                                         log::info!("✅ [PONG_QUEUED] Pong queued for server ping in {}μs (payload size: {})", queue_time_us, payload.len());
                                     }
