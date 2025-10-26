@@ -2493,32 +2493,37 @@ impl DexConnector for LighterConnector {
                 })?;
 
                 // Validate limit price vs trigger price for the order type
+                // The validation should be based on order execution direction, not position side
                 match (side, tpsl) {
                     (OrderSide::Long, TpSl::Sl) => {
-                        if limit_price > trigger_px {
+                        // Buy stop loss: limit should be >= trigger (worse price for buying)
+                        if limit_price < trigger_px {
                             return Err(DexError::Other(
-                                "For Long Stop Loss, limit_px must be <= trigger_px".into(),
+                                "For Buy Stop Loss, limit_px must be >= trigger_px".into(),
                             ));
                         }
                     }
                     (OrderSide::Short, TpSl::Sl) => {
-                        if limit_price < trigger_px {
+                        // Sell stop loss: limit should be <= trigger (worse price for selling)
+                        if limit_price > trigger_px {
                             return Err(DexError::Other(
-                                "For Short Stop Loss, limit_px must be >= trigger_px".into(),
+                                "For Sell Stop Loss, limit_px must be <= trigger_px".into(),
                             ));
                         }
                     }
                     (OrderSide::Long, TpSl::Tp) => {
-                        if limit_price < trigger_px {
+                        // Buy take profit: limit should be <= trigger (better price for buying)
+                        if limit_price > trigger_px {
                             return Err(DexError::Other(
-                                "For Long Take Profit, limit_px must be >= trigger_px".into(),
+                                "For Buy Take Profit, limit_px must be <= trigger_px".into(),
                             ));
                         }
                     }
                     (OrderSide::Short, TpSl::Tp) => {
-                        if limit_price > trigger_px {
+                        // Sell take profit: limit should be >= trigger (better price for selling)
+                        if limit_price < trigger_px {
                             return Err(DexError::Other(
-                                "For Short Take Profit, limit_px must be <= trigger_px".into(),
+                                "For Sell Take Profit, limit_px must be >= trigger_px".into(),
                             ));
                         }
                     }
