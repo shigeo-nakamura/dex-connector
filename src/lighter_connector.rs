@@ -30,6 +30,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Priority message system for WebSocket sending
+#[derive(Debug)]
+enum OutboundMessage {
+    Control(tokio_tungstenite::tungstenite::Message), // High priority: Pong, Close
+}
+
+impl OutboundMessage {
+    fn into_message(self) -> tokio_tungstenite::tungstenite::Message {
+        match self {
+            OutboundMessage::Control(msg) => msg,
+        }
+    }
+
+    fn is_pong(&self) -> bool {
+        match self {
+            OutboundMessage::Control(tokio_tungstenite::tungstenite::Message::Pong(_)) => true,
+            _ => false,
+        }
+    }
+}
+
 // Cryptographic imports
 #[cfg(feature = "lighter-sdk")]
 use libc::{c_char, c_int, c_longlong};
@@ -3031,6 +3052,21 @@ impl LighterConnector {
                     Ok((mut ws_stream, _)) => {
                         log::info!("WebSocket connected successfully");
 
+                        // Enable TCP_NODELAY for low-latency control frames (Ping/Pong)
+                        let stream = ws_stream.get_ref();
+                        match stream {
+                            tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
+                                if let Err(e) = tcp_stream.set_nodelay(true) {
+                                    log::warn!("Failed to set TCP_NODELAY: {:?}", e);
+                                } else {
+                                    log::debug!("✅ TCP_NODELAY enabled for WebSocket connection");
+                                }
+                            }
+                            _ => {
+                                log::debug!("TLS connection detected - TCP_NODELAY not set (requires deeper access)");
+                            }
+                        }
+
                         // Send subscription messages
                         let subscribe_orderbook = serde_json::json!({
                             "type": "subscribe",
@@ -3072,8 +3108,52 @@ impl LighterConnector {
 
                         // Split the WebSocket stream for concurrent read/write operations
                         use futures::sink::SinkExt;
-                        let (write, mut read) = ws_stream.split();
-                        let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
+                        let (ws_write, mut read) = ws_stream.split();
+
+                        // Priority channel system for WebSocket messages
+                        let (tx_ctrl, mut rx_ctrl) = tokio::sync::mpsc::channel::<OutboundMessage>(64);  // Control messages (high priority)
+
+                        // Create unified writer task with priority handling
+                        let writer_is_running = is_running.clone();
+                        let _writer_task = tokio::spawn(async move {
+                            let mut ws_write = ws_write;
+
+                            loop {
+                                if !writer_is_running.load(Ordering::SeqCst) {
+                                    break;
+                                }
+
+                                // Handle control messages
+                                let (msg, is_priority) = tokio::select! {
+                                    // High priority channel (control messages like Pong)
+                                    Some(msg) = rx_ctrl.recv() => (msg, true),
+                                    else => break,
+                                };
+
+                                let send_start = std::time::Instant::now();
+                                let is_pong = msg.is_pong();
+
+                                if let Err(e) = ws_write.send(msg.into_message()).await {
+                                    log::error!("WebSocket send failed: {:?}", e);
+                                    break;
+                                }
+
+                                let send_duration = send_start.elapsed();
+
+                                if is_pong {
+                                    let latency_ms = send_duration.as_millis();
+                                    if latency_ms > 50 {
+                                        log::warn!("🚨 [PONG_LATENCY] High pong send latency: {}ms", latency_ms);
+                                    } else {
+                                        log::debug!("⚡ [PONG_LATENCY] Pong sent in {}ms", latency_ms);
+                                    }
+                                } else if is_priority {
+                                    log::trace!("📤 [CTRL_SENT] Control message sent in {}ms", send_duration.as_millis());
+                                }
+                            }
+
+                            log::debug!("WebSocket writer task terminated");
+                        });
 
                         // Heartbeat strategy: idle-only client ping + immediate server pong
                         const IDLE_PING_SECS: u64 = 30; // Idle-only client ping interval
@@ -3098,14 +3178,14 @@ impl LighterConnector {
                         let last_client_ping_payload =
                             std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
 
-                        // Create ping/write task with intelligent heartbeat
+                        // Create ping/heartbeat task with priority channel access
                         let ping_is_running = is_running.clone();
-                        let ping_last_rx = last_rx.clone();
+                        let _ping_last_rx = last_rx.clone();
                         let ping_last_tx = last_tx.clone();
-                        let ping_last_server_ping = last_server_ping.clone();
+                        let _ping_last_server_ping = last_server_ping.clone();
                         let ping_pending_client_ping = pending_client_ping.clone();
                         let ping_last_client_ping_payload = last_client_ping_payload.clone();
-                        let ping_write = write.clone();
+                        let ping_tx_ctrl = tx_ctrl.clone();
 
                         let _ping_task = tokio::spawn(async move {
                             let mut heartbeat_interval = tokio::time::interval(
@@ -3123,31 +3203,28 @@ impl LighterConnector {
                                         }
 
                                         let now = now_secs();
-                                        let idle_rx = now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
                                         let idle_tx = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
-                                        let seen_server_ping_recent =
-                                            now.saturating_sub(ping_last_server_ping.load(Ordering::SeqCst)) < IDLE_PING_SECS;
 
-                                        // Send client ping only if idle and no recent server ping
-                                        if !seen_server_ping_recent
-                                            && !ping_pending_client_ping.load(Ordering::SeqCst)
-                                            && idle_rx >= IDLE_PING_SECS
+                                        // Send client ping regularly (every 30s) regardless of server ping activity
+                                        // This ensures server's ~120s client ping requirement is always satisfied
+                                        if !ping_pending_client_ping.load(Ordering::SeqCst)
                                             && idle_tx >= IDLE_PING_SECS
                                         {
                                             // Send ping with timestamp payload for echo verification
                                             let payload: [u8; 8] = (now as u64).to_be_bytes();
                                             *ping_last_client_ping_payload.lock() = payload.to_vec();
 
-                                            if let Err(e) = ping_write.lock().await.send(
+                                            let ping_msg = OutboundMessage::Control(
                                                 tokio_tungstenite::tungstenite::Message::Ping(payload.to_vec())
-                                            ).await {
-                                                log::warn!("Failed to send idle client ping: {:?}", e);
+                                            );
+                                            if let Err(e) = ping_tx_ctrl.send(ping_msg).await {
+                                                log::warn!("Failed to send regular client ping via channel: {:?}", e);
                                                 break;
                                             }
 
                                             ping_pending_client_ping.store(true, Ordering::SeqCst);
                                             ping_last_tx.store(now, Ordering::SeqCst);
-                                            log::trace!("Sent idle client ping (idle_rx: {}s, idle_tx: {}s)", idle_rx, idle_tx);
+                                            log::trace!("🏓 [CLIENT_PING] Sent regular client ping (idle_tx: {}s)", idle_tx);
                                         }
 
                                         // Check for pong timeout
@@ -3155,7 +3232,10 @@ impl LighterConnector {
                                             let waited = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
                                             if waited >= PONG_TIMEOUT_SECS {
                                                 log::warn!("Pong timeout ({}s) -> closing connection for reconnect", waited);
-                                                let _ = ping_write.lock().await.close().await;
+                                                let close_msg = OutboundMessage::Control(
+                                                    tokio_tungstenite::tungstenite::Message::Close(None)
+                                                );
+                                                let _ = ping_tx_ctrl.send(close_msg).await;
                                                 break;
                                             }
                                         }
@@ -3201,28 +3281,30 @@ impl LighterConnector {
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                                        // Server ping -> immediate pong response
+                                        // Server ping -> immediate pong response via priority channel
+                                        let ping_received_time = std::time::Instant::now();
                                         let now = now_secs();
                                         last_server_ping.store(now, Ordering::SeqCst);
                                         last_rx.store(now, Ordering::SeqCst);
 
-                                        if let Err(e) = write
-                                            .lock()
-                                            .await
-                                            .send(tokio_tungstenite::tungstenite::Message::Pong(
-                                                payload.clone(),
-                                            ))
-                                            .await
-                                        {
-                                            log::warn!(
-                                                "Failed to send immediate pong response: {:?}",
+                                        log::debug!("🏓 [SERVER_PING] Received server ping (payload size: {}), queueing immediate pong", payload.len());
+
+                                        // Send Pong via high-priority control channel (non-blocking)
+                                        let pong_msg = OutboundMessage::Control(
+                                            tokio_tungstenite::tungstenite::Message::Pong(payload.clone())
+                                        );
+
+                                        if let Err(e) = tx_ctrl.try_send(pong_msg) {
+                                            log::error!(
+                                                "🚨 [CRITICAL] Failed to queue pong response: {:?} - CHANNEL FULL!",
                                                 e
                                             );
                                             break;
                                         }
 
+                                        let queue_time_us = ping_received_time.elapsed().as_micros();
                                         last_tx.store(now, Ordering::SeqCst);
-                                        log::trace!("🏓 [SERVER_PING] Sent immediate pong response to server ping (payload size: {})", payload.len());
+                                        log::info!("✅ [PONG_QUEUED] Pong queued for server ping in {}μs (payload size: {})", queue_time_us, payload.len());
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(payload) => {
                                         // Pong response - check if it matches our client ping
@@ -3237,9 +3319,9 @@ impl LighterConnector {
                                             pending_client_ping.store(false, Ordering::SeqCst);
                                             let ping_time = last_tx.load(Ordering::SeqCst);
                                             let rtt = now.saturating_sub(ping_time);
-                                            log::trace!("🏓 [CLIENT_PONG] Matched pong for client ping (RTT: {}s)", rtt);
+                                            log::info!("✅ [CLIENT_PONG] Received pong for our client ping (RTT: {}s)", rtt);
                                         } else {
-                                            log::trace!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", payload.len());
+                                            log::debug!("🏓 [PONG_RECEIVED] Got pong response from server (size: {})", payload.len());
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
