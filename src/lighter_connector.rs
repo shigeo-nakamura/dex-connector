@@ -30,7 +30,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures::stream::StreamExt;
 use reqwest::Client;
 use rust_decimal::prelude::{FromStr, ToPrimitive};
 use rust_decimal::Decimal;
@@ -56,25 +55,8 @@ fn is_buy_for_tpsl(position_side: OrderSide) -> bool {
 
 struct MaintenanceInfo {
     next_start: Option<DateTime<Utc>>,
-    fetched_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
-struct ConnMeta {
-    epoch: u64,
-    local: std::net::SocketAddr,
-    peer: std::net::SocketAddr,
-}
-
-impl ConnMeta {
-    fn new(epoch: u64, local: std::net::SocketAddr, peer: std::net::SocketAddr) -> Self {
-        Self { epoch, local, peer }
-    }
-
-    fn log_prefix(&self) -> String {
-        format!("[{:03}]", self.epoch)
-    }
-}
 
 // Priority message system for WebSocket sending
 #[derive(Debug)]
@@ -643,7 +625,6 @@ impl LighterConnector {
             order_book: Arc::new(RwLock::new(None)),
             maintenance: Arc::new(RwLock::new(MaintenanceInfo {
                 next_start: None,
-                fetched_at: Utc::now(),
             })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
@@ -690,7 +671,6 @@ impl LighterConnector {
             order_book: Arc::new(RwLock::new(None)),
             maintenance: Arc::new(RwLock::new(MaintenanceInfo {
                 next_start: None,
-                fetched_at: Utc::now(),
             })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
@@ -3156,15 +3136,6 @@ impl LighterConnector {
             const BACKOFF_MAX_SECS: u64 = 60;
             const BACKOFF_BASE: f64 = 1.5;
 
-            // Connection metadata for race detection
-            #[derive(Debug, Clone)]
-            struct ConnMeta {
-                epoch: u64,
-                local: Option<std::net::SocketAddr>,
-                peer: Option<std::net::SocketAddr>,
-            }
-
-            let mut conn_epoch = 0u64;
             let mut reconnect_attempt = 0u32;
             let mut last_reconnect_time = std::time::SystemTime::now();
 
@@ -3220,14 +3191,10 @@ impl LighterConnector {
                 config.write_buffer_size = 128 * 1024; // 128KB write buffer
                 config.max_write_buffer_size = 1024 * 1024; // 1MB max write buffer
 
-                // Create custom connector with TCP optimizations
-                let connector = tokio_tungstenite::Connector::Plain;
-
-                let connection_result = tokio_tungstenite::connect_async_tls_with_config(
+                let connection_result = tokio_tungstenite::connect_async_with_config(
                     &ws_url_clone,
                     Some(config),
                     false,
-                    Some(connector),
                 )
                 .await;
 
@@ -3236,81 +3203,14 @@ impl LighterConnector {
                         // Increment connection epoch for race detection
                         let current_epoch = connection_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
-                        // Extract 4-tuple information for logging and apply TCP optimizations
+                        // Extract connection information for logging
                         let (local_addr, peer_addr) = match ws_stream.get_ref() {
-                            tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
-                                // Apply TCP optimizations for low latency
-                                if let Err(e) = tcp_stream.set_nodelay(true) {
-                                    log::warn!("Failed to set TCP_NODELAY: {}", e);
-                                }
-
-                                // Set socket-level options
-                                use std::os::unix::io::AsRawFd;
-                                let fd = tcp_stream.as_raw_fd();
-                                unsafe {
-                                    // Set SO_REUSEADDR and SO_REUSEPORT
-                                    let optval: libc::c_int = 1;
-                                    libc::setsockopt(
-                                        fd,
-                                        libc::SOL_SOCKET,
-                                        libc::SO_REUSEADDR,
-                                        &optval as *const _ as *const libc::c_void,
-                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                                    );
-
-                                    // Set TCP_USER_TIMEOUT to 30 seconds (30000ms)
-                                    let timeout: libc::c_int = 30000;
-                                    libc::setsockopt(
-                                        fd,
-                                        libc::IPPROTO_TCP,
-                                        18, // TCP_USER_TIMEOUT
-                                        &timeout as *const _ as *const libc::c_void,
-                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                                    );
-                                }
-
-                                match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
-                                    (Ok(local), Ok(peer)) => (local, peer),
-                                    _ => {
-                                        log::warn!(
-                                            "Failed to get socket addresses for epoch {}",
-                                            current_epoch
-                                        );
-                                        ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
-                                    }
-                                }
-                            }
                             tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream) => {
                                 let tcp_stream = tls_stream.get_ref().0;
 
                                 // Apply TCP optimizations for TLS connection
                                 if let Err(e) = tcp_stream.set_nodelay(true) {
                                     log::warn!("Failed to set TCP_NODELAY on TLS: {}", e);
-                                }
-
-                                // Set socket-level options for TLS connection
-                                use std::os::unix::io::AsRawFd;
-                                let fd = tcp_stream.as_raw_fd();
-                                unsafe {
-                                    // Set SO_REUSEADDR
-                                    let optval: libc::c_int = 1;
-                                    libc::setsockopt(
-                                        fd,
-                                        libc::SOL_SOCKET,
-                                        libc::SO_REUSEADDR,
-                                        &optval as *const _ as *const libc::c_void,
-                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                                    );
-
-                                    // Set TCP_USER_TIMEOUT to 30 seconds
-                                    let timeout: libc::c_int = 30000;
-                                    libc::setsockopt(
-                                        fd,
-                                        libc::IPPROTO_TCP,
-                                        18, // TCP_USER_TIMEOUT
-                                        &timeout as *const _ as *const libc::c_void,
-                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                                    );
                                 }
 
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
@@ -3325,7 +3225,7 @@ impl LighterConnector {
                                 }
                             }
                             _ => {
-                                log::warn!("Unknown connection type for epoch {}", current_epoch);
+                                log::warn!("Unexpected connection type for epoch {}", current_epoch);
                                 ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
                             }
                         };
@@ -3339,20 +3239,6 @@ impl LighterConnector {
                             peer_addr
                         );
 
-                        // Enable TCP_NODELAY for low-latency control frames (Ping/Pong)
-                        let stream = ws_stream.get_ref();
-                        match stream {
-                            tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
-                                if let Err(e) = tcp_stream.set_nodelay(true) {
-                                    log::warn!("Failed to set TCP_NODELAY: {:?}", e);
-                                } else {
-                                    log::debug!("✅ TCP_NODELAY enabled for WebSocket connection");
-                                }
-                            }
-                            _ => {
-                                log::debug!("TLS connection detected - TCP_NODELAY not set (requires deeper access)");
-                            }
-                        }
 
                         // Send subscription messages
                         let subscribe_orderbook = serde_json::json!({
@@ -3408,10 +3294,6 @@ impl LighterConnector {
                         let (tx_ctrl, mut rx_ctrl) =
                             tokio::sync::mpsc::channel::<OutboundMessage>(32);
 
-                        // Single-task pump: channel for application messages (non-ping/pong)
-                        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<
-                            tokio_tungstenite::tungstenite::Message,
-                        >(32);
 
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
@@ -3466,45 +3348,20 @@ impl LighterConnector {
                         });
 
                         // Heartbeat strategy: client-initiated ping + server ping response
-                        const CLIENT_PING_SECS: u64 = 30; // Client ping interval
-                        const CLIENT_PONG_TIMEOUT_SECS: u64 = 8; // Client pong timeout
                         const IDLE_PING_SECS: u64 = 20; // Legacy idle ping (kept for compatibility)
-                        const ACTIVE_PING_SECS: u64 = 30; // Legacy active ping (kept for compatibility)
                         const PONG_TIMEOUT_SECS: u64 = 10; // Legacy pong timeout (kept for compatibility)
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
 
-                        // Pong payload A/B testing: Echo vs Empty
-                        #[derive(Debug, Clone, Copy)]
-                        enum PongStrategy {
-                            Echo,  // Echo received payload (RFC 6455 standard)
-                            Empty, // Send empty payload (minimal latency)
-                        }
 
-                        static PONG_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-                        fn get_pong_strategy_and_payload(
-                            ping_payload: &[u8],
-                        ) -> (PongStrategy, Vec<u8>) {
-                            // Always echo for strict server compliance - A/B testing disabled
-                            (PongStrategy::Echo, ping_payload.to_vec())
+                        fn get_pong_payload(ping_payload: &[u8]) -> Vec<u8> {
+                            // Always echo for strict server compliance
+                            ping_payload.to_vec()
                         }
 
                         use parking_lot::Mutex;
                         use std::sync::atomic::{AtomicBool, AtomicU64};
                         use std::time::{SystemTime, UNIX_EPOCH};
 
-                        // Track last pong info for close analysis
-                        #[derive(Debug, Clone)]
-                        struct LastPongInfo {
-                            t0_ping_rx: std::time::Instant,
-                            t2_pong_flushed: std::time::Instant,
-                            strategy: &'static str,
-                            payload_hash8: u64,
-                        }
-
-                        static LAST_PONG: std::sync::OnceLock<
-                            parking_lot::Mutex<Option<LastPongInfo>>,
-                        > = std::sync::OnceLock::new();
 
                         fn now_secs() -> u64 {
                             SystemTime::now()
@@ -3655,11 +3512,8 @@ impl LighterConnector {
                                         last_server_ping.store(now, Ordering::SeqCst);
                                         last_rx.store(now, Ordering::SeqCst);
 
-                                        // A/B test: Echo vs Empty pong payload (calculate once for consistency)
-                                        let strategy_start = std::time::Instant::now();
-                                        let (strategy, pong_payload) =
-                                            get_pong_strategy_and_payload(&payload);
-                                        let strategy_duration = strategy_start.elapsed();
+                                        // Echo pong payload for server compliance
+                                        let pong_payload = get_pong_payload(&payload);
 
                                         // Get current epoch for race detection logging
                                         let current_epoch = connection_epoch.load(Ordering::SeqCst);
@@ -3714,17 +3568,14 @@ impl LighterConnector {
                                                 .map(|b| format!("{:02x}", b))
                                                 .collect::<Vec<_>>()
                                                 .join("");
-                                            let strategy_str = match strategy {
-                                                PongStrategy::Echo => "ECHO",
-                                                PongStrategy::Empty => "EMPTY",
-                                            };
+                                            let strategy_str = "ECHO";
 
                                             let total_ping_pong_time = ping_received_time.elapsed();
 
                                             if pong_epoch == current_epoch {
-                                                log::info!("{} ⏱️  [PONG_SENT_DIRECT] strategy={} total_time={}µs (strategy={}µs send={}µs) payload={} {} -> {} ✅ EPOCH_MATCH",
+                                                log::info!("{} ⏱️  [PONG_SENT_DIRECT] strategy={} total_time={}µs send={}µs payload={} {} -> {} ✅ EPOCH_MATCH",
                                                           format!("[{:03}]", pong_epoch), strategy_str, total_ping_pong_time.as_micros(),
-                                                          strategy_duration.as_micros(), send_time_us,
+                                                          send_time_us,
                                                           if sent_payload_hex.len() > 32 {
                                                               format!("{}...", &sent_payload_hex[..32])
                                                           } else if sent_payload_hex.is_empty() {
@@ -3734,9 +3585,9 @@ impl LighterConnector {
                                                           },
                                                           local_addr, peer_addr);
                                             } else {
-                                                log::error!("{} ⏱️  [PONG_SENT_DIRECT] strategy={} total_time={}µs (strategy={}µs send={}µs) payload={} {} -> {} ❌ EPOCH_MISMATCH ping_epoch={} pong_epoch={}",
+                                                log::error!("{} ⏱️  [PONG_SENT_DIRECT] strategy={} total_time={}µs send={}µs payload={} {} -> {} ❌ EPOCH_MISMATCH ping_epoch={} pong_epoch={}",
                                                            format!("[{:03}]", pong_epoch), strategy_str, total_ping_pong_time.as_micros(),
-                                                           strategy_duration.as_micros(), send_time_us,
+                                                           send_time_us,
                                                            if sent_payload_hex.len() > 32 {
                                                                format!("{}...", &sent_payload_hex[..32])
                                                            } else if sent_payload_hex.is_empty() {
@@ -3747,25 +3598,6 @@ impl LighterConnector {
                                                            local_addr, peer_addr, current_epoch, pong_epoch);
                                             }
 
-                                            // Record last pong info for close analysis
-                                            {
-                                                use std::hash::Hasher;
-                                                let mut hasher =
-                                                    std::collections::hash_map::DefaultHasher::new(
-                                                    );
-                                                hasher.write(&pong_payload);
-                                                let payload_hash8 = hasher.finish();
-
-                                                let mutex = LAST_PONG
-                                                    .get_or_init(|| parking_lot::Mutex::new(None));
-                                                let mut g = mutex.lock();
-                                                *g = Some(LastPongInfo {
-                                                    t0_ping_rx: ping_received_time,
-                                                    t2_pong_flushed: std::time::Instant::now(),
-                                                    strategy: "ECHO", // Now always ECHO
-                                                    payload_hash8,
-                                                });
-                                            }
                                         } else {
                                             // Fallback to try_lock with retry for up to 200ms
                                             let mut pong_sent = false;
@@ -3792,10 +3624,7 @@ impl LighterConnector {
                                                     let send_time_us = t0.elapsed().as_micros();
                                                     last_tx.store(now, Ordering::SeqCst);
 
-                                                    let strategy_str = match strategy {
-                                                        PongStrategy::Echo => "ECHO",
-                                                        PongStrategy::Empty => "EMPTY",
-                                                    };
+                                                    let strategy_str = "ECHO";
                                                     log::info!("✅ [PONG_SENT_RETRY] strategy={} sent on retry {} in {}μs", strategy_str, retry, send_time_us);
                                                     pong_sent = true;
                                                     break;
