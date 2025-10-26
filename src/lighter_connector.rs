@@ -37,6 +37,23 @@ struct MaintenanceInfo {
     fetched_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+struct ConnMeta {
+    epoch: u64,
+    local: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
+}
+
+impl ConnMeta {
+    fn new(epoch: u64, local: std::net::SocketAddr, peer: std::net::SocketAddr) -> Self {
+        Self { epoch, local, peer }
+    }
+
+    fn log_prefix(&self) -> String {
+        format!("[{:03}]", self.epoch)
+    }
+}
+
 // Priority message system for WebSocket sending
 #[derive(Debug)]
 enum OutboundMessage {
@@ -172,6 +189,8 @@ pub struct LighterConnector {
     maintenance: Arc<RwLock<MaintenanceInfo>>,
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
+    // Connection epoch counter for race detection
+    connection_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -606,6 +625,8 @@ impl LighterConnector {
             })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
+            // Connection epoch counter for race detection
+            connection_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -651,6 +672,8 @@ impl LighterConnector {
             })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
+            // Connection epoch counter for race detection
+            connection_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -3005,6 +3028,7 @@ impl LighterConnector {
         let filled_orders = self.filled_orders.clone();
         let canceled_orders = self.canceled_orders.clone();
         let is_running = self.is_running.clone();
+        let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
 
         // Spawn WebSocket handler task with reconnection logic
@@ -3015,6 +3039,15 @@ impl LighterConnector {
             const BACKOFF_MAX_SECS: u64 = 60;
             const BACKOFF_BASE: f64 = 1.5;
 
+            // Connection metadata for race detection
+            #[derive(Debug, Clone)]
+            struct ConnMeta {
+                epoch: u64,
+                local: Option<std::net::SocketAddr>,
+                peer: Option<std::net::SocketAddr>,
+            }
+
+            let mut conn_epoch = 0u64;
             let mut reconnect_attempt = 0u32;
             let mut last_reconnect_time = std::time::SystemTime::now();
 
@@ -3060,20 +3093,133 @@ impl LighterConnector {
                 );
                 last_reconnect_time = now;
 
-                // Try to establish connection with ping configuration like official Python SDK
+                // Try to establish connection with optimized configuration
                 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-                let config = WebSocketConfig::default();
+                let mut config = WebSocketConfig::default();
 
-                let connection_result = tokio_tungstenite::connect_async_with_config(
+                // Optimize WebSocket configuration for low latency
+                config.max_message_size = Some(64 * 1024 * 1024); // 64MB
+                config.max_frame_size = Some(16 * 1024 * 1024);   // 16MB
+                config.write_buffer_size = 128 * 1024; // 128KB write buffer
+                config.max_write_buffer_size = 1024 * 1024; // 1MB max write buffer
+
+                // Create custom connector with TCP optimizations
+                let connector = tokio_tungstenite::Connector::Plain;
+
+                let connection_result = tokio_tungstenite::connect_async_tls_with_config(
                     &ws_url_clone,
                     Some(config),
                     false,
+                    Some(connector),
                 )
                 .await;
 
                 match connection_result {
                     Ok((mut ws_stream, _)) => {
-                        log::info!("WebSocket connected successfully");
+                        // Increment connection epoch for race detection
+                        let current_epoch = connection_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+
+                        // Extract 4-tuple information for logging and apply TCP optimizations
+                        let (local_addr, peer_addr) = match ws_stream.get_ref() {
+                            tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
+                                // Apply TCP optimizations for low latency
+                                if let Err(e) = tcp_stream.set_nodelay(true) {
+                                    log::warn!("Failed to set TCP_NODELAY: {}", e);
+                                }
+
+                                // Set socket-level options
+                                use std::os::unix::io::AsRawFd;
+                                let fd = tcp_stream.as_raw_fd();
+                                unsafe {
+                                    // Set SO_REUSEADDR and SO_REUSEPORT
+                                    let optval: libc::c_int = 1;
+                                    libc::setsockopt(
+                                        fd,
+                                        libc::SOL_SOCKET,
+                                        libc::SO_REUSEADDR,
+                                        &optval as *const _ as *const libc::c_void,
+                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                    );
+
+                                    // Set TCP_USER_TIMEOUT to 30 seconds (30000ms)
+                                    let timeout: libc::c_int = 30000;
+                                    libc::setsockopt(
+                                        fd,
+                                        libc::IPPROTO_TCP,
+                                        18, // TCP_USER_TIMEOUT
+                                        &timeout as *const _ as *const libc::c_void,
+                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                    );
+                                }
+
+                                match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
+                                    (Ok(local), Ok(peer)) => (local, peer),
+                                    _ => {
+                                        log::warn!("Failed to get socket addresses for epoch {}", current_epoch);
+                                        (
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "0.0.0.0:0".parse().unwrap()
+                                        )
+                                    }
+                                }
+                            },
+                            tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream) => {
+                                let tcp_stream = tls_stream.get_ref().0;
+
+                                // Apply TCP optimizations for TLS connection
+                                if let Err(e) = tcp_stream.set_nodelay(true) {
+                                    log::warn!("Failed to set TCP_NODELAY on TLS: {}", e);
+                                }
+
+                                // Set socket-level options for TLS connection
+                                use std::os::unix::io::AsRawFd;
+                                let fd = tcp_stream.as_raw_fd();
+                                unsafe {
+                                    // Set SO_REUSEADDR
+                                    let optval: libc::c_int = 1;
+                                    libc::setsockopt(
+                                        fd,
+                                        libc::SOL_SOCKET,
+                                        libc::SO_REUSEADDR,
+                                        &optval as *const _ as *const libc::c_void,
+                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                    );
+
+                                    // Set TCP_USER_TIMEOUT to 30 seconds
+                                    let timeout: libc::c_int = 30000;
+                                    libc::setsockopt(
+                                        fd,
+                                        libc::IPPROTO_TCP,
+                                        18, // TCP_USER_TIMEOUT
+                                        &timeout as *const _ as *const libc::c_void,
+                                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                    );
+                                }
+
+                                match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
+                                    (Ok(local), Ok(peer)) => (local, peer),
+                                    _ => {
+                                        log::warn!("Failed to get TLS socket addresses for epoch {}", current_epoch);
+                                        (
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "0.0.0.0:0".parse().unwrap()
+                                        )
+                                    }
+                                }
+                            },
+                            _ => {
+                                log::warn!("Unknown connection type for epoch {}", current_epoch);
+                                (
+                                    "0.0.0.0:0".parse().unwrap(),
+                                    "0.0.0.0:0".parse().unwrap()
+                                )
+                            }
+                        };
+
+                        let epoch_prefix = format!("[{:03}]", current_epoch);
+
+                        log::info!("{} WebSocket connected successfully: {} -> {}",
+                                   epoch_prefix, local_addr, peer_addr);
 
                         // Enable TCP_NODELAY for low-latency control frames (Ping/Pong)
                         let stream = ws_stream.get_ref();
@@ -3129,18 +3275,27 @@ impl LighterConnector {
 
                         log::info!("WebSocket subscriptions sent successfully");
 
-                        // Split the WebSocket stream for concurrent read/write operations
+                        // Single-task pump architecture: no split(), unified read/write with select!
                         use futures::sink::SinkExt;
-                        let (ws_write, mut read) = ws_stream.split();
+                        use futures::stream::StreamExt;
 
-                        // Priority channel system for WebSocket messages
-                        let (tx_ctrl, mut rx_ctrl) =
-                            tokio::sync::mpsc::channel::<OutboundMessage>(64); // Control messages (high priority)
+                        // Split stream for shared access but use channels for coordination
+                        let (write, mut read) = ws_stream.split();
+
+                        // Shared writer protected by Arc<Mutex>
+                        let ws_writer_arc = Arc::new(tokio::sync::Mutex::new(write));
+                        let ws_writer_for_reader = ws_writer_arc.clone();
+
+                        // Control channel for high-priority messages (ping/pong)
+                        let (tx_ctrl, mut rx_ctrl) = tokio::sync::mpsc::channel::<OutboundMessage>(32);
+
+                        // Single-task pump: channel for application messages (non-ping/pong)
+                        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<tokio_tungstenite::tungstenite::Message>(32);
 
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
+                        let ws_writer_for_task = ws_writer_arc.clone();
                         let _writer_task = tokio::spawn(async move {
-                            let mut ws_write = ws_write;
 
                             loop {
                                 if !writer_is_running.load(Ordering::SeqCst) {
@@ -3157,6 +3312,8 @@ impl LighterConnector {
                                 let send_start = std::time::Instant::now();
                                 let is_pong = msg.is_pong();
 
+                                // Use shared writer with short-lived lock
+                                let mut ws_write = ws_writer_for_task.lock().await;
                                 if let Err(e) = ws_write.send(msg.into_message()).await {
                                     log::error!("WebSocket send failed: {:?}", e);
                                     break;
@@ -3188,14 +3345,43 @@ impl LighterConnector {
                             log::debug!("WebSocket writer task terminated");
                         });
 
-                        // Heartbeat strategy: idle-only client ping + immediate server pong
-                        const IDLE_PING_SECS: u64 = 30; // Idle-only client ping interval
-                        const PONG_TIMEOUT_SECS: u64 = 10; // Pong timeout for connection health
+                        // Heartbeat strategy: client-initiated ping + server ping response
+                        const CLIENT_PING_SECS: u64 = 30; // Client ping interval
+                        const CLIENT_PONG_TIMEOUT_SECS: u64 = 8; // Client pong timeout
+                        const IDLE_PING_SECS: u64 = 20; // Legacy idle ping (kept for compatibility)
+                        const ACTIVE_PING_SECS: u64 = 30; // Legacy active ping (kept for compatibility)
+                        const PONG_TIMEOUT_SECS: u64 = 10; // Legacy pong timeout (kept for compatibility)
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
+
+                        // Pong payload A/B testing: Echo vs Empty
+                        #[derive(Debug, Clone, Copy)]
+                        enum PongStrategy {
+                            Echo,   // Echo received payload (RFC 6455 standard)
+                            Empty,  // Send empty payload (minimal latency)
+                        }
+
+                        static PONG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                        fn get_pong_strategy_and_payload(ping_payload: &[u8]) -> (PongStrategy, Vec<u8>) {
+                            // Always echo for strict server compliance - A/B testing disabled
+                            (PongStrategy::Echo, ping_payload.to_vec())
+                        }
 
                         use parking_lot::Mutex;
                         use std::sync::atomic::{AtomicBool, AtomicU64};
                         use std::time::{SystemTime, UNIX_EPOCH};
+
+                        // Track last pong info for close analysis
+                        #[derive(Debug, Clone)]
+                        struct LastPongInfo {
+                            t0_ping_rx: std::time::Instant,
+                            t2_pong_flushed: std::time::Instant,
+                            strategy: &'static str,
+                            payload_hash8: u64,
+                        }
+
+                        static LAST_PONG: std::sync::OnceLock<parking_lot::Mutex<Option<LastPongInfo>>> =
+                            std::sync::OnceLock::new();
 
                         fn now_secs() -> u64 {
                             SystemTime::now()
@@ -3278,17 +3464,26 @@ impl LighterConnector {
                             log::debug!("Heartbeat task ended");
                         });
 
-                        // Handle messages in this connection
+                        // Handle messages in this connection with performance tracking
                         log::debug!("Starting WebSocket message handling loop");
+                        let mut msg_count = 0u64;
+                        let mut total_processing_time = std::time::Duration::ZERO;
+                        let mut slow_message_count = 0u64;
+                        let loop_start_time = std::time::Instant::now();
+
                         while let Some(message) = read.next().await {
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
                             }
 
+                            let msg_start_time = std::time::Instant::now();
+                            msg_count += 1;
+
                             match message {
                                 Ok(message) => match message {
                                     tokio_tungstenite::tungstenite::Message::Text(text) => {
+                                        let msg_start = std::time::Instant::now();
                                         log::trace!("WebSocket text message: {}", text);
 
                                         // Update last received timestamp for any text message
@@ -3296,6 +3491,9 @@ impl LighterConnector {
                                         last_rx.store(now, Ordering::SeqCst);
 
                                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                                            let parse_duration = msg_start.elapsed();
+                                            let handle_start = std::time::Instant::now();
+
                                             Self::handle_websocket_message(
                                                 parsed,
                                                 &current_price,
@@ -3306,41 +3504,153 @@ impl LighterConnector {
                                                 account_index,
                                             )
                                             .await;
+
+                                            let handle_duration = handle_start.elapsed();
+                                            let total_duration = msg_start.elapsed();
+
+                                            // Log detailed timing for message processing
+                                            if total_duration.as_millis() > 5 {
+                                                log::info!("⏱️  TEXT_MSG timing: parse={}μs handle={}μs total={}μs (len={})",
+                                                    parse_duration.as_micros(),
+                                                    handle_duration.as_micros(),
+                                                    total_duration.as_micros(),
+                                                    text.len()
+                                                );
+                                            }
                                         } else {
+                                            let parse_duration = msg_start.elapsed();
                                             log::warn!(
-                                                "Failed to parse WebSocket message as JSON: {}",
-                                                text
+                                                "Failed to parse WebSocket message as JSON: {} (parse_time={}μs)",
+                                                text, parse_duration.as_micros()
                                             );
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                                        // Server ping -> immediate pong response via priority channel
+                                        // Server ping -> immediate manual pong response
                                         let ping_received_time = std::time::Instant::now();
                                         let now = now_secs();
                                         last_server_ping.store(now, Ordering::SeqCst);
                                         last_rx.store(now, Ordering::SeqCst);
 
-                                        log::debug!("🏓 [SERVER_PING] Received server ping (payload size: {}), queueing immediate pong", payload.len());
+                                        // A/B test: Echo vs Empty pong payload (calculate once for consistency)
+                                        let strategy_start = std::time::Instant::now();
+                                        let (strategy, pong_payload) = get_pong_strategy_and_payload(&payload);
+                                        let strategy_duration = strategy_start.elapsed();
 
-                                        // Send Pong via high-priority control channel (non-blocking)
-                                        let pong_msg = OutboundMessage::Control(
-                                            tokio_tungstenite::tungstenite::Message::Pong(
-                                                payload.clone(),
-                                            ),
-                                        );
+                                        // Get current epoch for race detection logging
+                                        let current_epoch = connection_epoch.load(Ordering::SeqCst);
+                                        let payload_hex = payload.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
 
-                                        if let Err(e) = tx_ctrl.try_send(pong_msg) {
-                                            log::error!(
-                                                "🚨 [CRITICAL] Failed to queue pong response: {:?} - CHANNEL FULL!",
-                                                e
-                                            );
-                                            break;
+                                        log::debug!("{} [PING_RX] from {} -> {} (len={}, payload={})",
+                                                   format!("[{:03}]", current_epoch), peer_addr, local_addr, payload.len(),
+                                                   if payload_hex.len() > 32 {
+                                                       format!("{}...", &payload_hex[..32])
+                                                   } else {
+                                                       payload_hex
+                                                   });
+
+                                        // Direct pong send - bypass writer task for immediate response
+                                        if let Ok(mut ws_write) = ws_writer_for_reader.try_lock() {
+                                            let t0 = std::time::Instant::now();
+
+                                            if let Err(e) = ws_write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_payload.clone())).await {
+                                                log::error!("🚨 [CRITICAL] Failed to send pong directly: {:?}", e);
+                                                break;
+                                            }
+                                            if let Err(e) = futures::SinkExt::flush(&mut *ws_write).await {
+                                                log::error!("🚨 [CRITICAL] Failed to flush after pong: {:?}", e);
+                                                break;
+                                            }
+                                            let send_time_us = t0.elapsed().as_micros();
+                                            last_tx.store(now, Ordering::SeqCst);
+
+                                            // Verify same connection epoch for race detection
+                                            let pong_epoch = connection_epoch.load(Ordering::SeqCst);
+                                            let sent_payload_hex = pong_payload.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+                                            let strategy_str = match strategy {
+                                                PongStrategy::Echo => "ECHO",
+                                                PongStrategy::Empty => "EMPTY",
+                                            };
+
+                                            let total_ping_pong_time = ping_received_time.elapsed();
+
+                                            if pong_epoch == current_epoch {
+                                                log::info!("{} ⏱️  [PONG_SENT_DIRECT] strategy={} total_time={}µs (strategy={}µs send={}µs) payload={} {} -> {} ✅ EPOCH_MATCH",
+                                                          format!("[{:03}]", pong_epoch), strategy_str, total_ping_pong_time.as_micros(),
+                                                          strategy_duration.as_micros(), send_time_us,
+                                                          if sent_payload_hex.len() > 32 {
+                                                              format!("{}...", &sent_payload_hex[..32])
+                                                          } else if sent_payload_hex.is_empty() {
+                                                              "EMPTY".to_string()
+                                                          } else {
+                                                              sent_payload_hex
+                                                          },
+                                                          local_addr, peer_addr);
+                                            } else {
+                                                log::error!("{} ⏱️  [PONG_SENT_DIRECT] strategy={} total_time={}µs (strategy={}µs send={}µs) payload={} {} -> {} ❌ EPOCH_MISMATCH ping_epoch={} pong_epoch={}",
+                                                           format!("[{:03}]", pong_epoch), strategy_str, total_ping_pong_time.as_micros(),
+                                                           strategy_duration.as_micros(), send_time_us,
+                                                           if sent_payload_hex.len() > 32 {
+                                                               format!("{}...", &sent_payload_hex[..32])
+                                                           } else if sent_payload_hex.is_empty() {
+                                                               "EMPTY".to_string()
+                                                           } else {
+                                                               sent_payload_hex
+                                                           },
+                                                           local_addr, peer_addr, current_epoch, pong_epoch);
+                                            }
+
+                                            // Record last pong info for close analysis
+                                            {
+                                                use std::hash::Hasher;
+                                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                                hasher.write(&pong_payload);
+                                                let payload_hash8 = hasher.finish();
+
+                                                let mutex = LAST_PONG.get_or_init(|| parking_lot::Mutex::new(None));
+                                                let mut g = mutex.lock();
+                                                *g = Some(LastPongInfo {
+                                                    t0_ping_rx: ping_received_time,
+                                                    t2_pong_flushed: std::time::Instant::now(),
+                                                    strategy: "ECHO", // Now always ECHO
+                                                    payload_hash8,
+                                                });
+                                            }
+                                        } else {
+                                            // Fallback to try_lock with retry for up to 200ms
+                                            let mut pong_sent = false;
+                                            for retry in 0..4 {
+                                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                                if let Ok(mut ws_write) = ws_writer_for_reader.try_lock() {
+                                                    let t0 = std::time::Instant::now();
+                                                    if let Err(e) = ws_write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_payload.clone())).await {
+                                                        log::error!("🚨 [CRITICAL] Failed to send pong on retry {}: {:?}", retry, e);
+                                                        break;
+                                                    }
+                                                    if let Err(e) = futures::SinkExt::flush(&mut *ws_write).await {
+                                                        log::error!("🚨 [CRITICAL] Failed to flush after pong retry {}: {:?}", retry, e);
+                                                        break;
+                                                    }
+                                                    let send_time_us = t0.elapsed().as_micros();
+                                                    last_tx.store(now, Ordering::SeqCst);
+
+                                                    let strategy_str = match strategy {
+                                                        PongStrategy::Echo => "ECHO",
+                                                        PongStrategy::Empty => "EMPTY",
+                                                    };
+                                                    log::info!("✅ [PONG_SENT_RETRY] strategy={} sent on retry {} in {}μs", strategy_str, retry, send_time_us);
+                                                    pong_sent = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !pong_sent {
+                                                log::warn!("⚠️ [PONG_TIMEOUT] Could not send pong within 200ms - closing connection to avoid 'no pong' error");
+                                                // Proactively close to trigger reconnect before server timeout
+                                                let mut ws_write = ws_writer_for_reader.lock().await;
+                                                let _ = ws_write.close().await;
+                                                break;
+                                            }
                                         }
-
-                                        let queue_time_us =
-                                            ping_received_time.elapsed().as_micros();
-                                        last_tx.store(now, Ordering::SeqCst);
-                                        log::info!("✅ [PONG_QUEUED] Pong queued for server ping in {}μs (payload size: {})", queue_time_us, payload.len());
                                     }
                                     tokio_tungstenite::tungstenite::Message::Pong(payload) => {
                                         // Pong response - check if it matches our client ping
@@ -3361,7 +3671,7 @@ impl LighterConnector {
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
-                                        log::info!("WebSocket close frame received: {:?}", frame);
+                                        log::warn!("WebSocket close frame received: {:?}", frame);
                                         break;
                                     }
                                     tokio_tungstenite::tungstenite::Message::Binary(data) => {
@@ -3382,10 +3692,40 @@ impl LighterConnector {
                                     break; // Break inner loop to attempt reconnection
                                 }
                             }
+
+                            // Track message processing performance
+                            let msg_duration = msg_start_time.elapsed();
+                            total_processing_time += msg_duration;
+                            if msg_duration.as_millis() > 10 {
+                                slow_message_count += 1;
+                            }
+
+                            // Log performance summary every 1000 messages
+                            if msg_count % 1000 == 0 {
+                                let avg_processing_time = total_processing_time / msg_count as u32;
+                                let overall_duration = loop_start_time.elapsed();
+                                log::info!("📊 PERF_SUMMARY: processed {} msgs in {}s (avg={}μs slow={} tcp_opts=enabled ws_opts=enabled)",
+                                    msg_count,
+                                    overall_duration.as_secs(),
+                                    avg_processing_time.as_micros(),
+                                    slow_message_count
+                                );
+                            }
                         }
 
-                        log::warn!(
-                            "WebSocket message loop ended. Connection lost - will attempt reconnection with backoff."
+                        // Final performance summary when loop ends
+                        let final_duration = loop_start_time.elapsed();
+                        let avg_processing_time = if msg_count > 0 {
+                            total_processing_time / msg_count as u32
+                        } else {
+                            std::time::Duration::ZERO
+                        };
+
+                        log::warn!("📊 FINAL_PERF: loop ended after {}s, {} msgs (avg={}μs slow={}) - reconnecting with backoff",
+                            final_duration.as_secs(),
+                            msg_count,
+                            avg_processing_time.as_micros(),
+                            slow_message_count
                         );
                         reconnect_attempt += 1;
                     }
