@@ -4,7 +4,21 @@
 const ORDER_TYPE_LIMIT: u32 = 0;
 const ORDER_TYPE_IOC: u32 = 1;
 const ORDER_TYPE_TRIGGER: u32 = 2;
-const ORDER_TYPE_FOK: u32 = 2; // Fill-or-Kill (same value as trigger in Lighter Protocol)
+// Note: FOK and TRIGGER share the same value (2) in Lighter Protocol
+// This is intentional - FOK is a specific TIF behavior, not a separate order type
+const ORDER_TYPE_FOK: u32 = 2; // Fill-or-Kill - same underlying type as TRIGGER
+
+// Lighter Protocol Side constants (order direction, not position direction)
+const SIDE_SELL: u32 = 0; // Sell order (close long positions, open short positions)
+const SIDE_BUY: u32 = 1; // Buy order (close short positions, open long positions)
+
+// Lighter Protocol Time-in-Force constants
+const TIME_IN_FORCE_IOC: u32 = 0; // Immediate-or-Cancel
+const TIME_IN_FORCE_GTC: u32 = 1; // Good-Till-Cancel
+
+// Lighter Protocol scaling constants
+const PRICE_SCALE_FACTOR: u64 = 10; // Price scaling: multiply by 10
+const BASE_AMOUNT_SCALE: u64 = 100000; // Size scaling: multiply by 100,000
 
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
@@ -12,7 +26,7 @@ use crate::{
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
-    OpenOrder, OpenOrdersResponse, OrderSide, TickerResponse, TpSl,
+    OpenOrder, OpenOrdersResponse, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -31,6 +45,14 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+
+/// Determine buy/sell direction for SL/TP orders based on position direction
+/// Returns true for buy orders, false for sell orders
+/// - Long position SL/TP = Sell order (close position) = false
+/// - Short position SL/TP = Buy order (close position) = true
+fn is_buy_for_tpsl(position_side: OrderSide) -> bool {
+    matches!(position_side, OrderSide::Short)
+}
 
 struct MaintenanceInfo {
     next_start: Option<DateTime<Utc>>,
@@ -2402,27 +2424,29 @@ impl DexConnector for LighterConnector {
         result
     }
 
-    async fn create_trigger_order(
+    async fn create_advanced_trigger_order(
         &self,
         symbol: &str,
         size: Decimal,
         side: OrderSide,
         trigger_px: Decimal,
-        is_market: bool,
+        limit_px: Option<Decimal>,
+        order_style: TriggerOrderStyle,
+        slippage_bps: Option<u32>,
         tpsl: TpSl,
         reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         log::info!(
-            "🎯 [TRIGGER_ORDER] Creating {} trigger order for {}: size={}, trigger_price={}, is_market={}",
+            "🎯 [ADVANCED_TRIGGER_ORDER] Creating {} order for {}: style={:?}, trigger={}, limit={:?}, slippage_bps={:?}",
             match tpsl { TpSl::Sl => "stop loss", TpSl::Tp => "take profit" },
             symbol,
-            size,
+            order_style,
             trigger_px,
-            is_market
+            limit_px,
+            slippage_bps
         );
 
-        // Convert symbol to market_id
         let market_id = match symbol {
             "BTC-USD" | "BTC" => 1,
             "ETH-USD" | "ETH" => 2,
@@ -2432,47 +2456,140 @@ impl DexConnector for LighterConnector {
             }
         };
 
-        // Convert side: Long=0(BUY), Short=1(SELL) for Lighter API
-        let side_value = match side {
-            OrderSide::Long => 0,
-            OrderSide::Short => 1,
-        };
-
-        // Determine order type: StopLoss=2, TakeProfit=4, StopLossLimit=3, TakeProfitLimit=5
-        let order_type = match (&tpsl, is_market) {
-            (TpSl::Sl, true) => 2,  // StopLossOrder
-            (TpSl::Sl, false) => 3, // StopLossLimitOrder
-            (TpSl::Tp, true) => 4,  // TakeProfitOrder
-            (TpSl::Tp, false) => 5, // TakeProfitLimitOrder
-        };
-
-        // Convert to native units
-        let base_amount = (size * rust_decimal::Decimal::new(100000, 0))
-            .to_u64()
-            .unwrap_or(0);
-        let trigger_price_native = (trigger_px * rust_decimal::Decimal::new(10, 0))
-            .to_u64()
-            .unwrap_or(0);
-
-        // For market orders, use trigger price as execution price
-        let execution_price = if is_market {
-            trigger_price_native
+        let side_value = if is_buy_for_tpsl(side) {
+            SIDE_BUY
         } else {
-            trigger_price_native // For limit orders, could use different logic
+            SIDE_SELL
         };
 
-        // Set correct TimeInForce based on order type (following Python SDK)
-        let time_in_force = match (&tpsl, is_market) {
-            (TpSl::Sl, true) | (TpSl::Tp, true) => 0, // IOC for StopLossOrder/TakeProfitOrder (Python: DEFAULT_IOC_EXPIRY = 0)
-            _ => 1,                                   // GTC for limit orders
+        let (is_market, final_limit_price, order_type) = match order_style {
+            TriggerOrderStyle::Market => {
+                let order_type = match tpsl {
+                    TpSl::Sl => 2, // StopLossOrder
+                    TpSl::Tp => 4, // TakeProfitOrder
+                };
+                (true, trigger_px, order_type)
+            }
+            TriggerOrderStyle::MarketWithSlippageControl => {
+                if let Some(slippage) = slippage_bps {
+                    let slippage_factor = Decimal::new(slippage as i64, 4);
+                    // "Market equivalent with slippage control" means we prioritize execution over price
+                    // Always adjust towards the WORSE direction for guaranteed execution
+                    let adjusted_price = match (side, tpsl) {
+                        (OrderSide::Long, TpSl::Sl) => {
+                            // Long Stop Loss (sell): worse price for selling = lower price
+                            trigger_px * (Decimal::ONE - slippage_factor)
+                        }
+                        (OrderSide::Short, TpSl::Sl) => {
+                            // Short Stop Loss (buy): worse price for buying = higher price
+                            trigger_px * (Decimal::ONE + slippage_factor)
+                        }
+                        (OrderSide::Long, TpSl::Tp) => {
+                            // Long Take Profit executed as market (sell): worse price = lower price
+                            trigger_px * (Decimal::ONE - slippage_factor)
+                        }
+                        (OrderSide::Short, TpSl::Tp) => {
+                            // Short Take Profit executed as market (buy): worse price = higher price
+                            trigger_px * (Decimal::ONE + slippage_factor)
+                        }
+                    };
+                    let order_type = match tpsl {
+                        TpSl::Sl => 3, // StopLossLimitOrder with slippage control
+                        TpSl::Tp => 5, // TakeProfitLimitOrder with slippage control
+                    };
+                    (false, adjusted_price, order_type)
+                } else {
+                    // Fallback to pure market
+                    let order_type = match tpsl {
+                        TpSl::Sl => 2,
+                        TpSl::Tp => 4,
+                    };
+                    (true, trigger_px, order_type)
+                }
+            }
+            TriggerOrderStyle::Limit => {
+                let limit_price = limit_px.ok_or_else(|| {
+                    DexError::Other("limit_px required for Limit order style".into())
+                })?;
+
+                // Validate limit price vs trigger price for the order type
+                match (side, tpsl) {
+                    (OrderSide::Long, TpSl::Sl) => {
+                        if limit_price > trigger_px {
+                            return Err(DexError::Other(
+                                "For Long Stop Loss, limit_px must be <= trigger_px".into(),
+                            ));
+                        }
+                    }
+                    (OrderSide::Short, TpSl::Sl) => {
+                        if limit_price < trigger_px {
+                            return Err(DexError::Other(
+                                "For Short Stop Loss, limit_px must be >= trigger_px".into(),
+                            ));
+                        }
+                    }
+                    (OrderSide::Long, TpSl::Tp) => {
+                        if limit_price < trigger_px {
+                            return Err(DexError::Other(
+                                "For Long Take Profit, limit_px must be >= trigger_px".into(),
+                            ));
+                        }
+                    }
+                    (OrderSide::Short, TpSl::Tp) => {
+                        if limit_price > trigger_px {
+                            return Err(DexError::Other(
+                                "For Short Take Profit, limit_px must be <= trigger_px".into(),
+                            ));
+                        }
+                    }
+                }
+
+                let order_type = match tpsl {
+                    TpSl::Sl => 3, // StopLossLimitOrder
+                    TpSl::Tp => 5, // TakeProfitLimitOrder
+                };
+                (false, limit_price, order_type)
+            }
         };
+
+        // Convert to native units with proper error handling
+        let base_amount = (size * Decimal::from(BASE_AMOUNT_SCALE))
+            .to_u64()
+            .ok_or_else(|| DexError::Other("base_amount overflow or invalid value".into()))?;
+        let trigger_price_native = (trigger_px * Decimal::from(PRICE_SCALE_FACTOR))
+            .to_u64()
+            .ok_or_else(|| {
+                DexError::Other("trigger_price_native overflow or invalid value".into())
+            })?;
+
+        let execution_price_native = if is_market {
+            0 // Market orders: server ignores execution_price, use 0 for clarity
+        } else {
+            (final_limit_price * Decimal::from(PRICE_SCALE_FACTOR))
+                .to_u64()
+                .ok_or_else(|| {
+                    DexError::Other("execution_price_native overflow or invalid value".into())
+                })?
+        };
+
+        // Set TimeInForce based on order type (using global protocol constants)
+        let time_in_force = if is_market {
+            TIME_IN_FORCE_IOC
+        } else {
+            TIME_IN_FORCE_GTC
+        };
+
+        log::debug!(
+            "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}",
+            market_id, side_value, base_amount, execution_price_native, trigger_price_native, order_type
+        );
 
         self.create_order_native_with_trigger(
             market_id,
             side_value,
             time_in_force,
             base_amount,
-            execution_price,
+            execution_price_native,
             trigger_price_native,
             None,
             order_type,
@@ -3099,7 +3216,7 @@ impl LighterConnector {
 
                 // Optimize WebSocket configuration for low latency
                 config.max_message_size = Some(64 * 1024 * 1024); // 64MB
-                config.max_frame_size = Some(16 * 1024 * 1024);   // 16MB
+                config.max_frame_size = Some(16 * 1024 * 1024); // 16MB
                 config.write_buffer_size = 128 * 1024; // 128KB write buffer
                 config.max_write_buffer_size = 1024 * 1024; // 1MB max write buffer
 
@@ -3155,14 +3272,14 @@ impl LighterConnector {
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
                                     (Ok(local), Ok(peer)) => (local, peer),
                                     _ => {
-                                        log::warn!("Failed to get socket addresses for epoch {}", current_epoch);
-                                        (
-                                            "0.0.0.0:0".parse().unwrap(),
-                                            "0.0.0.0:0".parse().unwrap()
-                                        )
+                                        log::warn!(
+                                            "Failed to get socket addresses for epoch {}",
+                                            current_epoch
+                                        );
+                                        ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
                                     }
                                 }
-                            },
+                            }
                             tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream) => {
                                 let tcp_stream = tls_stream.get_ref().0;
 
@@ -3199,27 +3316,28 @@ impl LighterConnector {
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
                                     (Ok(local), Ok(peer)) => (local, peer),
                                     _ => {
-                                        log::warn!("Failed to get TLS socket addresses for epoch {}", current_epoch);
-                                        (
-                                            "0.0.0.0:0".parse().unwrap(),
-                                            "0.0.0.0:0".parse().unwrap()
-                                        )
+                                        log::warn!(
+                                            "Failed to get TLS socket addresses for epoch {}",
+                                            current_epoch
+                                        );
+                                        ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
                                     }
                                 }
-                            },
+                            }
                             _ => {
                                 log::warn!("Unknown connection type for epoch {}", current_epoch);
-                                (
-                                    "0.0.0.0:0".parse().unwrap(),
-                                    "0.0.0.0:0".parse().unwrap()
-                                )
+                                ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
                             }
                         };
 
                         let epoch_prefix = format!("[{:03}]", current_epoch);
 
-                        log::info!("{} WebSocket connected successfully: {} -> {}",
-                                   epoch_prefix, local_addr, peer_addr);
+                        log::info!(
+                            "{} WebSocket connected successfully: {} -> {}",
+                            epoch_prefix,
+                            local_addr,
+                            peer_addr
+                        );
 
                         // Enable TCP_NODELAY for low-latency control frames (Ping/Pong)
                         let stream = ws_stream.get_ref();
@@ -3287,16 +3405,18 @@ impl LighterConnector {
                         let ws_writer_for_reader = ws_writer_arc.clone();
 
                         // Control channel for high-priority messages (ping/pong)
-                        let (tx_ctrl, mut rx_ctrl) = tokio::sync::mpsc::channel::<OutboundMessage>(32);
+                        let (tx_ctrl, mut rx_ctrl) =
+                            tokio::sync::mpsc::channel::<OutboundMessage>(32);
 
                         // Single-task pump: channel for application messages (non-ping/pong)
-                        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<tokio_tungstenite::tungstenite::Message>(32);
+                        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<
+                            tokio_tungstenite::tungstenite::Message,
+                        >(32);
 
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
                         let ws_writer_for_task = ws_writer_arc.clone();
                         let _writer_task = tokio::spawn(async move {
-
                             loop {
                                 if !writer_is_running.load(Ordering::SeqCst) {
                                     break;
@@ -3356,13 +3476,15 @@ impl LighterConnector {
                         // Pong payload A/B testing: Echo vs Empty
                         #[derive(Debug, Clone, Copy)]
                         enum PongStrategy {
-                            Echo,   // Echo received payload (RFC 6455 standard)
-                            Empty,  // Send empty payload (minimal latency)
+                            Echo,  // Echo received payload (RFC 6455 standard)
+                            Empty, // Send empty payload (minimal latency)
                         }
 
                         static PONG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-                        fn get_pong_strategy_and_payload(ping_payload: &[u8]) -> (PongStrategy, Vec<u8>) {
+                        fn get_pong_strategy_and_payload(
+                            ping_payload: &[u8],
+                        ) -> (PongStrategy, Vec<u8>) {
                             // Always echo for strict server compliance - A/B testing disabled
                             (PongStrategy::Echo, ping_payload.to_vec())
                         }
@@ -3380,8 +3502,9 @@ impl LighterConnector {
                             payload_hash8: u64,
                         }
 
-                        static LAST_PONG: std::sync::OnceLock<parking_lot::Mutex<Option<LastPongInfo>>> =
-                            std::sync::OnceLock::new();
+                        static LAST_PONG: std::sync::OnceLock<
+                            parking_lot::Mutex<Option<LastPongInfo>>,
+                        > = std::sync::OnceLock::new();
 
                         fn now_secs() -> u64 {
                             SystemTime::now()
@@ -3534,30 +3657,49 @@ impl LighterConnector {
 
                                         // A/B test: Echo vs Empty pong payload (calculate once for consistency)
                                         let strategy_start = std::time::Instant::now();
-                                        let (strategy, pong_payload) = get_pong_strategy_and_payload(&payload);
+                                        let (strategy, pong_payload) =
+                                            get_pong_strategy_and_payload(&payload);
                                         let strategy_duration = strategy_start.elapsed();
 
                                         // Get current epoch for race detection logging
                                         let current_epoch = connection_epoch.load(Ordering::SeqCst);
-                                        let payload_hex = payload.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+                                        let payload_hex = payload
+                                            .iter()
+                                            .map(|b| format!("{:02x}", b))
+                                            .collect::<Vec<_>>()
+                                            .join("");
 
-                                        log::debug!("{} [PING_RX] from {} -> {} (len={}, payload={})",
-                                                   format!("[{:03}]", current_epoch), peer_addr, local_addr, payload.len(),
-                                                   if payload_hex.len() > 32 {
-                                                       format!("{}...", &payload_hex[..32])
-                                                   } else {
-                                                       payload_hex
-                                                   });
+                                        log::debug!(
+                                            "{} [PING_RX] from {} -> {} (len={}, payload={})",
+                                            format!("[{:03}]", current_epoch),
+                                            peer_addr,
+                                            local_addr,
+                                            payload.len(),
+                                            if payload_hex.len() > 32 {
+                                                format!("{}...", &payload_hex[..32])
+                                            } else {
+                                                payload_hex
+                                            }
+                                        );
 
                                         // Direct pong send - bypass writer task for immediate response
                                         if let Ok(mut ws_write) = ws_writer_for_reader.try_lock() {
                                             let t0 = std::time::Instant::now();
 
-                                            if let Err(e) = ws_write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_payload.clone())).await {
+                                            if let Err(e) = ws_write
+                                                .send(
+                                                    tokio_tungstenite::tungstenite::Message::Pong(
+                                                        pong_payload.clone(),
+                                                    ),
+                                                )
+                                                .await
+                                            {
                                                 log::error!("🚨 [CRITICAL] Failed to send pong directly: {:?}", e);
                                                 break;
                                             }
-                                            if let Err(e) = futures::SinkExt::flush(&mut *ws_write).await {
+                                            if let Err(e) =
+                                                futures::SinkExt::flush(&mut *ws_write).await
+                                            {
                                                 log::error!("🚨 [CRITICAL] Failed to flush after pong: {:?}", e);
                                                 break;
                                             }
@@ -3565,8 +3707,13 @@ impl LighterConnector {
                                             last_tx.store(now, Ordering::SeqCst);
 
                                             // Verify same connection epoch for race detection
-                                            let pong_epoch = connection_epoch.load(Ordering::SeqCst);
-                                            let sent_payload_hex = pong_payload.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+                                            let pong_epoch =
+                                                connection_epoch.load(Ordering::SeqCst);
+                                            let sent_payload_hex = pong_payload
+                                                .iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<Vec<_>>()
+                                                .join("");
                                             let strategy_str = match strategy {
                                                 PongStrategy::Echo => "ECHO",
                                                 PongStrategy::Empty => "EMPTY",
@@ -3603,11 +3750,14 @@ impl LighterConnector {
                                             // Record last pong info for close analysis
                                             {
                                                 use std::hash::Hasher;
-                                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                                let mut hasher =
+                                                    std::collections::hash_map::DefaultHasher::new(
+                                                    );
                                                 hasher.write(&pong_payload);
                                                 let payload_hash8 = hasher.finish();
 
-                                                let mutex = LAST_PONG.get_or_init(|| parking_lot::Mutex::new(None));
+                                                let mutex = LAST_PONG
+                                                    .get_or_init(|| parking_lot::Mutex::new(None));
                                                 let mut g = mutex.lock();
                                                 *g = Some(LastPongInfo {
                                                     t0_ping_rx: ping_received_time,
@@ -3620,14 +3770,22 @@ impl LighterConnector {
                                             // Fallback to try_lock with retry for up to 200ms
                                             let mut pong_sent = false;
                                             for retry in 0..4 {
-                                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                                if let Ok(mut ws_write) = ws_writer_for_reader.try_lock() {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(50),
+                                                )
+                                                .await;
+                                                if let Ok(mut ws_write) =
+                                                    ws_writer_for_reader.try_lock()
+                                                {
                                                     let t0 = std::time::Instant::now();
                                                     if let Err(e) = ws_write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_payload.clone())).await {
                                                         log::error!("🚨 [CRITICAL] Failed to send pong on retry {}: {:?}", retry, e);
                                                         break;
                                                     }
-                                                    if let Err(e) = futures::SinkExt::flush(&mut *ws_write).await {
+                                                    if let Err(e) =
+                                                        futures::SinkExt::flush(&mut *ws_write)
+                                                            .await
+                                                    {
                                                         log::error!("🚨 [CRITICAL] Failed to flush after pong retry {}: {:?}", retry, e);
                                                         break;
                                                     }
@@ -3646,7 +3804,8 @@ impl LighterConnector {
                                             if !pong_sent {
                                                 log::warn!("⚠️ [PONG_TIMEOUT] Could not send pong within 200ms - closing connection to avoid 'no pong' error");
                                                 // Proactively close to trigger reconnect before server timeout
-                                                let mut ws_write = ws_writer_for_reader.lock().await;
+                                                let mut ws_write =
+                                                    ws_writer_for_reader.lock().await;
                                                 let _ = ws_write.close().await;
                                                 break;
                                             }

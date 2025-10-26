@@ -4,7 +4,7 @@ use crate::{
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
-    OrderSide, TickerResponse, TpSl,
+    OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -19,7 +19,7 @@ use hyperliquid_rust_sdk_fork::{
     ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus,
 };
 use reqwest::Client;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -304,6 +304,13 @@ impl<'de> Deserialize<'de> for WebSocketMessage {
             data,
         })
     }
+}
+
+/// Determine buy/sell direction for SL/TP orders based on position direction
+/// - Long position SL/TP = Sell order (close position)
+/// - Short position SL/TP = Buy order (close position)
+fn is_buy_for_tpsl(position_side: OrderSide) -> bool {
+    matches!(position_side, OrderSide::Short)
 }
 
 impl HyperliquidConnector {
@@ -1728,58 +1735,139 @@ impl DexConnector for HyperliquidConnector {
         })
     }
 
-    async fn create_trigger_order(
+    async fn create_advanced_trigger_order(
         &self,
         symbol: &str,
         size: Decimal,
         side: OrderSide,
         trigger_px: Decimal,
-        is_market: bool,
+        limit_px: Option<Decimal>,
+        order_style: TriggerOrderStyle,
+        slippage_bps: Option<u32>,
         tpsl: TpSl,
-        _reduce_only: bool,
-        _expiry_secs: Option<u64>, // Ignored for Hyperliquid
+        reduce_only: bool,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        // Resolve the exchange asset code
+        // Log expiry_secs if provided
+        if let Some(expiry) = expiry_secs {
+            log::warn!(
+                "🕐 [HYPERLIQUID_EXPIRY] expiry_secs={} specified but not directly supported by Hyperliquid trigger orders. Consider implementing auto-cancel mechanism.",
+                expiry
+            );
+        }
+
         let asset = resolve_coin(symbol, &self.spot_index_map);
 
-        // Convert Decimal to f64, failing if out of range
-        let limit_px = trigger_px
+        // Round size to proper decimals for this symbol
+        let rounded_size = self.floor_size(size, symbol);
+
+        let trigger_price = trigger_px
             .to_f64()
             .ok_or_else(|| DexError::Other("Failed to convert trigger_px to f64".into()))?;
-        let sz = size
+        let sz = rounded_size
             .to_f64()
             .ok_or_else(|| DexError::Other("Failed to convert size to f64".into()))?;
 
-        // Build the ClientOrderRequest with a Trigger type
+        let (is_market, final_limit_price_opt) = match order_style {
+            TriggerOrderStyle::Market => (true, None), // Pure market order, no limit price
+            TriggerOrderStyle::MarketWithSlippageControl => {
+                if let Some(slippage) = slippage_bps {
+                    // MarketWithSlippageControl: prioritize execution over price
+                    // Calculate slippage-controlled price toward "worse" direction for guaranteed fills
+                    let slippage_factor = Decimal::new(slippage as i64, 4); // convert bps to decimal
+                    let adjusted_price = match side {
+                        // Long SL/TP = Sell order: worse price = lower (less favorable)
+                        OrderSide::Long => trigger_px * (Decimal::ONE - slippage_factor),
+                        // Short SL/TP = Buy order: worse price = higher (less favorable)
+                        OrderSide::Short => trigger_px * (Decimal::ONE + slippage_factor),
+                    };
+                    let limit_price = adjusted_price.to_f64().ok_or_else(|| {
+                        DexError::Other("Failed to convert adjusted price to f64".into())
+                    })?;
+                    (false, Some(limit_price)) // Use limit order with calculated price
+                } else {
+                    (true, None) // Fallback to pure market
+                }
+            }
+            TriggerOrderStyle::Limit => {
+                let limit_price = limit_px
+                    .ok_or_else(|| {
+                        DexError::Other("limit_px required for Limit order style".into())
+                    })?
+                    .to_f64()
+                    .ok_or_else(|| DexError::Other("Failed to convert limit_px to f64".into()))?;
+
+                // Validate that limit price is appropriate for the order side and TPSL type
+                match (side, tpsl) {
+                    (OrderSide::Long, TpSl::Sl) => {
+                        // Long Stop Loss (sell): limit should be <= trigger (worse/safer price)
+                        if limit_price > trigger_price {
+                            return Err(DexError::Other(
+                                "For Long Stop Loss, limit_px must be <= trigger_px".into(),
+                            ));
+                        }
+                    }
+                    (OrderSide::Short, TpSl::Sl) => {
+                        // Short Stop Loss (buy): limit should be >= trigger (worse/safer price)
+                        if limit_price < trigger_price {
+                            return Err(DexError::Other(
+                                "For Short Stop Loss, limit_px must be >= trigger_px".into(),
+                            ));
+                        }
+                    }
+                    (OrderSide::Long, TpSl::Tp) => {
+                        // Long Take Profit (sell): limit should be >= trigger (better price)
+                        if limit_price < trigger_price {
+                            return Err(DexError::Other(
+                                "For Long Take Profit, limit_px must be >= trigger_px".into(),
+                            ));
+                        }
+                    }
+                    (OrderSide::Short, TpSl::Tp) => {
+                        // Short Take Profit (buy): limit should be <= trigger (better price)
+                        if limit_price > trigger_price {
+                            return Err(DexError::Other(
+                                "For Short Take Profit, limit_px must be <= trigger_px".into(),
+                            ));
+                        }
+                    }
+                }
+                (false, Some(limit_price))
+            }
+        };
+
+        let is_buy = is_buy_for_tpsl(side);
+
         let request = ClientOrderRequest {
             asset,
-            is_buy: side == OrderSide::Long,
-            reduce_only: false,
-            limit_px,
+            is_buy,
+            reduce_only, // Use the passed reduce_only argument
+            // NOTE: is_market=true の場合、HL側で limit_px は無視される実装前提。
+            // もし将来のAPIで解釈されるなら 0.0 は危険なのでOption化を検討。
+            // Market order failures should be logged for debugging if 0.0 causes issues.
+            limit_px: final_limit_price_opt.unwrap_or(0.0),
             sz,
             cloid: None,
             order_type: ClientOrder::Trigger(ClientTrigger {
                 is_market,
-                trigger_px: limit_px,
-                // TpSl enum serialized lowercase: "tp" or "sl"
+                trigger_px: trigger_price,
                 tpsl: format!("{:?}", tpsl).to_lowercase(),
             }),
         };
 
-        // Send the order through the exchange client
         let resp_status = self
             .exchange_client
             .order(request, None)
             .await
-            .map_err(|e| DexError::Other(format!("Order request failed: {}", e)))?;
+            .map_err(|e| {
+                DexError::Other(format!("Advanced trigger order request failed: {}", e))
+            })?;
 
-        // Unwrap the response status
         let exchange_response = match resp_status {
             ExchangeResponseStatus::Ok(x) => x,
             ExchangeResponseStatus::Err(e) => return Err(DexError::ServerResponse(e.to_string())),
         };
 
-        // Expect at least one status entry
         let status = exchange_response
             .data
             .unwrap()
@@ -1788,7 +1876,6 @@ impl DexConnector for HyperliquidConnector {
             .next()
             .ok_or_else(|| DexError::Other("No order status returned".into()))?;
 
-        // Extract the order ID from either Filled or Resting
         let oid = match status {
             ExchangeDataStatus::Filled(o) => o.oid,
             ExchangeDataStatus::Resting(o) => o.oid,
@@ -1799,11 +1886,27 @@ impl DexConnector for HyperliquidConnector {
             }
         };
 
-        // Return the CreateOrderResponse
+        // Calculate the actual ordered price based on what was sent to the exchange
+        let ordered_price = match final_limit_price_opt {
+            Some(px) => Decimal::from_f64(px).unwrap_or(trigger_px),
+            None => trigger_px, // Market系：暫定的にtrigger参照（型追加できるなら Option に）
+        };
+
+        let order_id = oid.to_string();
+
+        // TODO: Implement auto-cancel mechanism for expiry_secs
+        // if let Some(expiry) = expiry_secs {
+        //     tokio::spawn(async move {
+        //         tokio::time::sleep(tokio::time::Duration::from_secs(expiry)).await;
+        //         // Cancel order with order_id
+        //         log::info!("Auto-canceling order {} after {} seconds", order_id, expiry);
+        //     });
+        // }
+
         Ok(CreateOrderResponse {
-            order_id: oid.to_string(),
-            ordered_price: trigger_px,
-            ordered_size: size,
+            order_id,
+            ordered_price,
+            ordered_size: rounded_size,
         })
     }
 

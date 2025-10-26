@@ -23,6 +23,14 @@ pub enum OrderSide {
     Short,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+pub enum TriggerOrderStyle {
+    #[default]
+    Market,
+    Limit,
+    MarketWithSlippageControl,
+}
+
 impl fmt::Display for OrderSide {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -134,7 +142,7 @@ pub struct Trigger {
     pub tpsl: String,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum TpSl {
     /// Take‐Profit
