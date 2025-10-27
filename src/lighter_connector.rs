@@ -57,7 +57,6 @@ struct MaintenanceInfo {
     next_start: Option<DateTime<Utc>>,
 }
 
-
 // Priority message system for WebSocket sending
 #[derive(Debug)]
 enum OutboundMessage {
@@ -623,9 +622,7 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
-            maintenance: Arc::new(RwLock::new(MaintenanceInfo {
-                next_start: None,
-            })),
+            maintenance: Arc::new(RwLock::new(MaintenanceInfo { next_start: None })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             // Connection epoch counter for race detection
@@ -669,9 +666,7 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
-            maintenance: Arc::new(RwLock::new(MaintenanceInfo {
-                next_start: None,
-            })),
+            maintenance: Arc::new(RwLock::new(MaintenanceInfo { next_start: None })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             // Connection epoch counter for race detection
@@ -3230,7 +3225,10 @@ impl LighterConnector {
                                 }
                             }
                             _ => {
-                                log::warn!("Unexpected connection type for epoch {}", current_epoch);
+                                log::warn!(
+                                    "Unexpected connection type for epoch {}",
+                                    current_epoch
+                                );
                                 ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
                             }
                         };
@@ -3243,7 +3241,6 @@ impl LighterConnector {
                             local_addr,
                             peer_addr
                         );
-
 
                         // Send subscription messages
                         let subscribe_orderbook = serde_json::json!({
@@ -3299,7 +3296,6 @@ impl LighterConnector {
                         let (tx_ctrl, mut rx_ctrl) =
                             tokio::sync::mpsc::channel::<OutboundMessage>(32);
 
-
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
                         let ws_writer_for_task = ws_writer_arc.clone();
@@ -3352,12 +3348,10 @@ impl LighterConnector {
                             log::debug!("WebSocket writer task terminated");
                         });
 
-                        // Heartbeat strategy: client-initiated ping + server ping response + data keepalive
+                        // Heartbeat strategy: application-layer ping-pong + control frame ping-pong
                         const IDLE_PING_SECS: u64 = 20; // Client ping interval
-                        const KEEPALIVE_SECS: u64 = 20; // Data keepalive interval
                         const PONG_TIMEOUT_SECS: u64 = 8; // Pong timeout (reduced from 10s)
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
-
 
                         fn get_pong_payload(ping_payload: &[u8]) -> Vec<u8> {
                             // Always echo for strict server compliance
@@ -3368,7 +3362,6 @@ impl LighterConnector {
                         use std::sync::atomic::{AtomicBool, AtomicU64};
                         use std::time::{SystemTime, UNIX_EPOCH};
 
-
                         fn now_secs() -> u64 {
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -3378,9 +3371,10 @@ impl LighterConnector {
 
                         let last_rx = std::sync::Arc::new(AtomicU64::new(now_secs()));
                         let last_tx = std::sync::Arc::new(AtomicU64::new(now_secs()));
-                        let last_keepalive = std::sync::Arc::new(AtomicU64::new(now_secs()));
+                        let last_app_ping = std::sync::Arc::new(AtomicU64::new(now_secs()));
                         let last_server_ping = std::sync::Arc::new(AtomicU64::new(0));
                         let pending_client_ping = std::sync::Arc::new(AtomicBool::new(false));
+                        let pending_app_pong = std::sync::Arc::new(AtomicBool::new(false));
                         let last_client_ping_payload =
                             std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
 
@@ -3388,9 +3382,10 @@ impl LighterConnector {
                         let ping_is_running = is_running.clone();
                         let _ping_last_rx = last_rx.clone();
                         let ping_last_tx = last_tx.clone();
-                        let ping_last_keepalive = last_keepalive.clone();
+                        let ping_last_app_ping = last_app_ping.clone();
                         let _ping_last_server_ping = last_server_ping.clone();
                         let ping_pending_client_ping = pending_client_ping.clone();
+                        let ping_pending_app_pong = pending_app_pong.clone();
                         let ping_last_client_ping_payload = last_client_ping_payload.clone();
                         let ping_tx_ctrl = tx_ctrl.clone();
 
@@ -3411,7 +3406,6 @@ impl LighterConnector {
 
                                         let now = now_secs();
                                         let idle_tx = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
-                                        let idle_keepalive = now.saturating_sub(ping_last_keepalive.load(Ordering::SeqCst));
 
                                         // Send client ping regularly (every 20s) regardless of server ping activity
                                         // This ensures server's ~120s client ping requirement is always satisfied
@@ -3435,37 +3429,47 @@ impl LighterConnector {
                                             log::trace!("🏓 [CLIENT_PING] Sent regular client ping (idle_tx: {}s)", idle_tx);
                                         }
 
-                                        // Send data keepalive (every 20s) to prevent LB/proxy idle disconnects
-                                        // Send unsolicited Pong + tiny data frame for LB/proxy that don't count control frames
-                                        if idle_keepalive >= KEEPALIVE_SECS {
-                                            // Send unsolicited Pong (harmless data frame)
-                                            let pong_msg = OutboundMessage::Control(
-                                                tokio_tungstenite::tungstenite::Message::Pong(Vec::new())
+
+                                        // Send application-layer ping (every 20s) for servers that require JSON ping-pong
+                                        let idle_app_ping = now.saturating_sub(ping_last_app_ping.load(Ordering::SeqCst));
+                                        if !ping_pending_app_pong.load(Ordering::SeqCst) && idle_app_ping >= IDLE_PING_SECS {
+                                            // Send application-layer ping with timestamp
+                                            let app_ping = serde_json::json!({
+                                                "type": "ping",
+                                                "ts": now
+                                            });
+
+                                            let ping_msg = OutboundMessage::Control(
+                                                tokio_tungstenite::tungstenite::Message::Text(app_ping.to_string())
                                             );
-                                            if let Err(e) = ping_tx_ctrl.send(pong_msg).await {
-                                                log::warn!("Keepalive Pong send failed: {:?}", e);
+                                            if let Err(e) = ping_tx_ctrl.send(ping_msg).await {
+                                                log::warn!("Failed to send application-layer ping: {:?}", e);
                                                 break;
                                             }
 
-                                            // Send tiny data frame to keep connection active for LB/proxy
-                                            // Note: Using Text frame for compatibility (some servers may reject binary data)
-                                            let data_msg = OutboundMessage::Control(
-                                                tokio_tungstenite::tungstenite::Message::Text("💓".into())
-                                            );
-                                            if let Err(e) = ping_tx_ctrl.send(data_msg).await {
-                                                log::warn!("Keepalive data send failed: {:?}", e);
-                                                // Continue even if data frame fails
-                                            }
-
-                                            ping_last_keepalive.store(now, Ordering::SeqCst);
-                                            log::trace!("[KA] sent unsolicited Pong and tiny data frame (idle_keepalive: {}s)", idle_keepalive);
+                                            ping_pending_app_pong.store(true, Ordering::SeqCst);
+                                            ping_last_app_ping.store(now, Ordering::SeqCst);
+                                            log::trace!("🏓 [APP_PING_SENT] application-layer ping sent (idle_app: {}s)", idle_app_ping);
                                         }
 
-                                        // Check for pong timeout
+                                        // Check for control frame pong timeout
                                         if ping_pending_client_ping.load(Ordering::SeqCst) {
                                             let waited = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
                                             if waited >= PONG_TIMEOUT_SECS {
-                                                log::warn!("Pong timeout ({}s) -> closing connection for reconnect", waited);
+                                                log::warn!("Control pong timeout ({}s) -> closing connection for reconnect", waited);
+                                                let close_msg = OutboundMessage::Control(
+                                                    tokio_tungstenite::tungstenite::Message::Close(None)
+                                                );
+                                                let _ = ping_tx_ctrl.send(close_msg).await;
+                                                break;
+                                            }
+                                        }
+
+                                        // Check for application-layer pong timeout
+                                        if ping_pending_app_pong.load(Ordering::SeqCst) {
+                                            let waited = now.saturating_sub(ping_last_app_ping.load(Ordering::SeqCst));
+                                            if waited >= PONG_TIMEOUT_SECS {
+                                                log::warn!("Application pong timeout ({}s) -> closing connection for reconnect", waited);
                                                 let close_msg = OutboundMessage::Control(
                                                     tokio_tungstenite::tungstenite::Message::Close(None)
                                                 );
@@ -3507,6 +3511,59 @@ impl LighterConnector {
 
                                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
                                             let parse_duration = msg_start.elapsed();
+
+                                            // Check for application-layer ping/pong FIRST (before business logic)
+                                            if let Some(msg_type) =
+                                                parsed.get("type").and_then(|t| t.as_str())
+                                            {
+                                                if msg_type == "ping" {
+                                                    // Immediate application-layer pong response
+                                                    let mut pong =
+                                                        serde_json::json!({"type": "pong"});
+
+                                                    // Echo any timestamp/id fields as required by server
+                                                    if let Some(ts) = parsed.get("ts") {
+                                                        pong["ts"] = ts.clone();
+                                                    }
+                                                    if let Some(id) = parsed.get("id") {
+                                                        pong["id"] = id.clone();
+                                                    }
+                                                    if let Some(nonce) = parsed.get("nonce") {
+                                                        pong["nonce"] = nonce.clone();
+                                                    }
+
+                                                    // Send application-layer pong (NOT control frame pong)
+                                                    if let Ok(mut ws_write) =
+                                                        ws_writer_for_reader.try_lock()
+                                                    {
+                                                        let pong_start = std::time::Instant::now();
+                                                        if let Err(e) = ws_write.send(
+                                                            tokio_tungstenite::tungstenite::Message::Text(pong.to_string())
+                                                        ).await {
+                                                            log::error!("Failed to send application-layer pong: {:?}", e);
+                                                        } else {
+                                                            let pong_time = pong_start.elapsed();
+                                                            log::info!("📨 [APP_PONG_SENT] response in {:?} to ping: {}", pong_time, pong);
+                                                        }
+                                                    } else {
+                                                        log::warn!("⚠️ [APP_PONG_BLOCKED] Could not acquire writer lock for application pong");
+                                                    }
+
+                                                    // Continue to next message (don't process ping as business data)
+                                                    continue;
+                                                } else if msg_type == "pong" {
+                                                    // Application-layer pong received - clear pending state
+                                                    pending_app_pong.store(false, Ordering::SeqCst);
+                                                    let app_ping_time =
+                                                        last_app_ping.load(Ordering::SeqCst);
+                                                    let rtt = now.saturating_sub(app_ping_time);
+                                                    log::info!("✅ [APP_PONG_RECEIVED] application-layer pong received (RTT: {}s)", rtt);
+
+                                                    // Continue to next message (don't process pong as business data)
+                                                    continue;
+                                                }
+                                            }
+
                                             let handle_start = std::time::Instant::now();
 
                                             Self::handle_websocket_message(
@@ -3632,7 +3689,6 @@ impl LighterConnector {
                                                            },
                                                            local_addr, peer_addr, current_epoch, pong_epoch);
                                             }
-
                                         } else {
                                             // Fallback to try_lock with retry for up to 200ms
                                             let mut pong_sent = false;
