@@ -3352,9 +3352,10 @@ impl LighterConnector {
                             log::debug!("WebSocket writer task terminated");
                         });
 
-                        // Heartbeat strategy: client-initiated ping + server ping response
-                        const IDLE_PING_SECS: u64 = 20; // Legacy idle ping (kept for compatibility)
-                        const PONG_TIMEOUT_SECS: u64 = 10; // Legacy pong timeout (kept for compatibility)
+                        // Heartbeat strategy: client-initiated ping + server ping response + data keepalive
+                        const IDLE_PING_SECS: u64 = 20; // Client ping interval
+                        const KEEPALIVE_SECS: u64 = 20; // Data keepalive interval
+                        const PONG_TIMEOUT_SECS: u64 = 8; // Pong timeout (reduced from 10s)
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
 
 
@@ -3377,6 +3378,7 @@ impl LighterConnector {
 
                         let last_rx = std::sync::Arc::new(AtomicU64::new(now_secs()));
                         let last_tx = std::sync::Arc::new(AtomicU64::new(now_secs()));
+                        let last_keepalive = std::sync::Arc::new(AtomicU64::new(now_secs()));
                         let last_server_ping = std::sync::Arc::new(AtomicU64::new(0));
                         let pending_client_ping = std::sync::Arc::new(AtomicBool::new(false));
                         let last_client_ping_payload =
@@ -3386,6 +3388,7 @@ impl LighterConnector {
                         let ping_is_running = is_running.clone();
                         let _ping_last_rx = last_rx.clone();
                         let ping_last_tx = last_tx.clone();
+                        let ping_last_keepalive = last_keepalive.clone();
                         let _ping_last_server_ping = last_server_ping.clone();
                         let ping_pending_client_ping = pending_client_ping.clone();
                         let ping_last_client_ping_payload = last_client_ping_payload.clone();
@@ -3408,8 +3411,9 @@ impl LighterConnector {
 
                                         let now = now_secs();
                                         let idle_tx = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
+                                        let idle_keepalive = now.saturating_sub(ping_last_keepalive.load(Ordering::SeqCst));
 
-                                        // Send client ping regularly (every 30s) regardless of server ping activity
+                                        // Send client ping regularly (every 20s) regardless of server ping activity
                                         // This ensures server's ~120s client ping requirement is always satisfied
                                         if !ping_pending_client_ping.load(Ordering::SeqCst)
                                             && idle_tx >= IDLE_PING_SECS
@@ -3429,6 +3433,32 @@ impl LighterConnector {
                                             ping_pending_client_ping.store(true, Ordering::SeqCst);
                                             ping_last_tx.store(now, Ordering::SeqCst);
                                             log::trace!("🏓 [CLIENT_PING] Sent regular client ping (idle_tx: {}s)", idle_tx);
+                                        }
+
+                                        // Send data keepalive (every 20s) to prevent LB/proxy idle disconnects
+                                        // Send unsolicited Pong + tiny data frame for LB/proxy that don't count control frames
+                                        if idle_keepalive >= KEEPALIVE_SECS {
+                                            // Send unsolicited Pong (harmless data frame)
+                                            let pong_msg = OutboundMessage::Control(
+                                                tokio_tungstenite::tungstenite::Message::Pong(Vec::new())
+                                            );
+                                            if let Err(e) = ping_tx_ctrl.send(pong_msg).await {
+                                                log::warn!("Keepalive Pong send failed: {:?}", e);
+                                                break;
+                                            }
+
+                                            // Send tiny data frame to keep connection active for LB/proxy
+                                            // Note: Using Text frame for compatibility (some servers may reject binary data)
+                                            let data_msg = OutboundMessage::Control(
+                                                tokio_tungstenite::tungstenite::Message::Text("💓".into())
+                                            );
+                                            if let Err(e) = ping_tx_ctrl.send(data_msg).await {
+                                                log::warn!("Keepalive data send failed: {:?}", e);
+                                                // Continue even if data frame fails
+                                            }
+
+                                            ping_last_keepalive.store(now, Ordering::SeqCst);
+                                            log::trace!("[KA] sent unsolicited Pong and tiny data frame (idle_keepalive: {}s)", idle_keepalive);
                                         }
 
                                         // Check for pong timeout
