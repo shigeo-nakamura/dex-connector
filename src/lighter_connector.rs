@@ -498,6 +498,65 @@ impl LighterConnector {
         }
     }
 
+    /// Start auto-cleanup background task for filled orders
+    /// Removes orders older than specified duration to prevent memory bloat
+    pub fn start_auto_cleanup(&self, cleanup_interval_hours: u64) {
+        let filled_orders = Arc::clone(&self.filled_orders);
+        let canceled_orders = Arc::clone(&self.canceled_orders);
+        let is_running = Arc::clone(&self.is_running);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_hours * 3600));
+
+            while is_running.load(Ordering::SeqCst) {
+                interval.tick().await;
+
+                // Clean up filled orders - simple approach since FilledOrder doesn't have timestamp
+                let mut total_removed = 0;
+
+                {
+                    let mut filled = filled_orders.write().await;
+                    for (symbol, orders) in filled.iter_mut() {
+                        // Keep only the most recent 100 filled orders per symbol
+                        if orders.len() > 100 {
+                            let keep_count = 50; // Keep recent 50 orders
+                            let remove_count = orders.len() - keep_count;
+                            orders.drain(0..remove_count);
+                            total_removed += remove_count;
+                            log::debug!("🗑️ [AUTO_CLEANUP] Removed {} old filled orders for {} (kept {})", remove_count, symbol, keep_count);
+                        }
+                    }
+                    // Remove empty symbol entries
+                    filled.retain(|_, orders| !orders.is_empty());
+                }
+
+                {
+                    let mut canceled = canceled_orders.write().await;
+                    let cutoff_timestamp = (Utc::now() - ChronoDuration::hours(24)).timestamp() as u64;
+
+                    for (symbol, orders) in canceled.iter_mut() {
+                        let initial_len = orders.len();
+                        orders.retain(|order| {
+                            order.canceled_timestamp > cutoff_timestamp
+                        });
+                        let removed = initial_len - orders.len();
+                        total_removed += removed;
+
+                        if removed > 0 {
+                            log::debug!("🗑️ [AUTO_CLEANUP] Removed {} old canceled orders for {}", removed, symbol);
+                        }
+                    }
+                    // Remove empty symbol entries
+                    canceled.retain(|_, orders| !orders.is_empty());
+                }
+
+                if total_removed > 0 {
+                    log::info!("🗑️ [AUTO_CLEANUP] Total removed {} old orders", total_removed);
+                }
+            }
+        });
+    }
+
     /// Initialize Go client (disabled when lighter-sdk feature is not enabled)
     #[cfg(not(feature = "lighter-sdk"))]
     async fn create_go_client(&self) -> Result<(), DexError> {
@@ -1730,6 +1789,10 @@ impl DexConnector for LighterConnector {
         // Start WebSocket connection
         self.start_websocket().await?;
 
+        // Start auto-cleanup background task (every 6 hours)
+        self.start_auto_cleanup(6);
+        log::info!("🗑️ [AUTO_CLEANUP] Started background cleanup task (every 6 hours)");
+
         Ok(())
     }
 
@@ -2237,16 +2300,34 @@ impl DexConnector for LighterConnector {
         Ok(LastTradesResponse { trades })
     }
 
-    async fn clear_filled_order(&self, _symbol: &str, _trade_id: &str) -> Result<(), DexError> {
-        Err(DexError::Other(
-            "clear_filled_order not supported for Lighter - filled orders are streamed via WebSocket only".to_string()
-        ))
+    async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
+        let mut filled_orders = self.filled_orders.write().await;
+        if let Some(orders) = filled_orders.get_mut(symbol) {
+            let initial_len = orders.len();
+            orders.retain(|order| order.trade_id.to_string() != trade_id);
+            if orders.len() < initial_len {
+                log::debug!("🗑️ [CLEAR_FILL] Removed trade_id {} for {}", trade_id, symbol);
+                Ok(())
+            } else {
+                Err(DexError::Other(format!(
+                    "Trade ID {} not found for symbol {}",
+                    trade_id, symbol
+                )))
+            }
+        } else {
+            Err(DexError::Other(format!(
+                "No filled orders found for symbol {}",
+                symbol
+            )))
+        }
     }
 
     async fn clear_all_filled_orders(&self) -> Result<(), DexError> {
-        Err(DexError::Other(
-            "clear_all_filled_orders not supported for Lighter - filled orders are streamed via WebSocket only".to_string()
-        ))
+        let mut filled_orders = self.filled_orders.write().await;
+        let total_cleared = filled_orders.values().map(|v| v.len()).sum::<usize>();
+        filled_orders.clear();
+        log::info!("🗑️ [CLEAR_ALL_FILLS] Cleared {} filled orders across all symbols", total_cleared);
+        Ok(())
     }
 
     async fn clear_canceled_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
