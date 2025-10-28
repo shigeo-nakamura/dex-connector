@@ -3374,9 +3374,25 @@ impl LighterConnector {
                                     }
                                 }
                             }
-                            _ => {
+                            tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
+                                if let Err(e) = tcp_stream.set_nodelay(true) {
+                                    log::warn!("Failed to set TCP_NODELAY on plain WS: {}", e);
+                                }
+                                match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
+                                    (Ok(local), Ok(peer)) => (local, peer),
+                                    _ => {
+                                        log::warn!(
+                                            "Failed to get plain socket addresses for epoch {}",
+                                            current_epoch
+                                        );
+                                        ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
+                                    }
+                                }
+                            }
+                            other => {
                                 log::warn!(
-                                    "Unexpected connection type for epoch {}",
+                                    "Unsupported WebSocket stream type {:?} for epoch {}",
+                                    other,
                                     current_epoch
                                 );
                                 ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
