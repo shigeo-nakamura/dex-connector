@@ -44,6 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 /// Determine buy/sell direction for SL/TP orders based on position direction
 /// Returns true for buy orders, false for sell orders
@@ -184,6 +185,9 @@ pub struct LighterConnector {
     // Cache for API key data to avoid repeated requests
     cached_server_pubkey: Arc<tokio::sync::RwLock<Option<(String, std::time::Instant)>>>,
     is_running: Arc<AtomicBool>,
+    // Auto-cleanup management
+    cleanup_started: Arc<AtomicBool>,
+    cleanup_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     _ws: Option<DexWebSocket>, // Reserved for future WebSocket implementation
     // WebSocket data storage
     current_price: Arc<RwLock<Option<(Decimal, u64)>>>, // (price, timestamp)
@@ -501,59 +505,104 @@ impl LighterConnector {
     /// Start auto-cleanup background task for filled orders
     /// Removes orders older than specified duration to prevent memory bloat
     pub fn start_auto_cleanup(&self, cleanup_interval_hours: u64) {
+        if self.cleanup_started.swap(true, Ordering::SeqCst) {
+            log::warn!("[AUTO_CLEANUP] already started; ignoring.");
+            return;
+        }
+
+        log::info!(
+            "[AUTO_CLEANUP] Starting background task (interval: {}h)",
+            cleanup_interval_hours
+        );
+
         let filled_orders = Arc::clone(&self.filled_orders);
         let canceled_orders = Arc::clone(&self.canceled_orders);
         let is_running = Arc::clone(&self.is_running);
+        let cleanup_started = Arc::clone(&self.cleanup_started);
+        let cleanup_handle = Arc::clone(&self.cleanup_handle);
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_hours * 3600));
+        let handle = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(cleanup_interval_hours * 3600));
+            // Skip the first immediate tick to delay initial cleanup
+            interval.tick().await;
 
-            while is_running.load(Ordering::SeqCst) {
+            while is_running.load(Ordering::Relaxed) {
                 interval.tick().await;
 
-                // Clean up filled orders - simple approach since FilledOrder doesn't have timestamp
-                let mut total_removed = 0;
+                let mut filled_removed = 0usize;
+                let mut canceled_removed = 0usize;
 
+                // Clean up filled orders - simple approach since FilledOrder doesn't have timestamp
                 {
                     let mut filled = filled_orders.write().await;
                     for (symbol, orders) in filled.iter_mut() {
-                        // Keep only the most recent 100 filled orders per symbol
-                        if orders.len() > 100 {
-                            let keep_count = 50; // Keep recent 50 orders
-                            let remove_count = orders.len() - keep_count;
+                        const KEEP_FILLED_PER_SYMBOL: usize = 50;
+                        if orders.len() > KEEP_FILLED_PER_SYMBOL {
+                            let remove_count = orders.len() - KEEP_FILLED_PER_SYMBOL;
+                            // Assumes first elements are oldest (order insertion maintains chronological order)
                             orders.drain(0..remove_count);
-                            total_removed += remove_count;
-                            log::debug!("🗑️ [AUTO_CLEANUP] Removed {} old filled orders for {} (kept {})", remove_count, symbol, keep_count);
+                            filled_removed += remove_count;
+                            log::debug!(
+                                "🗑️ [AUTO_CLEANUP] Removed {} old filled orders for {} (kept {})",
+                                remove_count,
+                                symbol,
+                                KEEP_FILLED_PER_SYMBOL
+                            );
                         }
                     }
                     // Remove empty symbol entries
                     filled.retain(|_, orders| !orders.is_empty());
                 }
 
+                // Clean up canceled orders older than 24 hours
                 {
                     let mut canceled = canceled_orders.write().await;
-                    let cutoff_timestamp = (Utc::now() - ChronoDuration::hours(24)).timestamp() as u64;
+                    // NOTE: canceled_timestamp is seconds since epoch (not milliseconds)
+                    let cutoff_secs = (Utc::now() - ChronoDuration::hours(24)).timestamp() as u64;
 
                     for (symbol, orders) in canceled.iter_mut() {
                         let initial_len = orders.len();
-                        orders.retain(|order| {
-                            order.canceled_timestamp > cutoff_timestamp
-                        });
-                        let removed = initial_len - orders.len();
-                        total_removed += removed;
+                        // Keep orders newer than 24 hours (timestamp > cutoff means newer)
+                        orders.retain(|order| order.canceled_timestamp > cutoff_secs);
+                        let removed = initial_len.saturating_sub(orders.len());
+                        canceled_removed += removed;
 
                         if removed > 0 {
-                            log::debug!("🗑️ [AUTO_CLEANUP] Removed {} old canceled orders for {}", removed, symbol);
+                            log::debug!(
+                                "🗑️ [AUTO_CLEANUP] Removed {} old canceled orders for {}",
+                                removed,
+                                symbol
+                            );
                         }
                     }
                     // Remove empty symbol entries
                     canceled.retain(|_, orders| !orders.is_empty());
                 }
 
+                let total_removed = filled_removed + canceled_removed;
                 if total_removed > 0 {
-                    log::info!("🗑️ [AUTO_CLEANUP] Total removed {} old orders", total_removed);
+                    log::info!(
+                        "🗑️ [AUTO_CLEANUP] removed total={} (filled={}, canceled={})",
+                        total_removed,
+                        filled_removed,
+                        canceled_removed
+                    );
                 }
             }
+
+            // Cleanup on exit: reset state for potential restart
+            cleanup_started.store(false, Ordering::SeqCst);
+            let mut guard = cleanup_handle.lock().await;
+            *guard = None;
+            log::info!("🛑 [AUTO_CLEANUP] task exited, ready for restart");
+        });
+
+        // Store the handle using async context
+        let cleanup_handle_for_storage = Arc::clone(&self.cleanup_handle);
+        tokio::spawn(async move {
+            let mut guard = cleanup_handle_for_storage.lock().await;
+            *guard = Some(handle);
         });
     }
 
@@ -677,6 +726,9 @@ impl LighterConnector {
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
+            // Auto-cleanup management
+            cleanup_started: Arc::new(AtomicBool::new(false)),
+            cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             _ws: Some(DexWebSocket::new(websocket_url)),
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
@@ -721,6 +773,9 @@ impl LighterConnector {
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
+            // Auto-cleanup management
+            cleanup_started: Arc::new(AtomicBool::new(false)),
+            cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             _ws: Some(DexWebSocket::new(websocket_url)),
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
@@ -1798,6 +1853,14 @@ impl DexConnector for LighterConnector {
 
     async fn stop(&self) -> Result<(), DexError> {
         self.is_running.store(false, Ordering::SeqCst);
+
+        // Optionally abort cleanup task for immediate shutdown
+        if let Some(handle) = self.cleanup_handle.lock().await.take() {
+            handle.abort();
+            self.cleanup_started.store(false, Ordering::SeqCst);
+            log::debug!("🛑 [AUTO_CLEANUP] task forcibly aborted on stop");
+        }
+
         log::debug!("Lighter connector stopped");
         Ok(())
     }
@@ -2304,9 +2367,13 @@ impl DexConnector for LighterConnector {
         let mut filled_orders = self.filled_orders.write().await;
         if let Some(orders) = filled_orders.get_mut(symbol) {
             let initial_len = orders.len();
-            orders.retain(|order| order.trade_id.to_string() != trade_id);
+            orders.retain(|order| order.trade_id != trade_id);
             if orders.len() < initial_len {
-                log::debug!("🗑️ [CLEAR_FILL] Removed trade_id {} for {}", trade_id, symbol);
+                log::debug!(
+                    "🗑️ [CLEAR_FILL] Removed trade_id {} for {}",
+                    trade_id,
+                    symbol
+                );
                 Ok(())
             } else {
                 Err(DexError::Other(format!(
@@ -2326,7 +2393,10 @@ impl DexConnector for LighterConnector {
         let mut filled_orders = self.filled_orders.write().await;
         let total_cleared = filled_orders.values().map(|v| v.len()).sum::<usize>();
         filled_orders.clear();
-        log::info!("🗑️ [CLEAR_ALL_FILLS] Cleared {} filled orders across all symbols", total_cleared);
+        log::info!(
+            "🗑️ [CLEAR_ALL_FILLS] Cleared {} filled orders across all symbols",
+            total_cleared
+        );
         Ok(())
     }
 
