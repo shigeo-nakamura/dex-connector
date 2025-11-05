@@ -2751,7 +2751,7 @@ impl DexConnector for LighterConnector {
         // Convert time-in-force: 0=IOC, 1=GTT, 2=PostOnly
         // Use spread parameter to specify TIF when negative values:
         // spread >= 0: normal spread adjustment
-        // spread = -1: IOC order
+        // spread = -1: Request IOC (degraded to GTT on Lighter)
         // spread = -2: Post-only order
         let default_tif = TIF_GTT;
 
@@ -2782,7 +2782,7 @@ impl DexConnector for LighterConnector {
                 if spread_ticks < 0 {
                     // Negative spread values specify TIF
                     let tif_value = match spread_ticks {
-                        -1 => TIF_IOC,       // IOC
+                        -1 => TIF_GTT,       // Treat IOC override as resting GTT on Lighter
                         -2 => TIF_POST_ONLY, // Post-only (resting limit)
                         _ => {
                             log::warn!("Invalid TIF spread value: {}, using GTT", spread_ticks);
