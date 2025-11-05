@@ -4,17 +4,16 @@
 const ORDER_TYPE_LIMIT: u32 = 0;
 const ORDER_TYPE_IOC: u32 = 1;
 const ORDER_TYPE_TRIGGER: u32 = 2;
-// Note: FOK and TRIGGER share the same value (2) in Lighter Protocol
-// This is intentional - FOK is a specific TIF behavior, not a separate order type
-const ORDER_TYPE_FOK: u32 = 2; // Fill-or-Kill - same underlying type as TRIGGER
+// Note: Lighter reuses enum values for certain order-type/TIF combinations.
 
 // Lighter Protocol Side constants (order direction, not position direction)
 const SIDE_SELL: u32 = 0; // Sell order (close long positions, open short positions)
 const SIDE_BUY: u32 = 1; // Buy order (close short positions, open long positions)
 
-// Lighter Protocol Time-in-Force constants
-const TIME_IN_FORCE_IOC: u32 = 0; // Immediate-or-Cancel
-const TIME_IN_FORCE_GTC: u32 = 1; // Good-Till-Cancel
+// Lighter Protocol Time-in-Force constants (as used by the Go SDK)
+const TIF_GTC: u32 = 0; // Good-Till-Cancel
+const TIF_IOC: u32 = 1; // Immediate-or-Cancel
+const TIF_FOK: u32 = 2; // Fill-or-Kill
 
 // Lighter Protocol scaling defaults (will be overridden by market metadata)
 const DEFAULT_PRICE_DECIMALS: u32 = 1;
@@ -1083,10 +1082,11 @@ impl LighterConnector {
         let time_in_force = tif as u64; // Use passed time in force
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price = 0u64; // no trigger
-                                  // For market orders and IOC orders, use 0 as expiry. For GTC orders, use future timestamp
-        let order_expiry = if order_type == ORDER_TYPE_IOC || tif == 0 {
-            // ORDER_TYPE_MARKET or IOC orders
-            0i64 // NilOrderExpiry for immediate-or-cancel orders
+                                  // For market or immediate TIF orders, use 0 (NilOrderExpiry). For GTC orders, use future timestamp
+        let is_immediate_tif =
+            time_in_force == u64::from(TIF_IOC) || time_in_force == u64::from(TIF_FOK);
+        let order_expiry = if order_type == ORDER_TYPE_IOC || is_immediate_tif {
+            0i64 // NilOrderExpiry for immediate-or-cancel / fill-or-kill orders
         } else {
             // For GTC limit orders, use passed expiry_secs or default to 24 hours
             let expiry_duration_ms = if let Some(expiry_secs) = expiry_secs {
@@ -1145,7 +1145,7 @@ impl LighterConnector {
                 actual_side as i32,
                 order_type_param as i32,
                 time_in_force as i32,
-                reduce_only as i32,
+                reduce_only_param as i32,
                 trigger_price as i32,
                 order_expiry as i64,
                 nonce as i64,
@@ -2754,7 +2754,7 @@ impl DexConnector for LighterConnector {
         // spread >= 0: normal spread adjustment
         // spread = -1: IOC order
         // spread = -2: FOK order
-        let default_tif = 0; // Default to GTC
+        let default_tif = TIF_GTC;
 
         let price_decimals = market_info.price_decimals;
         let size_decimals = market_info.size_decimals;
@@ -2783,8 +2783,8 @@ impl DexConnector for LighterConnector {
                 if spread_ticks < 0 {
                     // Negative spread values specify TIF
                     let tif_value = match spread_ticks {
-                        -1 => ORDER_TYPE_IOC, // IOC
-                        -2 => ORDER_TYPE_FOK, // FOK
+                        -1 => TIF_IOC, // IOC
+                        -2 => TIF_FOK, // FOK
                         _ => {
                             log::warn!("Invalid TIF spread value: {}, using GTC", spread_ticks);
                             default_tif
@@ -2859,7 +2859,7 @@ impl DexConnector for LighterConnector {
                 size_decimals
             );
 
-            (price_val, ORDER_TYPE_IOC, 0u32) // order_type=IOC (market), tif=0 (IOC)
+            (price_val, ORDER_TYPE_IOC, TIF_IOC) // Market orders use IOC semantics
         };
 
         // Use native Rust implementation for Lighter signatures
@@ -3055,11 +3055,7 @@ impl DexConnector for LighterConnector {
         };
 
         // Set TimeInForce based on order type (using global protocol constants)
-        let time_in_force = if is_market {
-            TIME_IN_FORCE_IOC
-        } else {
-            TIME_IN_FORCE_GTC
-        };
+        let time_in_force = if is_market { TIF_IOC } else { TIF_GTC };
 
         log::debug!(
             "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}",
