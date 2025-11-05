@@ -58,6 +58,18 @@ struct MaintenanceInfo {
     next_start: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug)]
+struct MarketInfo {
+    canonical_symbol: String,
+    market_id: u32,
+}
+
+#[derive(Default, Debug)]
+struct MarketCache {
+    by_symbol: HashMap<String, MarketInfo>,
+    by_id: HashMap<u32, MarketInfo>,
+}
+
 // Priority message system for WebSocket sending
 #[derive(Debug)]
 enum OutboundMessage {
@@ -77,6 +89,24 @@ impl OutboundMessage {
             _ => false,
         }
     }
+}
+
+fn normalize_symbol(symbol: &str) -> String {
+    let upper = symbol.trim().to_ascii_uppercase();
+    let mut normalized = upper
+        .replace("-PERP", "")
+        .replace("_PERP", "")
+        .replace(".PERP", "")
+        .replace("-USD", "")
+        .replace("_USD", "")
+        .replace("/USD", "")
+        .replace("-USDC", "")
+        .replace("_USDC", "")
+        .replace("/USDC", "");
+    if normalized.ends_with("-PERP") {
+        normalized = normalized.trim_end_matches("-PERP").to_string();
+    }
+    normalized
 }
 
 // Cryptographic imports
@@ -198,6 +228,10 @@ pub struct LighterConnector {
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
     // Connection epoch counter for race detection
     connection_epoch: Arc<AtomicU64>,
+    // Market metadata cache for symbol↔market_id resolution
+    market_cache: Arc<RwLock<MarketCache>>,
+    // Symbols requested by caller (for order book subscription)
+    tracked_symbols: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -352,6 +386,51 @@ struct LighterSignedEnvelope {
 // Lighter-specific cryptographic structures
 
 impl LighterConnector {
+    async fn refresh_market_cache(&self) -> Result<(), DexError> {
+        let funding = self.get_funding_rates().await?;
+        let mut cache = MarketCache::default();
+
+        for entry in funding.funding_rates {
+            let normalized = normalize_symbol(&entry.symbol);
+            if normalized.is_empty() {
+                continue;
+            }
+            let info = MarketInfo {
+                canonical_symbol: normalized.clone(),
+                market_id: entry.market_id,
+            };
+            cache.by_symbol.insert(normalized.clone(), info.clone());
+            cache.by_id.insert(entry.market_id, info);
+        }
+
+        if cache.by_symbol.is_empty() {
+            return Err(DexError::Other(
+                "Funding rates response did not contain any markets".to_string(),
+            ));
+        }
+
+        *self.market_cache.write().await = cache;
+        Ok(())
+    }
+
+    async fn resolve_market_info(&self, symbol: &str) -> Result<MarketInfo, DexError> {
+        let normalized = normalize_symbol(symbol);
+        {
+            let cache = self.market_cache.read().await;
+            if let Some(info) = cache.by_symbol.get(&normalized) {
+                return Ok(info.clone());
+            }
+        }
+
+        self.refresh_market_cache().await?;
+        let cache = self.market_cache.read().await;
+        cache
+            .by_symbol
+            .get(&normalized)
+            .cloned()
+            .ok_or_else(|| DexError::Other(format!("Unknown symbol: {}", symbol)))
+    }
+
     /// Initialize Go client
     #[cfg(feature = "lighter-sdk")]
     async fn create_go_client(&self) -> Result<(), DexError> {
@@ -702,6 +781,7 @@ impl LighterConnector {
         account_index: u32,
         base_url: String,
         websocket_url: String,
+        tracked_symbols: Vec<String>,
     ) -> Result<Self, DexError> {
         // For backward compatibility, derive L1 address for logging if possible
         let l1_address = "N/A".to_string(); // We don't need wallet address anymore
@@ -738,6 +818,8 @@ impl LighterConnector {
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
+            market_cache: Arc::new(RwLock::new(MarketCache::default())),
+            tracked_symbols,
         })
     }
 
@@ -750,6 +832,7 @@ impl LighterConnector {
         account_index: u32,
         base_url: String,
         websocket_url: String,
+        tracked_symbols: Vec<String>,
     ) -> Result<Self, DexError> {
         // For backward compatibility, derive L1 address for logging if possible
         let l1_address = "N/A".to_string(); // We don't need wallet address anymore
@@ -785,6 +868,8 @@ impl LighterConnector {
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
+            market_cache: Arc::new(RwLock::new(MarketCache::default())),
+            tracked_symbols,
         })
     }
 
@@ -1896,6 +1981,9 @@ impl DexConnector for LighterConnector {
             });
         }
 
+        let market_info = self.resolve_market_info(symbol).await?;
+        let canonical_symbol = market_info.canonical_symbol.clone();
+
         // Get statistics data from API
         let stats_data = self.get_exchange_stats().await.ok();
         let funding_data = self.get_funding_rates().await.ok();
@@ -1919,17 +2007,17 @@ impl DexConnector for LighterConnector {
                 let min_tick = Self::calculate_min_tick(ws_price, 3, false);
 
                 let (volume, num_trades) = if let Some(stats) = &stats_data {
-                    if let Some(btc_stats) = stats
+                    if let Some(market_stats) = stats
                         .order_book_stats
                         .iter()
-                        .find(|s| s.symbol == "BTC" || s.symbol == "BTCUSD")
+                        .find(|s| normalize_symbol(&s.symbol) == canonical_symbol)
                     {
                         (
                             Some(
-                                Decimal::from_f64_retain(btc_stats.daily_base_token_volume)
+                                Decimal::from_f64_retain(market_stats.daily_base_token_volume)
                                     .unwrap_or(Decimal::ZERO),
                             ),
-                            Some(btc_stats.daily_trades_count as u64),
+                            Some(market_stats.daily_trades_count as u64),
                         )
                     } else {
                         (Some(Decimal::ZERO), None)
@@ -1942,7 +2030,7 @@ impl DexConnector for LighterConnector {
                     funding
                         .funding_rates
                         .iter()
-                        .find(|f| f.symbol == "BTC" || f.symbol == "BTCUSD")
+                        .find(|f| normalize_symbol(&f.symbol) == canonical_symbol)
                         .and_then(|f| Decimal::from_f64_retain(f.rate))
                 } else {
                     None
@@ -1973,10 +2061,7 @@ impl DexConnector for LighterConnector {
         log::warn!("WebSocket data not available, falling back to REST API");
 
         // Get market_id for the symbol
-        let market_id = match symbol {
-            "BTC" => 1,
-            _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
-        };
+        let market_id = market_info.market_id;
 
         // Query recent trades to get current price and volume
         let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=100", market_id);
@@ -2027,7 +2112,7 @@ impl DexConnector for LighterConnector {
             funding
                 .funding_rates
                 .iter()
-                .find(|f| f.symbol == "BTC" || f.symbol == "BTCUSD")
+                .find(|f| normalize_symbol(&f.symbol) == canonical_symbol)
                 .and_then(|f| Decimal::from_f64_retain(f.rate))
         } else {
             None
@@ -2035,17 +2120,17 @@ impl DexConnector for LighterConnector {
 
         // Use stats data if available, otherwise fallback to trades data
         let (volume, num_trades) = if let Some(stats) = &stats_data {
-            if let Some(btc_stats) = stats
+            if let Some(market_stats) = stats
                 .order_book_stats
                 .iter()
-                .find(|s| s.symbol == "BTC" || s.symbol == "BTCUSD")
+                .find(|s| normalize_symbol(&s.symbol) == canonical_symbol)
             {
                 (
                     Some(
-                        Decimal::from_f64_retain(btc_stats.daily_base_token_volume)
+                        Decimal::from_f64_retain(market_stats.daily_base_token_volume)
                             .unwrap_or(Decimal::ZERO),
                     ),
-                    Some(btc_stats.daily_trades_count as u64),
+                    Some(market_stats.daily_trades_count as u64),
                 )
             } else {
                 // Fallback to trades data
@@ -2313,10 +2398,7 @@ impl DexConnector for LighterConnector {
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
         // Get market_id for the symbol
-        let market_id = match symbol {
-            "BTC" => 1,
-            _ => return Err(DexError::Other(format!("Unknown symbol: {}", symbol))),
-        };
+        let market_id = self.resolve_market_info(symbol).await?.market_id;
 
         // Query recent trades
         let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=10", market_id);
@@ -2421,15 +2503,9 @@ impl DexConnector for LighterConnector {
         _spread: Option<i64>,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        // Convert symbol to market_id (this would typically be a lookup)
-        let market_id = match symbol {
-            "BTC-USD" | "BTC" => 1,
-            "ETH-USD" | "ETH" => 2,
-            _ => {
-                log::warn!("Unknown symbol {}, using market_id=1", symbol);
-                1
-            }
-        };
+        // Resolve market metadata for symbol
+        let market_info = self.resolve_market_info(symbol).await?;
+        let market_id = market_info.market_id;
 
         // Convert side: Long=0(BUY), Short=1(SELL) for Lighter API
         let side_value = match side {
@@ -2573,14 +2649,8 @@ impl DexConnector for LighterConnector {
             slippage_bps
         );
 
-        let market_id = match symbol {
-            "BTC-USD" | "BTC" => 1,
-            "ETH-USD" | "ETH" => 2,
-            _ => {
-                log::warn!("Unknown symbol {}, using market_id=1", symbol);
-                1
-            }
-        };
+        let market_info = self.resolve_market_info(symbol).await?;
+        let market_id = market_info.market_id;
 
         let side_value = if is_buy_for_tpsl(side) {
             SIDE_BUY
@@ -3012,56 +3082,30 @@ impl DexConnector for LighterConnector {
                         market_id, order_side, pos_decimal
                     );
 
-                    // Get current price for market order
-                    let current_price = if market_id == 1 {
-                        // Try WebSocket price first
-                        let ws_price_data = *self.current_price.read().await;
-
-                        let price_decimal = if let Some((ws_price, price_timestamp)) = ws_price_data
-                        {
-                            let current_time = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            let price_age = current_time.saturating_sub(price_timestamp);
-
-                            if price_age <= 30 {
-                                log::debug!("Using WebSocket price for close order: {}", ws_price);
-                                ws_price
-                            } else {
-                                // Fallback to API
-                                log::warn!("WebSocket price stale, using API fallback");
-                                match self.get_ticker(&position.symbol, None).await {
-                                    Ok(ticker) => ticker.price,
-                                    Err(_) => rust_decimal::Decimal::new(50000, 0), // Safe fallback
-                                }
-                            }
-                        } else {
-                            // Fallback to API
-                            match self.get_ticker(&position.symbol, None).await {
-                                Ok(ticker) => ticker.price,
-                                Err(_) => rust_decimal::Decimal::new(50000, 0), // Safe fallback
-                            }
-                        };
-
-                        // Wide price protection for market orders
-                        let protection_price = if order_side == 1 {
-                            // Sell: set low protection price
-                            price_decimal * rust_decimal::Decimal::new(700, 3) // 30% below market
-                        } else {
-                            // Buy: set high protection price
-                            price_decimal * rust_decimal::Decimal::new(1300, 3) // 30% above market
-                        };
-
-                        (protection_price * rust_decimal::Decimal::new(10, 0))
-                            .to_u64()
-                            .unwrap_or(0)
-                    } else {
-                        return Err(DexError::Other(format!(
-                            "Market ID {} not supported",
-                            market_id
-                        )));
+                    // Get current price for market order using ticker data
+                    let ticker_price = match self.get_ticker(&position.symbol, None).await {
+                        Ok(ticker) => ticker.price,
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to fetch ticker for {} while closing position: {}. Using fallback price",
+                                position.symbol,
+                                e
+                            );
+                            rust_decimal::Decimal::new(50000, 0)
+                        }
                     };
+
+                    let protection_price = if order_side == 1 {
+                        // Sell: set low protection price
+                        ticker_price * rust_decimal::Decimal::new(700, 3) // 30% below market
+                    } else {
+                        // Buy: set high protection price
+                        ticker_price * rust_decimal::Decimal::new(1300, 3) // 30% above market
+                    };
+
+                    let current_price = (protection_price * rust_decimal::Decimal::new(10, 0))
+                        .to_u64()
+                        .unwrap_or(0);
 
                     // Create reduce-only market order directly
                     match self
@@ -3268,6 +3312,22 @@ impl LighterConnector {
             .await
             .map_err(|_| DexError::Other("Failed to connect to WebSocket".to_string()))?;
 
+        let primary_market_id = if let Some(symbol) = self.tracked_symbols.first() {
+            match self.resolve_market_info(symbol).await {
+                Ok(info) => info.market_id,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to resolve primary symbol '{}' for WS order book subscription: {}. Falling back to market_id=1",
+                        symbol,
+                        e
+                    );
+                    1
+                }
+            }
+        } else {
+            1
+        };
+
         // Clone necessary data for the WebSocket task
         let current_price = self.current_price.clone();
         let current_volume = self.current_volume.clone();
@@ -3277,6 +3337,12 @@ impl LighterConnector {
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
+        let market_cache = Arc::clone(&self.market_cache);
+        let default_symbol = self
+            .tracked_symbols
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "BTC".to_string());
 
         // Spawn WebSocket handler task with reconnection logic
         let ws_url_clone = ws_url.clone();
@@ -3408,10 +3474,13 @@ impl LighterConnector {
                             peer_addr
                         );
 
+                        // Determine primary market for order book subscription
+                        let orderbook_market_id = primary_market_id;
+
                         // Send subscription messages
                         let subscribe_orderbook = serde_json::json!({
                             "type": "subscribe",
-                            "channel": "order_book/1"
+                            "channel": format!("order_book/{}", orderbook_market_id)
                         });
 
                         let subscribe_account = serde_json::json!({
@@ -3706,6 +3775,8 @@ impl LighterConnector {
                                                 &filled_orders,
                                                 &canceled_orders,
                                                 account_index,
+                                                &market_cache,
+                                                default_symbol.as_str(),
                                             )
                                             .await;
 
@@ -3882,6 +3953,8 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         account_index: u32,
+        market_cache: &Arc<RwLock<MarketCache>>,
+        default_symbol: &str,
     ) {
         let msg_type = message.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -3938,6 +4011,8 @@ impl LighterConnector {
                     filled_orders,
                     canceled_orders,
                     account_index as u64,
+                    market_cache,
+                    default_symbol,
                 )
                 .await;
             }
@@ -3952,6 +4027,8 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         account_id: u64,
+        market_cache: &Arc<RwLock<MarketCache>>,
+        default_symbol: &str,
     ) {
         log::trace!("handle_account_update called with data: {:?}", data);
 
@@ -3961,6 +4038,7 @@ impl LighterConnector {
                 "✅ [FILL_DETECTION] Found {} fills in account update",
                 fills.len()
             );
+            let default_symbol = default_symbol.to_string();
             let mut filled_map = filled_orders.write().await;
             for fill in fills {
                 log::debug!("🔍 [FILL_DETECTION] Processing fill: {:?}", fill);
@@ -3968,7 +4046,7 @@ impl LighterConnector {
                     log::info!("✅ [FILL_DETECTION] Added filled order: order_id={}, size={:?}, value={:?}",
                               filled_order.order_id, filled_order.filled_size, filled_order.filled_value);
                     filled_map
-                        .entry("BTC".to_string())
+                        .entry(default_symbol.clone())
                         .or_insert_with(Vec::new)
                         .push(filled_order);
                 } else {
@@ -3980,27 +4058,55 @@ impl LighterConnector {
         // Process 'trades' field according to Lighter API specification
         if let Some(trades) = data.get("trades").and_then(|t| t.as_object()) {
             log::info!("✅ [FILL_DETECTION] Found trades object in account update");
-            let mut filled_map = filled_orders.write().await;
+
+            let mut pending_inserts: Vec<(String, FilledOrder)> = Vec::new();
 
             for (market_id, trade_array) in trades {
+                let market_id_num = match market_id.parse::<u32>() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        log::warn!(
+                            "[FILL_DETECTION] Unable to parse market_id '{}' as u32",
+                            market_id
+                        );
+                        continue;
+                    }
+                };
+
+                let market_symbol = {
+                    let cache = market_cache.read().await;
+                    cache
+                        .by_id
+                        .get(&market_id_num)
+                        .map(|info| info.canonical_symbol.clone())
+                };
+
+                let market_symbol = match market_symbol {
+                    Some(symbol) => symbol,
+                    None => {
+                        log::warn!(
+                            "[FILL_DETECTION] Market cache missing entry for market_id {}",
+                            market_id_num
+                        );
+                        continue;
+                    }
+                };
+
                 if let Some(trades_array) = trade_array.as_array() {
                     for trade in trades_array {
-                        // Parse trade according to Lighter API spec
                         if let (Some(ask_id), Some(bid_id), Some(size_str), Some(price_str)) = (
                             trade.get("ask_id").and_then(|v| v.as_u64()),
                             trade.get("bid_id").and_then(|v| v.as_u64()),
                             trade.get("size").and_then(|v| v.as_str()),
                             trade.get("price").and_then(|v| v.as_str()),
                         ) {
-                            // Determine which order ID belongs to this account
                             let order_id = if account_id == ask_id { ask_id } else { bid_id };
 
                             log::info!(
                                 "✅ [FILL_DETECTION] Trade detected: order_id={}, size={}, price={}, market_id={}",
-                                order_id, size_str, price_str, market_id
+                                order_id, size_str, price_str, market_id_num
                             );
 
-                            // Create FilledOrder from trade data
                             if let (Ok(size), Ok(price)) = (
                                 size_str.parse::<rust_decimal::Decimal>(),
                                 price_str.parse::<rust_decimal::Decimal>(),
@@ -4020,18 +4126,27 @@ impl LighterConnector {
                                     },
                                     filled_size: Some(size),
                                     filled_value: Some(size * price),
-                                    filled_fee: None, // Fee info not available in trade message
+                                    filled_fee: None,
                                 };
 
-                                filled_map
-                                    .entry("BTC".to_string()) // Use BTC as default symbol
-                                    .or_insert_with(Vec::new)
-                                    .push(filled_order);
-
-                                log::info!("✅ [FILL_DETECTION] Added filled order from trade: order_id={}", order_id);
+                                pending_inserts.push((market_symbol.clone(), filled_order));
+                                log::info!(
+                                    "✅ [FILL_DETECTION] Added filled order from trade: order_id={}",
+                                    order_id
+                                );
                             }
                         }
                     }
+                }
+            }
+
+            if !pending_inserts.is_empty() {
+                let mut filled_map = filled_orders.write().await;
+                for (symbol_key, filled_order) in pending_inserts {
+                    filled_map
+                        .entry(symbol_key)
+                        .or_insert_with(Vec::new)
+                        .push(filled_order);
                 }
             }
         } else {
@@ -4040,11 +4155,12 @@ impl LighterConnector {
 
         // Handle canceled orders
         if let Some(cancels) = data.get("cancels").and_then(|c| c.as_array()) {
+            let default_symbol = default_symbol.to_string();
             let mut canceled_map = canceled_orders.write().await;
             for cancel in cancels {
                 if let Ok(canceled_order) = Self::parse_canceled_order(cancel) {
                     canceled_map
-                        .entry("BTC".to_string())
+                        .entry(default_symbol.clone())
                         .or_insert_with(Vec::new)
                         .push(canceled_order);
                 }
@@ -4104,6 +4220,7 @@ pub fn create_lighter_connector(
     account_index: u32,
     base_url: String,
     websocket_url: String,
+    tracked_symbols: Vec<String>,
 ) -> Result<Box<dyn DexConnector>, DexError> {
     let connector = LighterConnector::new(
         api_key_public,
@@ -4113,6 +4230,7 @@ pub fn create_lighter_connector(
         account_index,
         base_url,
         websocket_url,
+        tracked_symbols,
     )?;
     Ok(Box::new(connector))
 }
