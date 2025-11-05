@@ -2170,7 +2170,12 @@ impl DexConnector for LighterConnector {
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
         let orders = self.filled_orders.read().await;
-        let symbol_orders = orders.get(symbol).cloned().unwrap_or_default();
+        let normalized = normalize_symbol(symbol);
+        let symbol_orders = orders
+            .get(symbol)
+            .or_else(|| orders.get(&normalized))
+            .cloned()
+            .unwrap_or_default();
 
         Ok(FilledOrdersResponse {
             orders: symbol_orders,
