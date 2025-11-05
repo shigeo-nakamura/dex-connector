@@ -161,9 +161,10 @@ extern "C" {
         nonce: c_longlong,
     ) -> StrOrErr;
 
-    fn SignChangePubKey(new_pubkey: *const c_char, nonce: c_longlong) -> StrOrErr;
+    fn SignCancelOrder(market_index: c_int, order_index: c_longlong, nonce: c_longlong)
+        -> StrOrErr;
 
-    fn SignCancelAllOrders(time_in_force: c_int, time: c_longlong, nonce: c_longlong) -> StrOrErr;
+    fn SignChangePubKey(new_pubkey: *const c_char, nonce: c_longlong) -> StrOrErr;
 
     fn SignMessageWithEVM(private_key: *const c_char, message: *const c_char) -> StrOrErr;
 }
@@ -870,6 +871,56 @@ impl LighterConnector {
         _reduce_only: i32,
         _trigger_price: i32,
         _order_expiry: i64,
+        _nonce: i64,
+    ) -> Result<String, DexError> {
+        Err(DexError::Other(
+            "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
+                .to_string(),
+        ))
+    }
+
+    /// Call Go shared library to sign a cancel order transaction
+    #[cfg(feature = "lighter-sdk")]
+    async fn call_go_sign_cancel_order(
+        &self,
+        market_index: i32,
+        order_index: i64,
+        nonce: i64,
+    ) -> Result<String, DexError> {
+        self.create_go_client().await?;
+
+        unsafe {
+            let result = SignCancelOrder(market_index, order_index, nonce);
+
+            if !result.err.is_null() {
+                let error_cstr = CStr::from_ptr(result.err);
+                let error_msg = error_cstr.to_string_lossy().to_string();
+                libc::free(result.err as *mut libc::c_void);
+                if !result.str.is_null() {
+                    libc::free(result.str as *mut libc::c_void);
+                }
+                return Err(DexError::Other(format!("Go SDK error: {}", error_msg)));
+            }
+
+            if result.str.is_null() {
+                return Err(DexError::Other(
+                    "Go SDK returned null result for cancel order".to_string(),
+                ));
+            }
+
+            let result_cstr = CStr::from_ptr(result.str);
+            let json_str = result_cstr.to_string_lossy().to_string();
+            libc::free(result.str as *mut libc::c_void);
+
+            Ok(json_str)
+        }
+    }
+
+    #[cfg(not(feature = "lighter-sdk"))]
+    async fn call_go_sign_cancel_order(
+        &self,
+        _market_index: i32,
+        _order_index: i64,
         _nonce: i64,
     ) -> Result<String, DexError> {
         Err(DexError::Other(
@@ -3077,150 +3128,108 @@ impl DexConnector for LighterConnector {
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
-        log::warn!("cancel_order called for symbol: {}, order_id: {} - Individual order cancellation not implemented for Lighter, use cancel_all_orders instead", symbol, order_id);
-        Err(DexError::Other(
-            "Order cancellation not implemented yet".to_string(),
-        ))
-    }
+        let market_info = self.resolve_market_info(symbol).await?;
 
-    async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
-        log::info!(
-            "Starting cancel_all_orders for symbol: {:?}, API key index: {}, account index: {}",
-            _symbol,
-            self.api_key_index,
-            self.account_index
+        let order_index = match order_id.parse::<i64>() {
+            Ok(idx) => idx,
+            Err(_) => {
+                log::warn!(
+                    "[CANCEL_ORDER] Unable to parse order_id '{}' as numeric index. Skipping cancel request.",
+                    order_id
+                );
+                return Ok(());
+            }
+        };
+
+        let nonce = self.get_nonce().await? as i64;
+        let tx_json = self
+            .call_go_sign_cancel_order(market_info.market_id as i32, order_index, nonce)
+            .await?;
+
+        let form_data = format!(
+            "tx_type=15&tx_info={}&price_protection=false",
+            urlencoding::encode(&tx_json)
         );
 
-        #[cfg(feature = "lighter-sdk")]
-        {
-            // Get nonce from API
-            log::debug!("Getting nonce for cancel_all_orders");
-            let nonce = self.get_nonce().await?;
-            log::debug!("Retrieved nonce: {}", nonce);
+        track_api_call("POST /api/v1/sendTx (cancel_order)", "POST");
 
-            // Use ImmediateCancelAll (time_in_force=0, time=0)
-            let time_in_force = 0; // ImmediateCancelAll
-            let time = 0; // Not used for immediate cancel
+        let response = self
+            .client
+            .post(&format!("{}/api/v1/sendTx", self.base_url))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_data)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("HTTP request failed: {}", e)))?;
 
-            log::debug!(
-                "Signing cancel_all_orders transaction with time_in_force: {}, time: {}, nonce: {}",
-                time_in_force,
-                time,
-                nonce
-            );
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-            unsafe {
-                let result = SignCancelAllOrders(time_in_force, time, nonce as i64);
-
-                if !result.err.is_null() {
-                    let error_cstr = CStr::from_ptr(result.err);
-                    let error_msg = error_cstr.to_string_lossy().to_string();
-                    libc::free(result.err as *mut libc::c_void);
-                    return Err(DexError::Other(format!(
-                        "Cancel all orders failed: {}",
-                        error_msg
-                    )));
-                }
-
-                // Get the transaction JSON
-                let result_cstr = CStr::from_ptr(result.str);
-                let tx_json = result_cstr.to_string_lossy().to_string();
-                libc::free(result.str as *mut libc::c_void);
-
-                // Submit the cancel transaction to the API
-                let _timestamp = chrono::Utc::now().timestamp_millis() as u64;
-                let form_data = format!(
-                    "tx_type=16&tx_info={}&price_protection=false",
-                    urlencoding::encode(&tx_json)
-                );
-
-                log::debug!(
-                    "Submitting cancel_all_orders transaction to API: {}/api/v1/sendTx",
-                    self.base_url
-                );
-
-                track_api_call("POST /api/v1/sendTx (cancel_all_orders)", "POST");
-
-                let response = self
-                    .client
-                    .post(&format!("{}/api/v1/sendTx", self.base_url))
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body(form_data)
-                    .send()
-                    .await
-                    .map_err(|e| DexError::Other(format!("Network error: {}", e)))?;
-
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-
-                if !status.is_success() {
-                    log::error!("Cancel all orders failed: HTTP {}, Body: {}", status, body);
-                    return Err(DexError::Other(format!(
-                        "Cancel all orders failed: HTTP {}, {}",
-                        status, body
-                    )));
-                }
-
-                log::info!(
-                    "Cancel all orders submitted successfully, Response: {}",
-                    body
-                );
-
-                // Wait a moment for the cancellation to process
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-
-                log::info!(
-                    "Cancel all orders submitted successfully - trusting server response without verification"
-                );
-            }
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "Cancel order failed: HTTP {}, {}",
+                status, response_text
+            )));
         }
 
-        #[cfg(not(feature = "lighter-sdk"))]
-        {
-            log::error!("Cancel all orders called but lighter-sdk feature is not enabled. Symbol: {:?}, API key index: {}, Account index: {}",
-                       _symbol, self.api_key_index, self.account_index);
-        }
+        self.update_order_tracking_after_cancel(symbol, order_id)
+            .await;
 
-        // Clear order tracking for all symbols (or specific symbol if provided)
-        // Call update_order_tracking_after_cancel for each order to maintain consistency
-        {
-            let orders_guard = self.cached_open_orders.read().await;
-            if let Some(ref symbol) = _symbol {
-                if let Some(orders) = orders_guard.get(symbol) {
-                    for order in orders {
-                        log::debug!(
-                            "[WS_ORDER_TRACKING] Marking order {} as cancelled for symbol {}",
-                            order.order_id,
-                            symbol
-                        );
-                    }
-                }
-            } else {
-                for (symbol, orders) in orders_guard.iter() {
-                    for order in orders {
-                        log::debug!(
-                            "[WS_ORDER_TRACKING] Marking order {} as cancelled for symbol {}",
-                            order.order_id,
-                            symbol
-                        );
-                    }
-                }
-            }
-        }
-
-        // Now actually clear the tracking (after we've logged the individual cancellations)
-        {
-            let mut orders_guard = self.cached_open_orders.write().await;
-            if let Some(symbol) = _symbol {
-                orders_guard.remove(&symbol);
-                log::debug!("[WS_ORDER_TRACKING] Cleared orders for symbol: {}", symbol);
-            } else {
-                orders_guard.clear();
-                log::debug!("[WS_ORDER_TRACKING] Cleared all orders from tracking");
-            }
-        }
+        log::info!(
+            "[CANCEL_ORDER] Successfully cancelled order {} for {}",
+            order_id,
+            symbol
+        );
 
         Ok(())
+    }
+
+    async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
+        let targets: Vec<(String, Vec<String>)> = {
+            let orders_guard = self.cached_open_orders.read().await;
+            match symbol {
+                Some(sym) => {
+                    let ids = orders_guard
+                        .get(&sym)
+                        .map(|orders| orders.iter().map(|o| o.order_id.clone()).collect())
+                        .unwrap_or_default();
+                    vec![(sym, ids)]
+                }
+                None => orders_guard
+                    .iter()
+                    .map(|(sym, orders)| {
+                        (
+                            sym.clone(),
+                            orders.iter().map(|o| o.order_id.clone()).collect(),
+                        )
+                    })
+                    .collect(),
+            }
+        };
+
+        let mut last_err: Option<DexError> = None;
+        for (sym, ids) in targets {
+            for order_id in ids {
+                if let Err(e) = self.cancel_order(&sym, &order_id).await {
+                    log::error!(
+                        "[CANCEL_ORDER] Failed to cancel order {} for {}: {}",
+                        order_id,
+                        sym,
+                        e
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     async fn cancel_orders(
@@ -3228,10 +3237,37 @@ impl DexConnector for LighterConnector {
         symbol: Option<String>,
         order_ids: Vec<String>,
     ) -> Result<(), DexError> {
-        log::warn!("cancel_orders called for symbol: {:?}, order_ids: {:?} - Individual order cancellation not implemented for Lighter, use cancel_all_orders instead", symbol, order_ids);
-        Err(DexError::Other(
-            "Individual order cancellation not implemented for Lighter. Use cancel_all_orders instead.".to_string(),
-        ))
+        let symbol = match symbol {
+            Some(sym) => sym,
+            None => {
+                return Err(DexError::Other(
+                    "cancel_orders requires a symbol on Lighter".to_string(),
+                ))
+            }
+        };
+
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut last_err: Option<DexError> = None;
+        for order_id in order_ids {
+            if let Err(e) = self.cancel_order(&symbol, &order_id).await {
+                log::error!(
+                    "[CANCEL_ORDER] Failed to cancel order {} for {}: {}",
+                    order_id,
+                    symbol,
+                    e
+                );
+                last_err = Some(e);
+            }
+        }
+
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
