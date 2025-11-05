@@ -16,9 +16,10 @@ const SIDE_BUY: u32 = 1; // Buy order (close short positions, open long position
 const TIME_IN_FORCE_IOC: u32 = 0; // Immediate-or-Cancel
 const TIME_IN_FORCE_GTC: u32 = 1; // Good-Till-Cancel
 
-// Lighter Protocol scaling constants
-const PRICE_SCALE_FACTOR: u64 = 10; // Price scaling: multiply by 10
-const BASE_AMOUNT_SCALE: u64 = 100000; // Size scaling: multiply by 100,000
+// Lighter Protocol scaling defaults (will be overridden by market metadata)
+const DEFAULT_PRICE_DECIMALS: u32 = 1;
+const DEFAULT_SIZE_DECIMALS: u32 = 5;
+const MAX_DECIMAL_PRECISION: u32 = 9;
 
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
@@ -31,12 +32,16 @@ use crate::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::Client;
-use rust_decimal::prelude::{FromStr, ToPrimitive};
 use rust_decimal::Decimal;
+use rust_decimal::{
+    prelude::{FromStr, ToPrimitive},
+    RoundingStrategy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    convert::TryFrom,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -62,6 +67,8 @@ struct MaintenanceInfo {
 struct MarketInfo {
     canonical_symbol: String,
     market_id: u32,
+    price_decimals: u32,
+    size_decimals: u32,
 }
 
 #[derive(Default, Debug)]
@@ -328,6 +335,25 @@ struct LighterFundingRate {
     rate: f64,
 }
 
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct LighterOrderBookDetailsResponse {
+    code: i32,
+    #[serde(rename = "order_book_details")]
+    order_book_details: Vec<LighterOrderBookDetail>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct LighterOrderBookDetail {
+    market_id: u32,
+    symbol: String,
+    #[serde(rename = "supported_price_decimals")]
+    supported_price_decimals: Option<u32>,
+    #[serde(rename = "supported_size_decimals")]
+    supported_size_decimals: Option<u32>,
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct LighterNonceResponse {
@@ -387,25 +413,106 @@ struct LighterSignedEnvelope {
 
 impl LighterConnector {
     async fn refresh_market_cache(&self) -> Result<(), DexError> {
-        let funding = self.get_funding_rates().await?;
         let mut cache = MarketCache::default();
+        let mut detail_decimals: HashMap<u32, (u32, u32)> = HashMap::new();
+
+        match self.get_order_book_details().await {
+            Ok(details) => {
+                for detail in details.order_book_details {
+                    let normalized = normalize_symbol(&detail.symbol);
+                    if normalized.is_empty() {
+                        continue;
+                    }
+
+                    let raw_price_decimals = detail.supported_price_decimals.unwrap_or_else(|| {
+                        log::warn!(
+                            "Missing supported_price_decimals for market_id={}, using default {}",
+                            detail.market_id,
+                            DEFAULT_PRICE_DECIMALS
+                        );
+                        DEFAULT_PRICE_DECIMALS
+                    });
+                    let price_decimals = raw_price_decimals.min(MAX_DECIMAL_PRECISION);
+                    if price_decimals != raw_price_decimals {
+                        log::warn!(
+                            "supported_price_decimals {} for market_id={} exceeds max {}, clamping",
+                            raw_price_decimals,
+                            detail.market_id,
+                            MAX_DECIMAL_PRECISION
+                        );
+                    }
+
+                    let raw_size_decimals = detail.supported_size_decimals.unwrap_or_else(|| {
+                        log::warn!(
+                            "Missing supported_size_decimals for market_id={}, using default {}",
+                            detail.market_id,
+                            DEFAULT_SIZE_DECIMALS
+                        );
+                        DEFAULT_SIZE_DECIMALS
+                    });
+                    let size_decimals = raw_size_decimals.min(MAX_DECIMAL_PRECISION);
+                    if size_decimals != raw_size_decimals {
+                        log::warn!(
+                            "supported_size_decimals {} for market_id={} exceeds max {}, clamping",
+                            raw_size_decimals,
+                            detail.market_id,
+                            MAX_DECIMAL_PRECISION
+                        );
+                    }
+
+                    detail_decimals.insert(detail.market_id, (price_decimals, size_decimals));
+
+                    let info = MarketInfo {
+                        canonical_symbol: normalized.clone(),
+                        market_id: detail.market_id,
+                        price_decimals,
+                        size_decimals,
+                    };
+
+                    cache.by_symbol.insert(normalized.clone(), info.clone());
+                    cache.by_id.insert(detail.market_id, info);
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to fetch order book details for market cache: {}. Falling back to funding rates only",
+                    err
+                );
+            }
+        }
+
+        let funding = self.get_funding_rates().await?;
 
         for entry in funding.funding_rates {
             let normalized = normalize_symbol(&entry.symbol);
             if normalized.is_empty() {
                 continue;
             }
-            let info = MarketInfo {
-                canonical_symbol: normalized.clone(),
-                market_id: entry.market_id,
-            };
-            cache.by_symbol.insert(normalized.clone(), info.clone());
-            cache.by_id.insert(entry.market_id, info);
+
+            let (price_decimals, size_decimals) = detail_decimals
+                .get(&entry.market_id)
+                .copied()
+                .unwrap_or((DEFAULT_PRICE_DECIMALS, DEFAULT_SIZE_DECIMALS));
+
+            if !cache.by_symbol.contains_key(&normalized) {
+                let info = MarketInfo {
+                    canonical_symbol: normalized.clone(),
+                    market_id: entry.market_id,
+                    price_decimals,
+                    size_decimals,
+                };
+                cache.by_symbol.insert(normalized.clone(), info.clone());
+                cache.by_id.insert(entry.market_id, info);
+            } else if !cache.by_id.contains_key(&entry.market_id) {
+                if let Some(existing) = cache.by_symbol.get(&normalized) {
+                    cache.by_id.insert(entry.market_id, existing.clone());
+                }
+            }
         }
 
         if cache.by_symbol.is_empty() {
             return Err(DexError::Other(
-                "Funding rates response did not contain any markets".to_string(),
+                "Unable to populate Lighter market metadata cache".to_string(),
             ));
         }
 
@@ -927,13 +1034,47 @@ impl LighterConnector {
         let _client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
         let nonce = self.get_nonce().await?;
 
+        let (price_scale, size_scale, price_decimals, size_decimals) = {
+            let cache = self.market_cache.read().await;
+            if let Some(info) = cache.by_id.get(&market_id) {
+                (
+                    Self::ten_pow(info.price_decimals),
+                    Self::ten_pow(info.size_decimals),
+                    info.price_decimals.min(MAX_DECIMAL_PRECISION),
+                    info.size_decimals.min(MAX_DECIMAL_PRECISION),
+                )
+            } else {
+                (
+                    Self::ten_pow(DEFAULT_PRICE_DECIMALS),
+                    Self::ten_pow(DEFAULT_SIZE_DECIMALS),
+                    DEFAULT_PRICE_DECIMALS.min(MAX_DECIMAL_PRECISION),
+                    DEFAULT_SIZE_DECIMALS.min(MAX_DECIMAL_PRECISION),
+                )
+            }
+        };
+
+        let approx_price = if price_scale > 0 {
+            price as f64 / price_scale as f64
+        } else {
+            price as f64
+        };
+
+        let approx_size = if size_scale > 0 {
+            base_amount as f64 / size_scale as f64
+        } else {
+            base_amount as f64
+        };
+
         log::debug!(
-            "Creating native order: market_id={}, side={}, base_amount={}, price={}, calculated_price_usd={:.1}",
+            "Creating native order: market_id={}, side={}, base_amount={}, price={}, approx_price={}, approx_size={}, price_decimals={}, size_decimals={}",
             market_id,
             side,
             base_amount,
             price,
-            price as f64 / 10.0
+            approx_price,
+            approx_size,
+            price_decimals,
+            size_decimals
         );
 
         // Use timestamp as unique client_order_index instead of hardcoded value
@@ -1064,13 +1205,22 @@ impl LighterConnector {
                 order_id,
                 client_order_index,
                 side,
-                Decimal::new(base_amount as i64, 5)
+                i64::try_from(base_amount)
+                    .ok()
+                    .map(|b| Decimal::new(b, size_decimals))
+                    .unwrap_or_else(|| Decimal::ZERO)
             );
 
             Ok(CreateOrderResponse {
                 order_id,
-                ordered_price: Decimal::new(price as i64, 6),
-                ordered_size: Decimal::new(base_amount as i64, 5),
+                ordered_price: i64::try_from(price)
+                    .ok()
+                    .map(|p| Decimal::new(p, price_decimals))
+                    .unwrap_or_else(|| Decimal::ZERO),
+                ordered_size: i64::try_from(base_amount)
+                    .ok()
+                    .map(|b| Decimal::new(b, size_decimals))
+                    .unwrap_or_else(|| Decimal::ZERO),
             })
         } else {
             Err(DexError::Other(format!(
@@ -1097,14 +1247,52 @@ impl LighterConnector {
         let _client_id = client_order_id.unwrap_or_else(|| format!("rust-trigger-{}", timestamp));
         let nonce = self.get_nonce().await?;
 
+        let (price_scale, size_scale, price_decimals, size_decimals) = {
+            let cache = self.market_cache.read().await;
+            if let Some(info) = cache.by_id.get(&market_id) {
+                (
+                    Self::ten_pow(info.price_decimals),
+                    Self::ten_pow(info.size_decimals),
+                    info.price_decimals.min(MAX_DECIMAL_PRECISION),
+                    info.size_decimals.min(MAX_DECIMAL_PRECISION),
+                )
+            } else {
+                (
+                    Self::ten_pow(DEFAULT_PRICE_DECIMALS),
+                    Self::ten_pow(DEFAULT_SIZE_DECIMALS),
+                    DEFAULT_PRICE_DECIMALS.min(MAX_DECIMAL_PRECISION),
+                    DEFAULT_SIZE_DECIMALS.min(MAX_DECIMAL_PRECISION),
+                )
+            }
+        };
+
+        let approx_price = if price_scale > 0 {
+            price as f64 / price_scale as f64
+        } else {
+            price as f64
+        };
+        let approx_trigger = if price_scale > 0 {
+            trigger_price as f64 / price_scale as f64
+        } else {
+            trigger_price as f64
+        };
+        let approx_size = if size_scale > 0 {
+            base_amount as f64 / size_scale as f64
+        } else {
+            base_amount as f64
+        };
+
         log::debug!(
-            "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}",
+            "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}, approx_price={}, approx_trigger={}, approx_size={}",
             market_id,
             side,
             base_amount,
             price,
             trigger_price,
-            order_type
+            order_type,
+            approx_price,
+            approx_trigger,
+            approx_size
         );
 
         let client_order_index = timestamp;
@@ -1221,8 +1409,14 @@ impl LighterConnector {
 
             Ok(CreateOrderResponse {
                 order_id,
-                ordered_price: Decimal::new(price as i64, 6),
-                ordered_size: Decimal::new(base_amount as i64, 5),
+                ordered_price: i64::try_from(price)
+                    .ok()
+                    .map(|p| Decimal::new(p, price_decimals))
+                    .unwrap_or_else(|| Decimal::ZERO),
+                ordered_size: i64::try_from(base_amount)
+                    .ok()
+                    .map(|b| Decimal::new(b, size_decimals))
+                    .unwrap_or_else(|| Decimal::ZERO),
             })
         } else {
             Err(DexError::Other(format!(
@@ -1245,12 +1439,42 @@ impl LighterConnector {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         let client_id = client_order_id.unwrap_or_else(|| format!("rust-order-{}", timestamp));
 
+        let (price_decimals, size_decimals) = {
+            let cache = self.market_cache.read().await;
+            if let Some(info) = cache.by_id.get(&market_id) {
+                (
+                    info.price_decimals.min(MAX_DECIMAL_PRECISION),
+                    info.size_decimals.min(MAX_DECIMAL_PRECISION),
+                )
+            } else {
+                (
+                    DEFAULT_PRICE_DECIMALS.min(MAX_DECIMAL_PRECISION),
+                    DEFAULT_SIZE_DECIMALS.min(MAX_DECIMAL_PRECISION),
+                )
+            }
+        };
+        let price_scale = Self::ten_pow(price_decimals);
+        let size_scale = Self::ten_pow(size_decimals);
+
+        let approx_price = if price_scale > 0 {
+            price as f64 / price_scale as f64
+        } else {
+            price as f64
+        };
+        let approx_size = if size_scale > 0 {
+            base_amount as f64 / size_scale as f64
+        } else {
+            base_amount as f64
+        };
+
         log::debug!(
-            "Delegating order to Python SDK: market_id={}, side={}, base_amount={}, price={}",
+            "Delegating order to Python SDK: market_id={}, side={}, base_amount={}, price={}, approx_price={}, approx_size={}",
             market_id,
             side,
             base_amount,
-            price
+            price,
+            approx_price,
+            approx_size
         );
 
         let output = std::process::Command::new("./venv/bin/python")
@@ -1295,8 +1519,14 @@ impl LighterConnector {
 
             Ok(CreateOrderResponse {
                 order_id,
-                ordered_price: Decimal::new(price as i64, 6), // Assuming 6 decimals for price
-                ordered_size: Decimal::new(base_amount as i64, 5), // Assuming 5 decimals for amount
+                ordered_price: i64::try_from(price)
+                    .ok()
+                    .map(|p| Decimal::new(p, price_decimals))
+                    .unwrap_or_else(|| Decimal::ZERO),
+                ordered_size: i64::try_from(base_amount)
+                    .ok()
+                    .map(|b| Decimal::new(b, size_decimals))
+                    .unwrap_or_else(|| Decimal::ZERO),
             })
         } else if let Some(error) = response.get("error") {
             log::error!("SDK order failed: {}", error);
@@ -1967,7 +2197,7 @@ impl DexConnector for LighterConnector {
         test_price: Option<Decimal>,
     ) -> Result<TickerResponse, DexError> {
         if let Some(price) = test_price {
-            let min_tick = Self::calculate_min_tick(price, 3, false); // BTC perpetual with 3 decimals
+            let min_tick = Self::calculate_min_tick(price, DEFAULT_PRICE_DECIMALS, false);
             return Ok(TickerResponse {
                 symbol: symbol.to_string(),
                 price,
@@ -2004,7 +2234,8 @@ impl DexConnector for LighterConnector {
                 );
                 // Fall through to REST API fallback below
             } else {
-                let min_tick = Self::calculate_min_tick(ws_price, 3, false);
+                let min_tick =
+                    Self::calculate_min_tick(ws_price, market_info.price_decimals, false);
 
                 let (volume, num_trades) = if let Some(stats) = &stats_data {
                     if let Some(market_stats) = stats
@@ -2105,7 +2336,7 @@ impl DexConnector for LighterConnector {
             Decimal::new(50000, 0)
         };
 
-        let min_tick = Self::calculate_min_tick(price, 3, false); // BTC perpetual with 3 decimals
+        let min_tick = Self::calculate_min_tick(price, market_info.price_decimals, false);
 
         // Get funding rate
         let funding_rate = if let Some(funding) = &funding_data {
@@ -2525,11 +2756,26 @@ impl DexConnector for LighterConnector {
         // spread = -2: FOK order
         let default_tif = 0; // Default to GTC
 
-        // Convert amounts to Lighter's scaled integers
-        // Base amount in 1e5 scale, price scaled to match Go SDK (much smaller scale)
-        let base_amount = (size * Decimal::new(100_000, 0))
-            .to_u64()
-            .ok_or_else(|| DexError::Other("Invalid size amount".to_string()))?;
+        let price_decimals = market_info.price_decimals;
+        let size_decimals = market_info.size_decimals;
+
+        // Convert amounts to Lighter's scaled integers using market metadata
+        let size_abs = size.abs();
+        let mut base_amount = Self::scale_decimal_to_u64(
+            size_abs,
+            size_decimals,
+            RoundingStrategy::ToZero,
+            "base amount",
+        )?;
+
+        if base_amount == 0 && size_abs > Decimal::ZERO {
+            log::debug!(
+                "Rounded base amount to zero for size {} (decimals {}), forcing minimum base_amount=1",
+                size_abs,
+                size_decimals
+            );
+            base_amount = 1;
+        }
 
         let (price_value, order_type, tif) = if let Some(p) = price {
             // Handle spread parameter: negative values for TIF, positive for price adjustment
@@ -2547,7 +2793,15 @@ impl DexConnector for LighterConnector {
                     (p, tif_value) // No price adjustment for TIF orders
                 } else {
                     // Positive spread values adjust price (original behavior)
-                    let tick_size = Decimal::new(1, 1); // 0.1
+                    let tick_decimals = price_decimals.min(MAX_DECIMAL_PRECISION);
+                    if tick_decimals != price_decimals {
+                        log::warn!(
+                            "Price decimals {} exceed supported max {}, clamping for spread adjustment",
+                            price_decimals,
+                            MAX_DECIMAL_PRECISION
+                        );
+                    }
+                    let tick_size = Decimal::new(1, tick_decimals);
                     let spread_amount = Decimal::from(spread_ticks) * tick_size;
                     (p + spread_amount, default_tif)
                 }
@@ -2556,10 +2810,13 @@ impl DexConnector for LighterConnector {
             };
 
             // Limit order
-            let price_val = (final_price * Decimal::new(10, 0))
-                .to_u32()
-                .ok_or_else(|| DexError::Other("Invalid price".to_string()))?
-                as u64;
+            let price_u32 = Self::scale_decimal_to_u32(
+                final_price,
+                price_decimals,
+                RoundingStrategy::MidpointAwayFromZero,
+                "price",
+            )?;
+            let price_val = u64::from(price_u32);
 
             let tif_name = match order_tif {
                 0 => "GTC",
@@ -2569,7 +2826,7 @@ impl DexConnector for LighterConnector {
             };
 
             log::debug!("Creating limit order: side={}, original_price={}, spread_param={:?}, final_price={}, TIF={} ({}), scaled_price={}, size={}, scaled_base_amount={}",
-                side_value, p, _spread, final_price, order_tif, tif_name, price_val, size, base_amount);
+                side_value, p, _spread, final_price, order_tif, tif_name, price_val, size_abs, base_amount);
             (price_val, ORDER_TYPE_LIMIT, order_tif)
         } else {
             // Market order - get current price and set protection price
@@ -2585,16 +2842,21 @@ impl DexConnector for LighterConnector {
                 current_price * Decimal::new(1200, 3) // 20% above market (protection price)
             };
 
-            let price_val = (protection_price * Decimal::new(10, 0))
-                .to_u32()
-                .ok_or_else(|| DexError::Other("Invalid protection price".to_string()))?
-                as u64;
+            let price_u32 = Self::scale_decimal_to_u32(
+                protection_price,
+                price_decimals,
+                RoundingStrategy::MidpointAwayFromZero,
+                "protection price",
+            )?;
+            let price_val = u64::from(price_u32);
 
             log::debug!(
-                "Market order: current_price={}, protection_price={}, side={}",
+                "Market order: current_price={}, protection_price={}, side={}, price_decimals={}, size_decimals={}",
                 current_price,
                 protection_price,
-                side_value
+                side_value,
+                price_decimals,
+                size_decimals
             );
 
             (price_val, ORDER_TYPE_IOC, 0u32) // order_type=IOC (market), tif=0 (IOC)
@@ -2759,23 +3021,37 @@ impl DexConnector for LighterConnector {
         };
 
         // Convert to native units with proper error handling
-        let base_amount = (size * Decimal::from(BASE_AMOUNT_SCALE))
-            .to_u64()
-            .ok_or_else(|| DexError::Other("base_amount overflow or invalid value".into()))?;
-        let trigger_price_native = (trigger_px * Decimal::from(PRICE_SCALE_FACTOR))
-            .to_u64()
-            .ok_or_else(|| {
-                DexError::Other("trigger_price_native overflow or invalid value".into())
-            })?;
+        let size_abs = size.abs();
+        let mut base_amount = Self::scale_decimal_to_u64(
+            size_abs,
+            market_info.size_decimals,
+            RoundingStrategy::ToZero,
+            "trigger order base amount",
+        )?;
+        if base_amount == 0 && size_abs > Decimal::ZERO {
+            log::debug!(
+                "Rounded trigger order base amount to zero for size {}, forcing minimum base_amount=1",
+                size_abs
+            );
+            base_amount = 1;
+        }
+
+        let trigger_price_native = u64::from(Self::scale_decimal_to_u32(
+            trigger_px,
+            market_info.price_decimals,
+            RoundingStrategy::MidpointAwayFromZero,
+            "trigger price",
+        )?);
 
         let execution_price_native = if is_market {
             0 // Market orders: server ignores execution_price, use 0 for clarity
         } else {
-            (final_limit_price * Decimal::from(PRICE_SCALE_FACTOR))
-                .to_u64()
-                .ok_or_else(|| {
-                    DexError::Other("execution_price_native overflow or invalid value".into())
-                })?
+            u64::from(Self::scale_decimal_to_u32(
+                final_limit_price,
+                market_info.price_decimals,
+                RoundingStrategy::MidpointAwayFromZero,
+                "execution price",
+            )?)
         };
 
         // Set TimeInForce based on order type (using global protocol constants)
@@ -3051,6 +3327,18 @@ impl DexConnector for LighterConnector {
                     };
 
                     let market_id = position.market_id;
+                    let market_info = match self.resolve_market_info(&position.symbol).await {
+                        Ok(info) => info,
+                        Err(err) => {
+                            log::warn!(
+                                "Failed to resolve market info for {} (market_id={}): {}. Skipping position close",
+                                position.symbol,
+                                market_id,
+                                err
+                            );
+                            continue;
+                        }
+                    };
 
                     // Use rust_decimal for precise conversion to avoid floating point errors
                     let pos_decimal =
@@ -3061,9 +3349,30 @@ impl DexConnector for LighterConnector {
                                 rust_decimal::Decimal::from_str(&pos_str)
                                     .unwrap_or(rust_decimal::Decimal::ZERO)
                             });
-                    let mut base_amount = (pos_decimal * rust_decimal::Decimal::new(100000, 0))
-                        .to_u64()
-                        .unwrap_or((pos_size.abs() * 100000.0) as u64);
+                    let mut base_amount = match Self::scale_decimal_to_u64(
+                        pos_decimal,
+                        market_info.size_decimals,
+                        RoundingStrategy::ToZero,
+                        "position base amount",
+                    ) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            log::warn!(
+                                "Failed to scale position size {} with {} decimals: {}. Falling back to default decimals {}",
+                                pos_decimal,
+                                market_info.size_decimals,
+                                err,
+                                DEFAULT_SIZE_DECIMALS
+                            );
+                            Self::scale_decimal_to_u64(
+                                pos_decimal,
+                                DEFAULT_SIZE_DECIMALS,
+                                RoundingStrategy::ToZero,
+                                "fallback position base amount",
+                            )
+                            .unwrap_or(0)
+                        }
+                    };
 
                     // Ensure minimum of 1 unit for very small positions
                     if base_amount == 0 && pos_size.abs() > 0.0 {
@@ -3108,9 +3417,23 @@ impl DexConnector for LighterConnector {
                         ticker_price * rust_decimal::Decimal::new(1300, 3) // 30% above market
                     };
 
-                    let current_price = (protection_price * rust_decimal::Decimal::new(10, 0))
-                        .to_u64()
-                        .unwrap_or(0);
+                    let current_price = match Self::scale_decimal_to_u32(
+                        protection_price,
+                        market_info.price_decimals,
+                        RoundingStrategy::MidpointAwayFromZero,
+                        "close-position protection price",
+                    ) {
+                        Ok(value) => u64::from(value),
+                        Err(err) => {
+                            log::warn!(
+                                "Failed to scale protection price {} with {} decimals: {}. Using fallback 0",
+                                protection_price,
+                                market_info.price_decimals,
+                                err
+                            );
+                            0
+                        }
+                    };
 
                     // Create reduce-only market order directly
                     match self
@@ -3268,6 +3591,35 @@ impl LighterConnector {
 
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse exchange stats: {}", e)))
+    }
+
+    async fn get_order_book_details(&self) -> Result<LighterOrderBookDetailsResponse, DexError> {
+        let url = format!("{}/api/v1/orderBookDetails", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to get order book details: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            DexError::Other(format!("Failed to read order book details response: {}", e))
+        })?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "OrderBookDetails HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        log::trace!("Order book details response: {}", response_text);
+
+        serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse order book details: {}", e)))
     }
 
     async fn get_funding_rates(&self) -> Result<LighterFundingRates, DexError> {
@@ -4192,6 +4544,60 @@ impl LighterConnector {
                 .to_string(),
             canceled_timestamp: data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
         })
+    }
+
+    fn ten_pow(decimals: u32) -> u64 {
+        let safe_decimals = decimals.min(MAX_DECIMAL_PRECISION);
+        if safe_decimals != decimals {
+            log::warn!(
+                "Decimal precision {} exceeds supported max {}, clamping",
+                decimals,
+                MAX_DECIMAL_PRECISION
+            );
+        }
+        10u64.pow(safe_decimals)
+    }
+
+    fn scale_decimal_to_u64(
+        value: Decimal,
+        decimals: u32,
+        rounding: RoundingStrategy,
+        context: &str,
+    ) -> Result<u64, DexError> {
+        let safe_decimals = decimals.min(MAX_DECIMAL_PRECISION);
+        if safe_decimals != decimals {
+            log::warn!(
+                "{} decimals {} exceed supported max {}, clamping",
+                context,
+                decimals,
+                MAX_DECIMAL_PRECISION
+            );
+        }
+
+        let multiplier = Decimal::new(10i64.pow(safe_decimals), 0);
+        let rounded = value.round_dp_with_strategy(safe_decimals, rounding);
+        (rounded * multiplier).to_u64().ok_or_else(|| {
+            DexError::Other(format!(
+                "Invalid {} value {} after scaling to {} decimals",
+                context, value, safe_decimals
+            ))
+        })
+    }
+
+    fn scale_decimal_to_u32(
+        value: Decimal,
+        decimals: u32,
+        rounding: RoundingStrategy,
+        context: &str,
+    ) -> Result<u32, DexError> {
+        let scaled = Self::scale_decimal_to_u64(value, decimals, rounding, context)?;
+        if scaled > u64::from(u32::MAX) {
+            return Err(DexError::Other(format!(
+                "Scaled {} value {} exceeds u32 maximum",
+                context, scaled
+            )));
+        }
+        Ok(scaled as u32)
     }
 
     fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decimal {
