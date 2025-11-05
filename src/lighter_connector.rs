@@ -10,10 +10,10 @@ const ORDER_TYPE_TRIGGER: u32 = 2;
 const SIDE_SELL: u32 = 0; // Sell order (close long positions, open short positions)
 const SIDE_BUY: u32 = 1; // Buy order (close short positions, open long positions)
 
-// Lighter Protocol Time-in-Force constants (as used by the Go SDK)
-const TIF_GTC: u32 = 0; // Good-Till-Cancel
-const TIF_IOC: u32 = 1; // Immediate-or-Cancel
-const TIF_FOK: u32 = 2; // Fill-or-Kill
+// Lighter Protocol Time-in-Force constants (aligned with Go SDK)
+const TIF_IOC: u32 = 0; // Immediate-or-Cancel
+const TIF_GTT: u32 = 1; // Good-Till-Time
+const TIF_POST_ONLY: u32 = 2; // Post-Only (behaves like GTT but rejects immediate fills)
 
 // Lighter Protocol scaling defaults (will be overridden by market metadata)
 const DEFAULT_PRICE_DECIMALS: u32 = 1;
@@ -1083,8 +1083,7 @@ impl LighterConnector {
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
         let trigger_price = 0u64; // no trigger
                                   // For market or immediate TIF orders, use 0 (NilOrderExpiry). For GTC orders, use future timestamp
-        let is_immediate_tif =
-            time_in_force == u64::from(TIF_IOC) || time_in_force == u64::from(TIF_FOK);
+        let is_immediate_tif = time_in_force == u64::from(TIF_IOC);
         let order_expiry = if order_type == ORDER_TYPE_IOC || is_immediate_tif {
             0i64 // NilOrderExpiry for immediate-or-cancel / fill-or-kill orders
         } else {
@@ -2749,12 +2748,12 @@ impl DexConnector for LighterConnector {
             OrderSide::Short => 1,
         };
 
-        // Convert time-in-force: 0=GTC, 1=IOC, 2=FOK
+        // Convert time-in-force: 0=IOC, 1=GTT, 2=PostOnly
         // Use spread parameter to specify TIF when negative values:
         // spread >= 0: normal spread adjustment
         // spread = -1: IOC order
-        // spread = -2: FOK order
-        let default_tif = TIF_GTC;
+        // spread = -2: Post-only order
+        let default_tif = TIF_GTT;
 
         let price_decimals = market_info.price_decimals;
         let size_decimals = market_info.size_decimals;
@@ -2783,10 +2782,10 @@ impl DexConnector for LighterConnector {
                 if spread_ticks < 0 {
                     // Negative spread values specify TIF
                     let tif_value = match spread_ticks {
-                        -1 => TIF_IOC, // IOC
-                        -2 => TIF_FOK, // FOK
+                        -1 => TIF_IOC,       // IOC
+                        -2 => TIF_POST_ONLY, // Post-only (resting limit)
                         _ => {
-                            log::warn!("Invalid TIF spread value: {}, using GTC", spread_ticks);
+                            log::warn!("Invalid TIF spread value: {}, using GTT", spread_ticks);
                             default_tif
                         }
                     };
@@ -2819,9 +2818,9 @@ impl DexConnector for LighterConnector {
             let price_val = u64::from(price_u32);
 
             let tif_name = match order_tif {
-                0 => "GTC",
-                1 => "IOC",
-                2 => "FOK",
+                v if v == TIF_IOC => "IOC",
+                v if v == TIF_GTT => "GTT",
+                v if v == TIF_POST_ONLY => "POST_ONLY",
                 _ => "UNKNOWN",
             };
 
@@ -3055,7 +3054,7 @@ impl DexConnector for LighterConnector {
         };
 
         // Set TimeInForce based on order type (using global protocol constants)
-        let time_in_force = if is_market { TIF_IOC } else { TIF_GTC };
+        let time_in_force = if is_market { TIF_IOC } else { TIF_GTT };
 
         log::debug!(
             "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}",
