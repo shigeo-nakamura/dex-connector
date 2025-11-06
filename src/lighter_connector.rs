@@ -3112,19 +3112,34 @@ impl DexConnector for LighterConnector {
             market_id, side_value, base_amount, execution_price_native, trigger_price_native, order_type
         );
 
-        self.create_order_native_with_trigger(
-            market_id,
-            side_value,
-            time_in_force,
-            base_amount,
-            execution_price_native,
-            trigger_price_native,
-            None,
-            order_type,
-            reduce_only,
-            expiry_secs,
-        )
-        .await
+        let result = self
+            .create_order_native_with_trigger(
+                market_id,
+                side_value,
+                time_in_force,
+                base_amount,
+                execution_price_native,
+                trigger_price_native,
+                None,
+                order_type,
+                reduce_only,
+                expiry_secs,
+            )
+            .await;
+
+        if let Ok(ref response) = result {
+            let tracked_price = response.ordered_price;
+            self.update_order_tracking_after_create(
+                symbol,
+                &response.order_id,
+                side,
+                size,
+                tracked_price,
+            )
+            .await;
+        }
+
+        result
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
