@@ -412,6 +412,16 @@ struct LighterSignedEnvelope {
 // Lighter-specific cryptographic structures
 
 impl LighterConnector {
+    fn parse_cancel_order_index(order_id: &str) -> Option<i64> {
+        if let Ok(idx) = order_id.parse::<i64>() {
+            return Some(idx);
+        }
+
+        let stripped = order_id.strip_prefix("trigger-")?;
+        let (timestamp, _) = stripped.split_once('-')?;
+        timestamp.parse::<i64>().ok()
+    }
+
     async fn refresh_market_cache(&self) -> Result<(), DexError> {
         let mut cache = MarketCache::default();
         let mut detail_decimals: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -3145,11 +3155,11 @@ impl DexConnector for LighterConnector {
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
         let market_info = self.resolve_market_info(symbol).await?;
 
-        let order_index = match order_id.parse::<i64>() {
-            Ok(idx) => idx,
-            Err(_) => {
+        let order_index = match Self::parse_cancel_order_index(order_id) {
+            Some(idx) => idx,
+            None => {
                 log::warn!(
-                    "[CANCEL_ORDER] Unable to parse order_id '{}' as numeric index. Skipping cancel request.",
+                    "[CANCEL_ORDER] Unable to derive numeric index from order_id '{}'. Skipping cancel request.",
                     order_id
                 );
                 return Ok(());
@@ -4696,6 +4706,30 @@ pub fn create_lighter_connector(
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn parses_plain_numeric_order_id_for_cancel() {
+        assert_eq!(
+            LighterConnector::parse_cancel_order_index("12345"),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn parses_trigger_style_order_id_for_cancel() {
+        assert_eq!(
+            LighterConnector::parse_cancel_order_index("trigger-1762471376097-1"),
+            Some(1762471376097)
+        );
+    }
+
+    #[test]
+    fn returns_none_for_unknown_cancel_format() {
+        assert_eq!(
+            LighterConnector::parse_cancel_order_index("unknown-id"),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn test_get_open_orders() {
