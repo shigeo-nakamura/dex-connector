@@ -237,6 +237,8 @@ pub struct LighterConnector {
     connection_epoch: Arc<AtomicU64>,
     // Market metadata cache for symbol↔market_id resolution
     market_cache: Arc<RwLock<MarketCache>>,
+    // Serialize refresh attempts to avoid thundering herd on orderBookDetails
+    market_cache_init_lock: Arc<tokio::sync::Mutex<()>>,
     // Symbols requested by caller (for order book subscription)
     tracked_symbols: Vec<String>,
 }
@@ -530,6 +532,59 @@ impl LighterConnector {
         Ok(())
     }
 
+    async fn has_market_metadata(&self) -> bool {
+        let cache = self.market_cache.read().await;
+        !cache.by_symbol.is_empty()
+    }
+
+    async fn ensure_market_metadata_loaded(&self) -> Result<(), DexError> {
+        if self.has_market_metadata().await {
+            return Ok(());
+        }
+
+        let _lock = self.market_cache_init_lock.lock().await;
+        if self.has_market_metadata().await {
+            return Ok(());
+        }
+
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+        let mut backoff = Duration::from_secs(1);
+
+        loop {
+            attempt += 1;
+            match self.refresh_market_cache().await {
+                Ok(_) => {
+                    log::info!(
+                        "📊 [MARKET_CACHE] Loaded market metadata successfully (attempt {})",
+                        attempt
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Failed to refresh market metadata (attempt {}): {}",
+                        attempt,
+                        err
+                    );
+
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+
+                    log::info!(
+                        "Retrying market metadata fetch in {}s (next attempt {}/{})",
+                        backoff.as_secs(),
+                        attempt + 1,
+                        MAX_ATTEMPTS
+                    );
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    }
+
     async fn resolve_market_info(&self, symbol: &str) -> Result<MarketInfo, DexError> {
         let normalized = normalize_symbol(symbol);
         {
@@ -539,7 +594,7 @@ impl LighterConnector {
             }
         }
 
-        self.refresh_market_cache().await?;
+        self.ensure_market_metadata_loaded().await?;
         let cache = self.market_cache.read().await;
         cache
             .by_symbol
@@ -986,6 +1041,7 @@ impl LighterConnector {
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
+            market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
             tracked_symbols,
         })
     }
@@ -1036,6 +1092,7 @@ impl LighterConnector {
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
+            market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
             tracked_symbols,
         })
     }
@@ -2215,6 +2272,9 @@ impl DexConnector for LighterConnector {
                 Err(e) => return Err(e),
             }
         }
+
+        // Preload market metadata once at startup to prevent repeated REST calls later.
+        self.ensure_market_metadata_loaded().await?;
 
         // Start WebSocket connection
         self.start_websocket().await?;
