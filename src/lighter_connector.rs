@@ -241,6 +241,14 @@ pub struct LighterConnector {
     market_cache_init_lock: Arc<tokio::sync::Mutex<()>>,
     // Symbols requested by caller (for order book subscription)
     tracked_symbols: Vec<String>,
+    nonce_cache: Arc<tokio::sync::Mutex<Option<NonceCache>>>,
+    nonce_cache_ttl: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct NonceCache {
+    next_nonce: u64,
+    last_refresh: Instant,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1043,6 +1051,8 @@ impl LighterConnector {
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
             market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
             tracked_symbols,
+            nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            nonce_cache_ttl: Duration::from_secs(30),
         })
     }
 
@@ -1094,6 +1104,8 @@ impl LighterConnector {
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
             market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
             tracked_symbols,
+            nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            nonce_cache_ttl: Duration::from_secs(30),
         })
     }
 
@@ -1340,6 +1352,7 @@ impl LighterConnector {
                     .unwrap_or_else(|| Decimal::ZERO),
             })
         } else {
+            self.invalidate_nonce_cache().await;
             Err(DexError::Other(format!(
                 "Order failed: HTTP {}, {}",
                 status, response_text
@@ -1536,6 +1549,7 @@ impl LighterConnector {
                     .unwrap_or_else(|| Decimal::ZERO),
             })
         } else {
+            self.invalidate_nonce_cache().await;
             Err(DexError::Other(format!(
                 "Trigger order failed: HTTP {}, {}",
                 status, response_text
@@ -1661,6 +1675,26 @@ impl LighterConnector {
     }
 
     async fn get_nonce_with_key(&self, api_key: &str) -> Result<u64, DexError> {
+        if api_key == self.api_key_public {
+            let mut cache = self.nonce_cache.lock().await;
+            if let Some(state) = cache.as_mut() {
+                if state.last_refresh.elapsed() <= self.nonce_cache_ttl {
+                    let nonce = state.next_nonce;
+                    state.next_nonce = state.next_nonce.saturating_add(1);
+                    return Ok(nonce);
+                }
+            }
+            let nonce = self.fetch_nonce(api_key).await?;
+            *cache = Some(NonceCache {
+                next_nonce: nonce.saturating_add(1),
+                last_refresh: Instant::now(),
+            });
+            return Ok(nonce);
+        }
+        self.fetch_nonce(api_key).await
+    }
+
+    async fn fetch_nonce(&self, api_key: &str) -> Result<u64, DexError> {
         let url = format!(
             "{}/api/v1/nextNonce?account_index={}&api_key_index={}",
             self.base_url, self.account_index, self.api_key_index
@@ -1703,6 +1737,11 @@ impl LighterConnector {
             .map_err(|e| DexError::Other(format!("Failed to parse nonce response: {}", e)))?;
 
         Ok(nonce_response.nonce)
+    }
+
+    async fn invalidate_nonce_cache(&self) {
+        let mut cache = self.nonce_cache.lock().await;
+        *cache = None;
     }
 
     #[allow(dead_code)]
@@ -3254,6 +3293,7 @@ impl DexConnector for LighterConnector {
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
         if !status.is_success() {
+            self.invalidate_nonce_cache().await;
             return Err(DexError::Other(format!(
                 "Cancel order failed: HTTP {}, {}",
                 status, response_text
