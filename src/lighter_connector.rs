@@ -19,6 +19,8 @@ const TIF_POST_ONLY: u32 = 2; // Post-Only (behaves like GTT but rejects immedia
 const DEFAULT_PRICE_DECIMALS: u32 = 1;
 const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
+const LIGHTER_ANNOUNCEMENT_ENDPOINT: &str = "/api/v1/announcement";
+const MAINTENANCE_CACHE_TTL_MINS: i64 = 10;
 
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
@@ -60,6 +62,20 @@ fn is_buy_for_tpsl(position_side: OrderSide) -> bool {
 
 struct MaintenanceInfo {
     next_start: Option<DateTime<Utc>>,
+    last_checked: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LighterAnnouncementsResponse {
+    #[serde(default)]
+    announcements: Vec<LighterAnnouncement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LighterAnnouncement {
+    title: String,
+    content: String,
+    created_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -422,6 +438,70 @@ struct LighterSignedEnvelope {
 // Lighter-specific cryptographic structures
 
 impl LighterConnector {
+    fn announcement_mentions_downtime(title: &str, content: &str) -> bool {
+        let keywords = ["maintenance", "upgrade", "downtime"];
+        let lower_title = title.to_ascii_lowercase();
+        let lower_content = content.to_ascii_lowercase();
+
+        keywords
+            .iter()
+            .any(|keyword| lower_title.contains(keyword) || lower_content.contains(keyword))
+    }
+
+    fn maintenance_within_window(
+        next_start: Option<DateTime<Utc>>,
+        now: &DateTime<Utc>,
+        hours_ahead: i64,
+    ) -> bool {
+        if let Some(start) = next_start {
+            if start <= *now {
+                return true;
+            }
+
+            let horizon = if hours_ahead > 0 {
+                ChronoDuration::hours(hours_ahead)
+            } else {
+                ChronoDuration::zero()
+            };
+
+            return (start - *now) <= horizon;
+        }
+        false
+    }
+
+    async fn fetch_next_maintenance_window(&self) -> Result<Option<DateTime<Utc>>, DexError> {
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{}{}", base, LIGHTER_ANNOUNCEMENT_ENDPOINT);
+
+        let response = self.client.get(&url).send().await.map_err(|e| {
+            DexError::Other(format!("Failed to fetch Lighter announcements: {}", e))
+        })?;
+
+        if !response.status().is_success() {
+            return Err(DexError::Other(format!(
+                "Lighter announcements endpoint returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let payload: LighterAnnouncementsResponse = response.json().await.map_err(|e| {
+            DexError::Other(format!("Failed to parse Lighter announcements: {}", e))
+        })?;
+
+        let now = Utc::now();
+
+        let mut upcoming: Vec<DateTime<Utc>> = payload
+            .announcements
+            .into_iter()
+            .filter(|ann| Self::announcement_mentions_downtime(&ann.title, &ann.content))
+            .filter_map(|ann| DateTime::<Utc>::from_timestamp(ann.created_at, 0))
+            .filter(|scheduled| *scheduled >= now)
+            .collect();
+
+        upcoming.sort();
+        Ok(upcoming.into_iter().next())
+    }
+
     fn parse_cancel_order_index(order_id: &str) -> Option<i64> {
         if let Ok(idx) = order_id.parse::<i64>() {
             return Some(idx);
@@ -1043,7 +1123,10 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
-            maintenance: Arc::new(RwLock::new(MaintenanceInfo { next_start: None })),
+            maintenance: Arc::new(RwLock::new(MaintenanceInfo {
+                next_start: None,
+                last_checked: None,
+            })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             // Connection epoch counter for race detection
@@ -1096,7 +1179,10 @@ impl LighterConnector {
             current_price: Arc::new(RwLock::new(None)),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
-            maintenance: Arc::new(RwLock::new(MaintenanceInfo { next_start: None })),
+            maintenance: Arc::new(RwLock::new(MaintenanceInfo {
+                next_start: None,
+                last_checked: None,
+            })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             // Connection epoch counter for race detection
@@ -3632,14 +3718,35 @@ impl DexConnector for LighterConnector {
     }
 
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
-        let info = self.maintenance.read().await;
-        if let Some(start) = info.next_start {
-            let now = Utc::now();
-            if now < start && (start - now) <= ChronoDuration::hours(hours_ahead) {
-                return true;
+        let now = Utc::now();
+        let cache_ttl = ChronoDuration::minutes(MAINTENANCE_CACHE_TTL_MINS);
+
+        let (needs_refresh, cached_start) = {
+            let info = self.maintenance.read().await;
+            let needs_refresh = match info.last_checked {
+                Some(ts) => now - ts >= cache_ttl,
+                None => true,
+            };
+            (needs_refresh, info.next_start.clone())
+        };
+
+        if !needs_refresh {
+            return Self::maintenance_within_window(cached_start, &now, hours_ahead);
+        }
+
+        match self.fetch_next_maintenance_window().await {
+            Ok(next_start) => {
+                let mut info = self.maintenance.write().await;
+                info.next_start = next_start;
+                info.last_checked = Some(now);
+                Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead)
+            }
+            Err(err) => {
+                log::warn!("Failed to refresh Lighter maintenance schedule: {:?}", err);
+                let info = self.maintenance.read().await;
+                Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead)
             }
         }
-        false
     }
 
     async fn sign_evm_65b(&self, message: &str) -> Result<String, DexError> {
