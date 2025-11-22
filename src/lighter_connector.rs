@@ -489,17 +489,57 @@ impl LighterConnector {
         })?;
 
         let now = Utc::now();
+        let announcement_titles: Vec<String> = payload
+            .announcements
+            .iter()
+            .map(|ann| ann.title.clone())
+            .collect();
+
+        log::debug!(
+            "Lighter maintenance fetch: url={} count={} titles={:?}",
+            url,
+            payload.announcements.len(),
+            announcement_titles
+        );
 
         let mut upcoming: Vec<DateTime<Utc>> = payload
             .announcements
             .into_iter()
             .filter(|ann| Self::announcement_mentions_downtime(&ann.title, &ann.content))
-            .filter_map(|ann| DateTime::<Utc>::from_timestamp(ann.created_at, 0))
-            .filter(|scheduled| *scheduled >= now)
+            .filter_map(|ann| {
+                let parsed = DateTime::<Utc>::from_timestamp(ann.created_at, 0);
+                if parsed.is_none() {
+                    log::debug!(
+                        "Lighter maintenance parse: failed to parse created_at={} title={}",
+                        ann.created_at,
+                        ann.title
+                    );
+                }
+                parsed
+            })
+            .filter(|scheduled| {
+                if *scheduled < now {
+                    log::debug!(
+                        "Lighter maintenance skip past announcement: scheduled={} now={}",
+                        scheduled,
+                        now
+                    );
+                    return false;
+                }
+                true
+            })
             .collect();
 
         upcoming.sort();
-        Ok(upcoming.into_iter().next())
+        let next = upcoming.into_iter().next();
+
+        log::debug!(
+            "Lighter maintenance result: next_start={:?} now={}",
+            next,
+            now
+        );
+
+        Ok(next)
     }
 
     fn parse_cancel_order_index(order_id: &str) -> Option<i64> {

@@ -509,6 +509,21 @@ impl HyperliquidConnector {
                     .await
                 {
                     if let Ok(json) = res.json::<Value>().await {
+                        let scheduled = json
+                            .get("scheduled_maintenances")
+                            .and_then(|v| v.as_array());
+                        let scheduled_count = scheduled.map(|arr| arr.len()).unwrap_or(0);
+                        let raw_next = scheduled
+                            .and_then(|arr| arr.get(0))
+                            .and_then(|v| v.get("scheduled_for"))
+                            .and_then(|v| v.as_str());
+
+                        log::debug!(
+                            "Hyperliquid maintenance poll: count={} raw_next={:?}",
+                            scheduled_count,
+                            raw_next
+                        );
+
                         let next = json
                             .get("scheduled_maintenances")
                             .and_then(|v| v.get(0))
@@ -516,6 +531,13 @@ impl HyperliquidConnector {
                             .and_then(|v| v.as_str())
                             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                             .map(|dt| dt.with_timezone(&Utc));
+
+                        if next.is_none() {
+                            log::debug!(
+                                "Hyperliquid maintenance parse result: no upcoming window parsed from {:?}",
+                                raw_next
+                            );
+                        }
 
                         *cache.write().await = MaintenanceInfo {
                             next_start: next,
