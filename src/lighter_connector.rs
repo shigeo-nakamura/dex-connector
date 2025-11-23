@@ -33,6 +33,8 @@ use crate::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::Client;
+use regex::Regex;
+use lazy_static::lazy_static;
 use rust_decimal::Decimal;
 use rust_decimal::{
     prelude::{FromStr, ToPrimitive},
@@ -448,23 +450,33 @@ impl LighterConnector {
             .any(|keyword| lower_title.contains(keyword) || lower_content.contains(keyword))
     }
 
+    fn parse_datetime_from_text(title: &str, content: &str) -> Option<DateTime<Utc>> {
+        // Example: "November 23, 2025 at 12:00 PM UTC"
+        lazy_static! {
+            static ref DT_RE: Regex = Regex::new(
+                r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+\\d{1,2},\\s+\\d{4}\\s+at\\s+\\d{1,2}:\\d{2}\\s+(AM|PM)\\s+UTC"
+            )
+            .unwrap();
+        }
+        let haystack = format!("{} {}", title, content);
+        DT_RE
+            .captures(&haystack)
+            .and_then(|caps| caps.get(0))
+            .and_then(|m| DateTime::parse_from_str(m.as_str(), "%B %d, %Y at %I:%M %p UTC").ok())
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
     fn maintenance_within_window(
         next_start: Option<DateTime<Utc>>,
         now: &DateTime<Utc>,
         hours_ahead: i64,
     ) -> bool {
         if let Some(start) = next_start {
-            if start <= *now {
-                return true;
-            }
-
-            let horizon = if hours_ahead > 0 {
-                ChronoDuration::hours(hours_ahead)
-            } else {
-                ChronoDuration::zero()
-            };
-
-            return (start - *now) <= horizon;
+            let horizon = ChronoDuration::hours(hours_ahead.max(0));
+            let active_window = ChronoDuration::minutes(90);
+            let upcoming = *now <= start && (start - *now) <= horizon;
+            let active = *now >= start && (*now - start) <= active_window;
+            return upcoming || active;
         }
         false
     }
@@ -507,15 +519,36 @@ impl LighterConnector {
             .into_iter()
             .filter(|ann| Self::announcement_mentions_downtime(&ann.title, &ann.content))
             .filter_map(|ann| {
-                let parsed = DateTime::<Utc>::from_timestamp(ann.created_at, 0);
-                if parsed.is_none() {
+                if let Some(dt) = Self::parse_datetime_from_text(&ann.title, &ann.content) {
+                    if dt >= now {
+                        return Some(dt);
+                    }
                     log::debug!(
-                        "Lighter maintenance parse: failed to parse created_at={} title={}",
-                        ann.created_at,
+                        "Lighter maintenance parse: parsed datetime {} already past, skipping (title={})",
+                        dt,
                         ann.title
                     );
                 }
-                parsed
+
+                match DateTime::<Utc>::from_timestamp(ann.created_at, 0) {
+                    Some(dt) if dt >= now => Some(dt),
+                    Some(dt) => {
+                        log::debug!(
+                            "Lighter maintenance skip past announcement: scheduled={} now={}",
+                            dt,
+                            now
+                        );
+                        None
+                    }
+                    None => {
+                        log::debug!(
+                            "Lighter maintenance parse: failed to parse created_at={} title={}",
+                            ann.created_at,
+                            ann.title
+                        );
+                        None
+                    }
+                }
             })
             .filter(|scheduled| {
                 if *scheduled < now {
@@ -3771,7 +3804,14 @@ impl DexConnector for LighterConnector {
         };
 
         if !needs_refresh {
-            return Self::maintenance_within_window(cached_start, &now, hours_ahead);
+            let res = Self::maintenance_within_window(cached_start, &now, hours_ahead);
+            log::debug!(
+                "Lighter maintenance check (cached): start={:?} now={} result={}",
+                cached_start,
+                now,
+                res
+            );
+            return res;
         }
 
         match self.fetch_next_maintenance_window().await {
@@ -3779,12 +3819,26 @@ impl DexConnector for LighterConnector {
                 let mut info = self.maintenance.write().await;
                 info.next_start = next_start;
                 info.last_checked = Some(now);
-                Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead)
+                let res = Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
+                log::debug!(
+                    "Lighter maintenance check (refreshed): start={:?} now={} result={}",
+                    info.next_start,
+                    now,
+                    res
+                );
+                res
             }
             Err(err) => {
                 log::warn!("Failed to refresh Lighter maintenance schedule: {:?}", err);
                 let info = self.maintenance.read().await;
-                Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead)
+                let res = Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
+                log::debug!(
+                    "Lighter maintenance check (stale cache): start={:?} now={} result={}",
+                    info.next_start,
+                    now,
+                    res
+                );
+                res
             }
         }
     }

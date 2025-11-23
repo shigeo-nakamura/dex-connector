@@ -32,6 +32,7 @@ sha3 = "0.10.1"
 crypto-mac = "0.11"
 rust_decimal = { version = "1.0", features = ["serde"] }
 lazy_static = "1.3"
+regex = "1"
 ethers = { version = "2.0.14", features = ["eip712", "abigen"] } # Updated to match hyperliquid_rust_sdk
 debot-utils = "1.0.*"
 ecdsa = "0.16.9"
