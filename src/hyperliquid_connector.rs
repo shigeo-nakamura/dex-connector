@@ -2049,10 +2049,23 @@ impl DexConnector for HyperliquidConnector {
         let info = self.maintenance.read().await;
         if let Some(start) = info.next_start {
             let now = Utc::now();
-            if now < start && (start - now) <= ChronoDuration::hours(hours_ahead) {
-                return true;
-            }
+            let lead = ChronoDuration::hours(hours_ahead.max(0));
+            // Treat as maintenance if scheduled within lead time OR already started within a 90-minute window.
+            let active_window = ChronoDuration::minutes(90);
+            let upcoming = now <= start && (start - now) <= lead;
+            let already_active = now >= start && (now - start) <= active_window;
+            let result = upcoming || already_active;
+            log::debug!(
+                "Hyperliquid maintenance check: start={:?} now={:?} upcoming={} active={} result={}",
+                start,
+                now,
+                upcoming,
+                already_active,
+                result
+            );
+            return result;
         }
+        log::debug!("Hyperliquid maintenance check: no cached start");
         false
     }
 
