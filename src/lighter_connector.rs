@@ -31,7 +31,7 @@ use crate::{
     OpenOrder, OpenOrdersResponse, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use reqwest::Client;
 use regex::Regex;
 use lazy_static::lazy_static;
@@ -451,19 +451,93 @@ impl LighterConnector {
     }
 
     fn parse_datetime_from_text(title: &str, content: &str) -> Option<DateTime<Utc>> {
-        // Example: "November 23, 2025 at 12:00 PM UTC"
+        // Examples from announcements:
+        // - "We're doing a network upgrade on Sunday November 30th at 12PM UTC."
+        // - "November 23, 2025 at 12:00 PM UTC"
         lazy_static! {
             static ref DT_RE: Regex = Regex::new(
-                r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+\\d{1,2},\\s+\\d{4}\\s+at\\s+\\d{1,2}:\\d{2}\\s+(AM|PM)\\s+UTC"
+                r"(?ix)
+                (January|February|March|April|May|June|July|August|September|October|November|December)
+                \s+
+                (\d{1,2})       # day
+                (?:st|nd|rd|th)? # optional ordinal suffix
+                (?:,?\s*(\d{4}))? # optional year
+                \s+at\s+
+                (\d{1,2})       # hour
+                (?::(\d{2}))?   # optional minutes
+                \s*(AM|PM)?     # optional meridiem (default to 24h if missing)
+                \s*UTC
+                "
             )
             .unwrap();
         }
+
         let haystack = format!("{} {}", title, content);
-        DT_RE
-            .captures(&haystack)
-            .and_then(|caps| caps.get(0))
-            .and_then(|m| DateTime::parse_from_str(m.as_str(), "%B %d, %Y at %I:%M %p UTC").ok())
-            .map(|dt| dt.with_timezone(&Utc))
+        let caps = DT_RE.captures(&haystack)?;
+        let month_str = caps.get(1)?.as_str();
+        let day: u32 = caps.get(2)?.as_str().parse().ok()?;
+        let year: i32 = if let Some(m) = caps.get(3) {
+            m.as_str().parse().ok()?
+        } else {
+            Utc::now().year()
+        };
+        let hour_raw: u32 = caps.get(4)?.as_str().parse().ok()?;
+        let minute: u32 = caps
+            .get(5)
+            .map(|m| m.as_str().parse().unwrap_or(0))
+            .unwrap_or(0);
+        let meridiem = caps.get(6).map(|m| m.as_str().to_ascii_uppercase());
+
+        let month = match month_str.to_ascii_lowercase().as_str() {
+            "january" => 1,
+            "february" => 2,
+            "march" => 3,
+            "april" => 4,
+            "may" => 5,
+            "june" => 6,
+            "july" => 7,
+            "august" => 8,
+            "september" => 9,
+            "october" => 10,
+            "november" => 11,
+            "december" => 12,
+            _ => return None,
+        };
+
+        let hour_24 = match meridiem.as_deref() {
+            Some("AM") => {
+                if hour_raw == 12 {
+                    0
+                } else {
+                    hour_raw
+                }
+            }
+            Some("PM") => {
+                if hour_raw == 12 {
+                    12
+                } else {
+                    hour_raw + 12
+                }
+            }
+            None => hour_raw, // assume already 24h format
+            _ => return None,
+        };
+
+        let naive = NaiveDate::from_ymd_opt(year, month, day)?
+            .and_hms_opt(hour_24, minute, 0)?;
+        let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+
+        // If year was inferred and the date is already past, try bumping to next year
+        if caps.get(3).is_none() && dt < Utc::now() {
+            let naive_next = NaiveDate::from_ymd_opt(year + 1, month, day)?
+                .and_hms_opt(hour_24, minute, 0)?;
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                naive_next,
+                Utc,
+            ));
+        }
+
+        Some(dt)
     }
 
     fn maintenance_within_window(
