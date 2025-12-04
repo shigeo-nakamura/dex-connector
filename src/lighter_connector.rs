@@ -32,9 +32,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Utc};
-use reqwest::Client;
-use regex::Regex;
 use lazy_static::lazy_static;
+use regex::Regex;
+use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal::{
     prelude::{FromStr, ToPrimitive},
@@ -245,7 +245,7 @@ pub struct LighterConnector {
     cleanup_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     _ws: Option<DexWebSocket>, // Reserved for future WebSocket implementation
     // WebSocket data storage
-    current_price: Arc<RwLock<Option<(Decimal, u64)>>>, // (price, timestamp)
+    current_price: Arc<RwLock<HashMap<String, (Decimal, u64)>>>, // symbol -> (price, timestamp)
     current_volume: Arc<RwLock<Option<Decimal>>>,
     order_book: Arc<RwLock<Option<LighterOrderBook>>>,
     maintenance: Arc<RwLock<MaintenanceInfo>>,
@@ -523,18 +523,14 @@ impl LighterConnector {
             _ => return None,
         };
 
-        let naive = NaiveDate::from_ymd_opt(year, month, day)?
-            .and_hms_opt(hour_24, minute, 0)?;
+        let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour_24, minute, 0)?;
         let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
 
         // If year was inferred and the date is already past, try bumping to next year
         if caps.get(3).is_none() && dt < Utc::now() {
-            let naive_next = NaiveDate::from_ymd_opt(year + 1, month, day)?
-                .and_hms_opt(hour_24, minute, 0)?;
-            return Some(DateTime::<Utc>::from_naive_utc_and_offset(
-                naive_next,
-                Utc,
-            ));
+            let naive_next =
+                NaiveDate::from_ymd_opt(year + 1, month, day)?.and_hms_opt(hour_24, minute, 0)?;
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive_next, Utc));
         }
 
         Some(dt)
@@ -1267,7 +1263,7 @@ impl LighterConnector {
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             _ws: Some(DexWebSocket::new(websocket_url)),
-            current_price: Arc::new(RwLock::new(None)),
+            current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
             maintenance: Arc::new(RwLock::new(MaintenanceInfo {
@@ -1323,7 +1319,7 @@ impl LighterConnector {
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             _ws: Some(DexWebSocket::new(websocket_url)),
-            current_price: Arc::new(RwLock::new(None)),
+            current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(None)),
             maintenance: Arc::new(RwLock::new(MaintenanceInfo {
@@ -2611,7 +2607,13 @@ impl DexConnector for LighterConnector {
         let funding_data = self.get_funding_rates().await.ok();
 
         // Try to get price from WebSocket first, but check if it's recent
-        if let Some((ws_price, price_timestamp)) = *self.current_price.read().await {
+        if let Some((ws_price, price_timestamp)) = self
+            .current_price
+            .read()
+            .await
+            .get(&canonical_symbol)
+            .copied()
+        {
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -3893,7 +3895,8 @@ impl DexConnector for LighterConnector {
                 let mut info = self.maintenance.write().await;
                 info.next_start = next_start;
                 info.last_checked = Some(now);
-                let res = Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
+                let res =
+                    Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
                 log::debug!(
                     "Lighter maintenance check (refreshed): start={:?} now={} result={}",
                     info.next_start,
@@ -3905,7 +3908,8 @@ impl DexConnector for LighterConnector {
             Err(err) => {
                 log::warn!("Failed to refresh Lighter maintenance schedule: {:?}", err);
                 let info = self.maintenance.read().await;
-                let res = Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
+                let res =
+                    Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
                 log::debug!(
                     "Lighter maintenance check (stale cache): start={:?} now={} result={}",
                     info.next_start,
@@ -4126,6 +4130,26 @@ impl LighterConnector {
         let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
         let market_cache = Arc::clone(&self.market_cache);
+        let mut orderbook_market_ids: Vec<u32> = Vec::new();
+        for sym in &self.tracked_symbols {
+            match self.resolve_market_info(sym).await {
+                Ok(info) => {
+                    if !orderbook_market_ids.contains(&info.market_id) {
+                        orderbook_market_ids.push(info.market_id);
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to resolve symbol '{}' for WS order book subscription: {}",
+                        sym,
+                        e
+                    );
+                }
+            }
+        }
+        if orderbook_market_ids.is_empty() {
+            orderbook_market_ids.push(primary_market_id);
+        }
         let default_symbol = self
             .tracked_symbols
             .first()
@@ -4262,34 +4286,35 @@ impl LighterConnector {
                             peer_addr
                         );
 
-                        // Determine primary market for order book subscription
-                        let orderbook_market_id = primary_market_id;
-
                         // Send subscription messages
-                        let subscribe_orderbook = serde_json::json!({
-                            "type": "subscribe",
-                            "channel": format!("order_book/{}", orderbook_market_id)
-                        });
-
                         let subscribe_account = serde_json::json!({
                             "type": "subscribe",
                             "channel": format!("account_all/{}", account_index)
                         });
 
-                        log::info!(
-                            "🔗 [WS_DEBUG] Sending subscriptions - orderbook: {}, account: {}",
-                            subscribe_orderbook,
-                            subscribe_account
-                        );
+                        for market_id in &orderbook_market_ids {
+                            let subscribe_orderbook = serde_json::json!({
+                                "type": "subscribe",
+                                "channel": format!("order_book/{}", market_id)
+                            });
+                            log::info!(
+                                "🔗 [WS_DEBUG] Sending orderbook subscription: {}",
+                                subscribe_orderbook
+                            );
 
-                        if let Err(e) = ws_stream
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                subscribe_orderbook.to_string(),
-                            ))
-                            .await
-                        {
-                            log::error!("Failed to send orderbook subscription: {}", e);
-                            continue;
+                            if let Err(e) = ws_stream
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    subscribe_orderbook.to_string(),
+                                ))
+                                .await
+                            {
+                                log::error!(
+                                    "Failed to send orderbook subscription for {}: {}",
+                                    market_id,
+                                    e
+                                );
+                                continue;
+                            }
                         }
 
                         if let Err(e) = ws_stream
@@ -4735,7 +4760,7 @@ impl LighterConnector {
 
     async fn handle_websocket_message(
         message: Value,
-        current_price: &Arc<RwLock<Option<(Decimal, u64)>>>,
+        current_price: &Arc<RwLock<HashMap<String, (Decimal, u64)>>>,
         current_volume: &Arc<RwLock<Option<Decimal>>>,
         order_book: &Arc<RwLock<Option<LighterOrderBook>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
@@ -4752,6 +4777,26 @@ impl LighterConnector {
                     if let Ok(ob) =
                         serde_json::from_value::<LighterOrderBook>(order_book_data.clone())
                     {
+                        // Resolve symbol for this order book update using the channel hint (order_book/<market_id>)
+                        let channel = message
+                            .get("channel")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or_default();
+                        let market_id = channel
+                            .split('/')
+                            .last()
+                            .and_then(|id| id.parse::<u32>().ok());
+                        let symbol = if let Some(market_id) = market_id {
+                            let cache = market_cache.read().await;
+                            cache
+                                .by_id
+                                .get(&market_id)
+                                .map(|info| info.canonical_symbol.clone())
+                        } else {
+                            None
+                        }
+                        .unwrap_or_else(|| default_symbol.to_string());
+
                         // Update current price from best bid/ask
                         if let (Some(best_bid), Some(best_ask)) = (ob.bids.first(), ob.asks.first())
                         {
@@ -4764,11 +4809,15 @@ impl LighterConnector {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
                                     .as_secs();
-                                *current_price.write().await = Some((mid_price, timestamp));
+                                current_price
+                                    .write()
+                                    .await
+                                    .insert(symbol.clone(), (mid_price, timestamp));
                                 log::trace!(
-                                    "Updated price from WebSocket: {} at {}",
+                                    "Updated price from WebSocket: {} at {} ({})",
                                     mid_price,
-                                    timestamp
+                                    timestamp,
+                                    symbol
                                 );
                             }
                         }
