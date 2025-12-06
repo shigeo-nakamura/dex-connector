@@ -2707,7 +2707,7 @@ impl DexConnector for LighterConnector {
             .await
             .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
 
-        log::debug!(
+        log::trace!(
             "Trades API response (status: {}): {}",
             status,
             response_text
