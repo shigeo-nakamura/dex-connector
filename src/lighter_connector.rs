@@ -4782,9 +4782,10 @@ impl LighterConnector {
                             .get("channel")
                             .and_then(|c| c.as_str())
                             .unwrap_or_default();
+                        // Server sometimes returns channel as "order_book:1" instead of "order_book/1"
                         let market_id = channel
-                            .split('/')
-                            .last()
+                            .rsplit(|c| c == '/' || c == ':')
+                            .next()
                             .and_then(|id| id.parse::<u32>().ok());
                         let symbol = if let Some(market_id) = market_id {
                             let cache = market_cache.read().await;
