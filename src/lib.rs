@@ -124,11 +124,26 @@ pub struct CreateOrderResponse {
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct LastTrade {
     pub price: Decimal,
+    pub size: Option<Decimal>,
+    /// Optional taker side if provided by the venue
+    pub side: Option<OrderSide>,
 }
 
 #[derive(Deserialize, Debug, Default)]
 pub struct LastTradesResponse {
     pub trades: Vec<LastTrade>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OrderBookLevel {
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OrderBookSnapshot {
+    pub bids: Vec<OrderBookLevel>,
+    pub asks: Vec<OrderBookLevel>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

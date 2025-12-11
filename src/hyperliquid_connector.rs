@@ -4,7 +4,7 @@ use crate::{
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
-    OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
+    OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1586,6 +1586,16 @@ impl DexConnector for HyperliquidConnector {
         // TODO: Implement HyperLiquid last trades functionality
         Err(DexError::Other(
             "get_last_trades not implemented for HyperLiquid".to_string(),
+        ))
+    }
+
+    async fn get_order_book(
+        &self,
+        _symbol: &str,
+        _depth: usize,
+    ) -> Result<OrderBookSnapshot, DexError> {
+        Err(DexError::Other(
+            "get_order_book not implemented for HyperLiquid".to_string(),
         ))
     }
 

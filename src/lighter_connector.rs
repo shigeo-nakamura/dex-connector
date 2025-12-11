@@ -28,7 +28,8 @@ use crate::{
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
-    OpenOrder, OpenOrdersResponse, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
+    OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, TickerResponse,
+    TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Utc};
@@ -3069,10 +3070,45 @@ impl DexConnector for LighterConnector {
             .into_iter()
             .map(|t| LastTrade {
                 price: string_to_decimal(Some(t.price)).unwrap_or_default(),
+                size: string_to_decimal(Some(t.size)).ok(),
+                side: None,
             })
             .collect();
 
         Ok(LastTradesResponse { trades })
+    }
+
+    async fn get_order_book(
+        &self,
+        _symbol: &str,
+        depth: usize,
+    ) -> Result<OrderBookSnapshot, DexError> {
+        let ob_guard = self.order_book.read().await;
+        if let Some(ob) = ob_guard.as_ref() {
+            let mut bids = Vec::new();
+            let mut asks = Vec::new();
+            for entry in ob.bids.iter().take(depth) {
+                if let (Ok(price), Ok(size)) = (
+                    string_to_decimal(Some(entry.price.clone())),
+                    string_to_decimal(Some(entry.size.clone())),
+                ) {
+                    bids.push(OrderBookLevel { price, size });
+                }
+            }
+            for entry in ob.asks.iter().take(depth) {
+                if let (Ok(price), Ok(size)) = (
+                    string_to_decimal(Some(entry.price.clone())),
+                    string_to_decimal(Some(entry.size.clone())),
+                ) {
+                    asks.push(OrderBookLevel { price, size });
+                }
+            }
+            return Ok(OrderBookSnapshot { bids, asks });
+        }
+
+        Err(DexError::Other(
+            "order book snapshot unavailable (no recent update)".to_string(),
+        ))
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
