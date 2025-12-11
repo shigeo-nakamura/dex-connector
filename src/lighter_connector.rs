@@ -4579,13 +4579,27 @@ impl LighterConnector {
                                 Ok(message) => match message {
                                     tokio_tungstenite::tungstenite::Message::Text(text) => {
                                         let msg_start = std::time::Instant::now();
-                                        log::trace!("WebSocket text message: {}", text);
-
                                         // Update last received timestamp for any text message
                                         let now = now_secs();
                                         last_rx.store(now, Ordering::SeqCst);
 
                                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                                            let msg_type =
+                                                parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                            let channel = parsed
+                                                .get("channel")
+                                                .and_then(|c| c.as_str())
+                                                .unwrap_or("");
+                                            let offset = parsed
+                                                .get("offset")
+                                                .and_then(|o| o.as_i64())
+                                                .unwrap_or_default();
+                                            log::trace!(
+                                                "WebSocket msg type={} channel={} offset={}",
+                                                msg_type,
+                                                channel,
+                                                offset
+                                            );
                                             // Check for application-layer ping/pong FIRST (before business logic)
                                             if let Some(msg_type) =
                                                 parsed.get("type").and_then(|t| t.as_str())
@@ -4655,7 +4669,8 @@ impl LighterConnector {
                                             }
                                         } else {
                                             log::warn!(
-                                                "Failed to parse WebSocket message as JSON: {}",
+                                                "Failed to parse WebSocket message as JSON (len={}): {}",
+                                                text.len(),
                                                 text
                                             );
                                         }
