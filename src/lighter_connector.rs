@@ -326,6 +326,8 @@ struct LighterTrade {
     size: String,
     usd_amount: String,
     market_id: u8,
+    #[serde(default)]
+    side: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -3071,7 +3073,7 @@ impl DexConnector for LighterConnector {
             .map(|t| LastTrade {
                 price: string_to_decimal(Some(t.price)).unwrap_or_default(),
                 size: string_to_decimal(Some(t.size)).ok(),
-                side: None,
+                side: Self::map_side(t.side.as_deref()),
             })
             .collect();
 
@@ -3981,6 +3983,18 @@ impl DexConnector for LighterConnector {
         // EIP-191 adds the prefix "\x19Ethereum Signed Message:\n" + message.len() + message
         let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
         self.sign_evm_65b(&prefixed).await
+    }
+}
+
+impl LighterConnector {
+    fn map_side(side: Option<&str>) -> Option<OrderSide> {
+        let Some(s) = side else { return None };
+        let normalized = s.trim().to_lowercase();
+        match normalized.as_str() {
+            "buy" | "bid" | "long" => Some(OrderSide::Long),
+            "sell" | "ask" | "short" => Some(OrderSide::Short),
+            _ => None,
+        }
     }
 }
 
