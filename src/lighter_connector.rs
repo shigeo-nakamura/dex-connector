@@ -153,6 +153,16 @@ pub struct StrOrErr {
 }
 
 #[cfg(feature = "lighter-sdk")]
+#[repr(C)]
+pub struct SignedTxResponse {
+    pub tx_type: u8,
+    pub tx_info: *mut c_char,
+    pub tx_hash: *mut c_char,
+    pub message_to_sign: *mut c_char,
+    pub err: *mut c_char,
+}
+
+#[cfg(feature = "lighter-sdk")]
 extern "C" {
     fn CreateClient(
         url: *const c_char,
@@ -163,8 +173,6 @@ extern "C" {
     ) -> *mut c_char;
 
     fn CheckClient(api_key_index: c_int, account_index: c_longlong) -> *mut c_char;
-
-    fn GetClientPubKey(api_key_index: c_int, account_index: c_longlong) -> *mut c_char;
 
     fn SignCreateOrder(
         market_index: c_int,
@@ -178,14 +186,54 @@ extern "C" {
         trigger_price: c_int,
         order_expiry: c_longlong,
         nonce: c_longlong,
-    ) -> StrOrErr;
+        api_key_index: c_int,
+        account_index: c_longlong,
+    ) -> SignedTxResponse;
 
-    fn SignCancelOrder(market_index: c_int, order_index: c_longlong, nonce: c_longlong)
-        -> StrOrErr;
+    fn SignCancelOrder(
+        market_index: c_int,
+        order_index: c_longlong,
+        nonce: c_longlong,
+        api_key_index: c_int,
+        account_index: c_longlong,
+    ) -> SignedTxResponse;
 
-    fn SignChangePubKey(new_pubkey: *const c_char, nonce: c_longlong) -> StrOrErr;
+    fn SignChangePubKey(
+        new_pubkey: *const c_char,
+        nonce: c_longlong,
+        api_key_index: c_int,
+        account_index: c_longlong,
+    ) -> SignedTxResponse;
+}
 
-    fn SignMessageWithEVM(private_key: *const c_char, message: *const c_char) -> StrOrErr;
+#[cfg(feature = "lighter-sdk")]
+unsafe fn take_c_string(ptr: *mut c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let s = CStr::from_ptr(ptr).to_string_lossy().to_string();
+    libc::free(ptr as *mut libc::c_void);
+    Some(s)
+}
+
+#[cfg(feature = "lighter-sdk")]
+unsafe fn parse_signed_tx_response(
+    resp: SignedTxResponse,
+) -> Result<(String, Option<String>), DexError> {
+    if !resp.err.is_null() {
+        let err_msg = take_c_string(resp.err).unwrap_or_else(|| "unknown error".to_string());
+        let _ = take_c_string(resp.tx_info);
+        let _ = take_c_string(resp.tx_hash);
+        let _ = take_c_string(resp.message_to_sign);
+        return Err(DexError::Other(format!("Go SDK error: {}", err_msg)));
+    }
+
+    let tx_info = take_c_string(resp.tx_info)
+        .ok_or_else(|| DexError::Other("Go SDK returned null tx_info".to_string()))?;
+    let message_to_sign = take_c_string(resp.message_to_sign);
+    let _ = take_c_string(resp.tx_hash);
+
+    Ok((tx_info, message_to_sign))
 }
 
 /// Global API call counter for monitoring Lighter Protocol rate limits
@@ -878,51 +926,6 @@ impl LighterConnector {
                 )));
             }
 
-            // Get the correct public key from the server
-            let server_pubkey = match self.get_server_public_key().await {
-                Ok(pubkey) => pubkey,
-                Err(e) => {
-                    log::error!("Failed to get server public key: {}", e);
-                    return Err(e);
-                }
-            };
-
-            // Get the public key derived by the Go shared library
-            let go_pubkey_result = GetClientPubKey(
-                self.api_key_index as c_int,
-                self.account_index as c_longlong,
-            );
-
-            let go_derived_pubkey = if !go_pubkey_result.is_null() {
-                let pubkey_cstr = CStr::from_ptr(go_pubkey_result);
-                let pubkey_str = pubkey_cstr.to_string_lossy().to_string();
-                libc::free(go_pubkey_result as *mut libc::c_void);
-                Some(pubkey_str)
-            } else {
-                log::error!("Failed to get public key from Go client");
-                None
-            };
-
-            // Compare Go-derived key with server key
-            if let Some(go_key) = &go_derived_pubkey {
-                let srv = server_pubkey
-                    .to_lowercase()
-                    .trim_start_matches("0x")
-                    .to_string();
-                let loc = go_key.to_lowercase().trim_start_matches("0x").to_string();
-
-                if loc != srv {
-                    log::debug!(
-                        "API key mismatch detected (account={}, index={}). server={}…{} vs local={}…{} — will attempt ChangePubKey",
-                        self.account_index,
-                        self.api_key_index,
-                        &srv[..8], &srv[srv.len()-8..],
-                        &loc[..8], &loc[loc.len()-8..]
-                    );
-                } else {
-                }
-            }
-
             // Verify the API key is properly registered with Lighter
             let check_result = CheckClient(
                 self.api_key_index as c_int,
@@ -965,9 +968,9 @@ impl LighterConnector {
                     }
                 }
 
-                // If we have the Go-derived public key and EVM wallet key, try to update the API key
+                // If we have the EVM wallet key, try to update the API key
                 #[cfg(feature = "lighter-sdk")]
-                if let (Some(_), Some(_)) = (&go_derived_pubkey, &self.evm_wallet_private_key) {
+                if self.evm_wallet_private_key.is_some() {
                     return Err(DexError::ApiKeyRegistrationRequired);
                 } else {
                     return Err(DexError::Other(format!(
@@ -1132,27 +1135,12 @@ impl LighterConnector {
                 trigger_price,
                 order_expiry,
                 nonce,
+                self.api_key_index as c_int,
+                self.account_index as c_longlong,
             );
 
-            if !result.err.is_null() {
-                let error_cstr = CStr::from_ptr(result.err);
-                let error_msg = error_cstr.to_string_lossy().to_string();
-                libc::free(result.err as *mut libc::c_void);
-                if !result.str.is_null() {
-                    libc::free(result.str as *mut libc::c_void);
-                }
-                return Err(DexError::Other(format!("Go SDK error: {}", error_msg)));
-            }
-
-            if result.str.is_null() {
-                return Err(DexError::Other("Go SDK returned null result".to_string()));
-            }
-
-            let result_cstr = CStr::from_ptr(result.str);
-            let json_str = result_cstr.to_string_lossy().to_string();
-            libc::free(result.str as *mut libc::c_void);
-
-            Ok(json_str)
+            let (tx_info, _) = parse_signed_tx_response(result)?;
+            Ok(tx_info)
         }
     }
 
@@ -1189,29 +1177,16 @@ impl LighterConnector {
         self.create_go_client().await?;
 
         unsafe {
-            let result = SignCancelOrder(market_index, order_index, nonce);
+            let result = SignCancelOrder(
+                market_index,
+                order_index,
+                nonce,
+                self.api_key_index as c_int,
+                self.account_index as c_longlong,
+            );
 
-            if !result.err.is_null() {
-                let error_cstr = CStr::from_ptr(result.err);
-                let error_msg = error_cstr.to_string_lossy().to_string();
-                libc::free(result.err as *mut libc::c_void);
-                if !result.str.is_null() {
-                    libc::free(result.str as *mut libc::c_void);
-                }
-                return Err(DexError::Other(format!("Go SDK error: {}", error_msg)));
-            }
-
-            if result.str.is_null() {
-                return Err(DexError::Other(
-                    "Go SDK returned null result for cancel order".to_string(),
-                ));
-            }
-
-            let result_cstr = CStr::from_ptr(result.str);
-            let json_str = result_cstr.to_string_lossy().to_string();
-            libc::free(result.str as *mut libc::c_void);
-
-            Ok(json_str)
+            let (tx_info, _) = parse_signed_tx_response(result)?;
+            Ok(tx_info)
         }
     }
 
@@ -2076,34 +2051,36 @@ impl LighterConnector {
             SignChangePubKey(
                 std::ffi::CString::new(new_pubkey.clone()).unwrap().as_ptr(),
                 nonce as c_longlong,
+                self.api_key_index as c_int,
+                self.account_index as c_longlong,
             )
         };
 
-        // Check if signing was successful
-        if !sign_result.err.is_null() {
-            let error_msg = unsafe { std::ffi::CStr::from_ptr(sign_result.err).to_string_lossy() };
-            return Err(format!("Failed to sign ChangePubKey: {}", error_msg));
-        }
-
-        let tx_info_str = unsafe { std::ffi::CStr::from_ptr(sign_result.str).to_string_lossy() };
+        let (tx_info_str, message_to_sign_opt) = unsafe { parse_signed_tx_response(sign_result) }
+            .map_err(|e| format!("Failed to sign ChangePubKey: {}", e))?;
         log::debug!("SignChangePubKey result: {}", tx_info_str);
 
-        // Parse the tx_info JSON and extract MessageToSign
+        // Parse the tx_info JSON
         let mut tx_info: serde_json::Value = serde_json::from_str(&tx_info_str)
             .map_err(|e| format!("Failed to parse tx_info: {}", e))?;
 
-        let message_to_sign = tx_info["MessageToSign"]
-            .as_str()
-            .ok_or("MessageToSign not found in tx_info")?
-            .to_string();
+        let message_to_sign = if let Some(msg) = message_to_sign_opt {
+            msg
+        } else {
+            tx_info["MessageToSign"]
+                .as_str()
+                .ok_or("MessageToSign not found in tx_info")?
+                .to_string()
+        };
         log::debug!("MessageToSign: {}", message_to_sign);
 
         // Remove MessageToSign from tx_info as per Python SDK implementation
         tx_info.as_object_mut().unwrap().remove("MessageToSign");
 
-        // Sign the message with EVM key using lighter-go SignMessageWithEVM
-        let evm_signature =
-            self.sign_message_with_lighter_go_evm(evm_private_key, &message_to_sign)?;
+        // Sign the message with EVM key using local signing (EIP-191)
+        let evm_signature = self
+            .sign_message_with_lighter_go_evm(evm_private_key, &message_to_sign)
+            .await?;
         log::debug!("EVM signature: {}", evm_signature);
 
         // Compare expected vs actual L1 address for debugging
@@ -2180,34 +2157,27 @@ impl LighterConnector {
     }
 
     #[cfg(feature = "lighter-sdk")]
-    fn sign_message_with_lighter_go_evm(
+    async fn sign_message_with_lighter_go_evm(
         &self,
         evm_private_key: &str,
         message: &str,
     ) -> Result<String, String> {
-        log::debug!("Using lighter-go SignMessageWithEVM for EVM signature");
+        use ethers::signers::{LocalWallet, Signer};
+        use std::str::FromStr;
 
-        let private_key_cstr = std::ffi::CString::new(evm_private_key)
-            .map_err(|e| format!("Failed to create CString for private key: {}", e))?;
-        let message_cstr = std::ffi::CString::new(message)
-            .map_err(|e| format!("Failed to create CString for message: {}", e))?;
+        log::debug!("Using local EVM signer (ethers) for ChangePubKey signature");
 
-        let sign_result =
-            unsafe { SignMessageWithEVM(private_key_cstr.as_ptr(), message_cstr.as_ptr()) };
+        let cleaned_key = evm_private_key.strip_prefix("0x").unwrap_or(evm_private_key);
+        let wallet = LocalWallet::from_str(cleaned_key)
+            .map_err(|e| format!("Invalid private key: {}", e))?;
 
-        if !sign_result.err.is_null() {
-            let error_msg = unsafe { std::ffi::CStr::from_ptr(sign_result.err).to_string_lossy() };
-            return Err(format!("EVM signature failed: {}", error_msg));
-        }
-
-        let signature = unsafe { std::ffi::CStr::from_ptr(sign_result.str).to_string_lossy() };
+        let signature = wallet
+            .sign_message(message.as_bytes())
+            .await
+            .map_err(|e| format!("Signing failed: {}", e))?;
 
         // Ensure 0x prefix is present (Lighter expects 0x-prefixed signatures)
-        let signature_with_prefix = if signature.starts_with("0x") {
-            signature.to_string()
-        } else {
-            format!("0x{}", signature)
-        };
+        let signature_with_prefix = format!("0x{}", signature);
 
         // Check if v value needs to be adjusted from {0,1} to {27,28}
         if signature_with_prefix.len() == 132 {
@@ -2245,7 +2215,7 @@ impl LighterConnector {
     }
 
     #[cfg(not(feature = "lighter-sdk"))]
-    fn sign_message_with_lighter_go_evm(
+    async fn sign_message_with_lighter_go_evm(
         &self,
         _evm_private_key: &str,
         _message: &str,
@@ -2495,44 +2465,28 @@ impl DexConnector for LighterConnector {
                 Err(DexError::ApiKeyRegistrationRequired) => {
                     #[cfg(feature = "lighter-sdk")]
                     if let Some(evm_key) = &self.evm_wallet_private_key {
-                        // Get Go-derived public key for registration
-                        let go_pubkey_result = unsafe {
-                            GetClientPubKey(
-                                self.api_key_index as c_int,
-                                self.account_index as c_longlong,
-                            )
-                        };
+                        let go_key = self.get_go_pubkey_from_check().map_err(|e| {
+                            DexError::Other(format!(
+                                "Failed to derive Go public key from CheckClient: {}",
+                                e
+                            ))
+                        })?;
 
-                        if !go_pubkey_result.is_null() {
-                            let pubkey_cstr = unsafe { CStr::from_ptr(go_pubkey_result) };
-                            let go_key = pubkey_cstr.to_string_lossy().to_string();
-                            unsafe { libc::free(go_pubkey_result as *mut libc::c_void) };
+                        log::debug!("API key registration required. Attempting to register...");
 
-                            log::debug!("API key registration required. Attempting to register...");
+                        // Get server public key for ChangePubKey
+                        let server_pubkey = self.get_server_public_key().await.map_err(|e| {
+                            DexError::Other(format!("Failed to get server public key: {}", e))
+                        })?;
 
-                            // Get server public key for ChangePubKey
-                            let server_pubkey =
-                                self.get_server_public_key().await.map_err(|e| {
-                                    DexError::Other(format!(
-                                        "Failed to get server public key: {}",
-                                        e
-                                    ))
-                                })?;
+                        self.register_api_key(evm_key, &go_key, &server_pubkey)
+                            .await
+                            .map_err(|e| {
+                                DexError::Other(format!("API key registration failed: {}", e))
+                            })?;
 
-                            self.register_api_key(evm_key, &go_key, &server_pubkey)
-                                .await
-                                .map_err(|e| {
-                                    DexError::Other(format!("API key registration failed: {}", e))
-                                })?;
-
-                            // Retry validation after registration
-                            self.create_go_client().await?;
-                        } else {
-                            log::error!("Failed to get Go-derived public key for registration");
-                            return Err(DexError::Other(
-                                "Cannot get Go-derived public key".to_string(),
-                            ));
-                        }
+                        // Retry validation after registration
+                        self.create_go_client().await?;
                     } else {
                         return Err(DexError::ApiKeyRegistrationRequired);
                     }
@@ -3987,6 +3941,46 @@ impl DexConnector for LighterConnector {
 }
 
 impl LighterConnector {
+    #[cfg(feature = "lighter-sdk")]
+    fn extract_own_pubkey_from_error(error_msg: &str) -> Option<String> {
+        let marker = "ownPubKey:";
+        let start = error_msg.find(marker)?;
+        let after = error_msg[start + marker.len()..].trim_start();
+        let end = after.find(' ').unwrap_or(after.len());
+        if end == 0 {
+            None
+        } else {
+            Some(after[..end].to_string())
+        }
+    }
+
+    #[cfg(feature = "lighter-sdk")]
+    fn get_go_pubkey_from_check(&self) -> Result<String, DexError> {
+        unsafe {
+            let result = CheckClient(
+                self.api_key_index as c_int,
+                self.account_index as c_longlong,
+            );
+
+            if result.is_null() {
+                return Err(DexError::Other(
+                    "CheckClient succeeded; no pubkey mismatch detected".to_string(),
+                ));
+            }
+
+            let error_cstr = CStr::from_ptr(result);
+            let error_msg = error_cstr.to_string_lossy().to_string();
+            libc::free(result as *mut libc::c_void);
+
+            Self::extract_own_pubkey_from_error(&error_msg).ok_or_else(|| {
+                DexError::Other(format!(
+                    "Failed to extract public key from CheckClient error: {}",
+                    error_msg
+                ))
+            })
+        }
+    }
+
     fn map_side(side: Option<&str>) -> Option<OrderSide> {
         let Some(s) = side else { return None };
         let normalized = s.trim().to_lowercase();
