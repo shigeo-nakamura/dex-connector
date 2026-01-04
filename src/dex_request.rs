@@ -14,6 +14,7 @@ pub enum HttpMethod {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
 }
 
@@ -23,6 +24,7 @@ impl From<HttpMethod> for Method {
             HttpMethod::Get => Method::GET,
             HttpMethod::Post => Method::POST,
             HttpMethod::Put => Method::PUT,
+            HttpMethod::Patch => Method::PATCH,
             HttpMethod::Delete => Method::DELETE,
         }
     }

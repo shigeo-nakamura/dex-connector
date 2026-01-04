@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "3.2.6"
+version = "4.0.0"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -57,6 +57,8 @@ num-traits = "0.2"
 poseidon-rs = "0.0.10"
 # Simple field arithmetic for Goldilocks
 # Using num-bigint for field operations
+rust-crypto-lib-base = { path = "../stark-crypto-wrapper/rust-crypto-lib-base" }
+starknet = { git = "https://github.com/xJonathanLEI/starknet-rs", tag = "starknet/v0.17.0" }
 
 [dev-dependencies]
 rusoto_core = "0.48"

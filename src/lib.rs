@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 mod dex_connector;
 mod dex_request;
 mod dex_websocket;
+mod extended_connector;
 mod hyperliquid_connector;
 #[cfg(feature = "lighter-sdk")]
 pub mod lighter_connector;
 
 pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
+pub use extended_connector::*;
 pub use hyperliquid_connector::*;
 #[cfg(feature = "lighter-sdk")]
 pub use lighter_connector::*;

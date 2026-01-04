@@ -6,6 +6,7 @@ A Rust library for connecting to multiple decentralized exchanges (DEX) with con
 
 - **Hyperliquid**: Native Rust implementation (always available)
 - **Lighter**: Go SDK integration (conditional feature)
+- **Extended (Perp)**: Native Rust implementation
 - **Others**: Extensible architecture for additional protocols
 
 ## Feature Flags
@@ -90,6 +91,15 @@ let lighter = create_lighter_connector(
     base_url,
     websocket_url,
 )?;
+
+// Extended (Perp)
+let extended = create_extended_connector(
+    api_key,
+    public_key,
+    private_key,
+    vault,
+    Some(base_url),
+).await?;
 ```
 
 ### Feature-Conditional Code
@@ -114,6 +124,7 @@ dex-connector/
 ├── src/
 │   ├── lib.rs                    # Public API and traits
 │   ├── dex_connector.rs          # Core connector trait
+│   ├── extended_connector.rs     # Extended (Perp) implementation
 │   ├── hyperliquid_connector.rs  # Hyperliquid implementation
 │   └── lighter_connector.rs      # Lighter implementation (conditional)
 ├── Cargo.toml                    # Feature flag configuration
@@ -127,6 +138,7 @@ dex-connector/
 - **Enable lighter-sdk**: Only when you have matching architecture libraries
 - **Handle errors**: Gracefully handle disabled feature runtime errors
 - **Cross-platform**: Always rebuild `libsigner.so` for target architecture
+- **Extended**: Uses `rust-crypto-lib-base` (from `stark-crypto-wrapper`) for Stark order hashing/signing
 
 ### For Contributors
 - Mark Lighter-specific code with `#[cfg(feature = "lighter-sdk")]`

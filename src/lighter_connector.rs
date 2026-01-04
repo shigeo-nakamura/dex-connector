@@ -1977,6 +1977,7 @@ impl LighterConnector {
             HttpMethod::Get => "GET",
             HttpMethod::Post => "POST",
             HttpMethod::Put => "PUT",
+            HttpMethod::Patch => "PATCH",
             HttpMethod::Delete => "DELETE",
         };
         track_api_call(endpoint, method_str);
@@ -1987,6 +1988,7 @@ impl LighterConnector {
             HttpMethod::Get => self.client.get(&url),
             HttpMethod::Post => self.client.post(&url),
             HttpMethod::Put => self.client.put(&url),
+            HttpMethod::Patch => self.client.patch(&url),
             HttpMethod::Delete => self.client.delete(&url),
         };
 
@@ -2056,8 +2058,9 @@ impl LighterConnector {
             )
         };
 
-        let (tx_info_str, message_to_sign_opt) = unsafe { parse_signed_tx_response(sign_result) }
-            .map_err(|e| format!("Failed to sign ChangePubKey: {}", e))?;
+        let (tx_info_str, message_to_sign_opt) =
+            unsafe { parse_signed_tx_response(sign_result) }
+                .map_err(|e| format!("Failed to sign ChangePubKey: {}", e))?;
         log::debug!("SignChangePubKey result: {}", tx_info_str);
 
         // Parse the tx_info JSON
@@ -2167,7 +2170,9 @@ impl LighterConnector {
 
         log::debug!("Using local EVM signer (ethers) for ChangePubKey signature");
 
-        let cleaned_key = evm_private_key.strip_prefix("0x").unwrap_or(evm_private_key);
+        let cleaned_key = evm_private_key
+            .strip_prefix("0x")
+            .unwrap_or(evm_private_key);
         let wallet = LocalWallet::from_str(cleaned_key)
             .map_err(|e| format!("Invalid private key: {}", e))?;
 
@@ -4578,8 +4583,10 @@ impl LighterConnector {
                                         last_rx.store(now, Ordering::SeqCst);
 
                                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-                                            let msg_type =
-                                                parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                            let msg_type = parsed
+                                                .get("type")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("");
                                             let channel = parsed
                                                 .get("channel")
                                                 .and_then(|c| c.as_str())
