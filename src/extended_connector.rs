@@ -537,7 +537,7 @@ impl ExtendedConnector {
         let symbols = self.tracked_symbols.clone();
 
         for symbol in symbols.iter() {
-            let orderbook_path = format!("/orderbooks/{symbol}?depth={DEFAULT_ORDERBOOK_DEPTH}");
+            let orderbook_path = format!("/orderbooks/{symbol}");
             if let Some(url) = self.build_ws_url(&orderbook_path) {
                 let order_book_cache = Arc::clone(&self.order_book_cache);
                 let symbol = symbol.clone();
@@ -583,6 +583,10 @@ impl ExtendedConnector {
                     )
                     .await
                     {
+                        if matches!(err, DexError::ApiKeyRegistrationRequired) {
+                            log::warn!("account stream unavailable: {err}");
+                            break;
+                        }
                         log::warn!("account stream error: {err}");
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -818,7 +822,7 @@ async fn connect_ws(
         .map_err(|e| DexError::Other(format!("Invalid websocket url: {e}")))?;
     {
         let headers = request.headers_mut();
-        headers.insert("User-Agent", HeaderValue::from_static("dex-connector"));
+        headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0"));
         if let Some(key) = api_key {
             headers.insert(
                 "X-Api-Key",
@@ -851,6 +855,7 @@ async fn stream_orderbooks(
             let bids = update
                 .bid
                 .into_iter()
+                .take(DEFAULT_ORDERBOOK_DEPTH)
                 .map(|level| OrderBookLevel {
                     price: level.price,
                     size: level.qty,
@@ -859,6 +864,7 @@ async fn stream_orderbooks(
             let asks = update
                 .ask
                 .into_iter()
+                .take(DEFAULT_ORDERBOOK_DEPTH)
                 .map(|level| OrderBookLevel {
                     price: level.price,
                     size: level.qty,
@@ -918,7 +924,16 @@ async fn stream_account(
     open_orders_cache: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
     filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
 ) -> Result<(), DexError> {
-    let mut ws = connect_ws(url, Some(api_key)).await?;
+    let mut ws = match connect_ws(url, Some(api_key)).await {
+        Ok(ws) => ws,
+        Err(err) => {
+            if err.to_string().contains("401 Unauthorized") {
+                return Err(DexError::ApiKeyRegistrationRequired);
+            }
+            return Err(err);
+        }
+    };
+    let mut logged_once = false;
     while let Some(message) = ws.next().await {
         let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
         if !message.is_text() {
@@ -928,6 +943,18 @@ async fn stream_account(
             serde_json::from_str(message.to_text().unwrap_or(""))
                 .map_err(|e| DexError::Other(format!("account parse error: {e}")))?;
         if let Some(data) = payload.data {
+            if !logged_once {
+                let orders_len = data.orders.as_ref().map(|v| v.len()).unwrap_or(0);
+                let trades_len = data.trades.as_ref().map(|v| v.len()).unwrap_or(0);
+                let has_balance = data.balance.is_some();
+                log::debug!(
+                    "account stream update received: balance={}, orders={}, trades={}",
+                    has_balance,
+                    orders_len,
+                    trades_len
+                );
+                logged_once = true;
+            }
             if let Some(balance) = data.balance {
                 let mut cache = balance_cache.write().await;
                 *cache = Some(BalanceResponse {
