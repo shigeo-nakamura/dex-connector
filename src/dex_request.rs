@@ -92,7 +92,10 @@ impl From<reqwest::Error> for DexError {
 
 impl DexRequest {
     pub async fn new(endpoint: String) -> Result<Self, DexError> {
-        let client = Client::builder().cookie_store(true).build()?;
+        let client = Client::builder()
+            .cookie_store(true)
+            .user_agent("debot/1.0")
+            .build()?;
 
         Ok(DexRequest { client, endpoint })
     }
@@ -145,7 +148,11 @@ impl DexRequest {
         log::trace!("Response header: {:?}", response_headers);
 
         let response_body = response.text().await.map_err(DexError::from)?;
-        log::trace!("Response body: {}", response_body);
+        if !status.is_success() {
+            log::error!("Response body (non-success): {}", response_body);
+        } else {
+            log::trace!("Response body: {}", response_body);
+        }
 
         serde_json::from_str(&response_body).map_err(|e| {
             log::error!(

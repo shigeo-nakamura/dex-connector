@@ -12,6 +12,7 @@ use futures::StreamExt;
 use rust_crypto_lib_base::{get_order_hash, sign_message};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
+use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use starknet::core::types::Felt;
@@ -37,6 +38,57 @@ const DEFAULT_ORDERBOOK_DEPTH: usize = 50;
 
 fn default_taker_fee() -> Decimal {
     Decimal::new(5, 4)
+}
+
+fn deserialize_i64_from_string_or_number<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct I64Visitor;
+
+    impl<'de> Visitor<'de> for I64Visitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer or a string containing an integer")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            i64::try_from(value).map_err(|_| E::custom("value overflows i64"))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.round() as i64)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value
+                .parse::<i64>()
+                .map_err(|_| E::custom("invalid integer string"))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+    }
+
+    deserializer.deserialize_any(I64Visitor)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -221,6 +273,7 @@ struct TradingConfigModel {
     max_limit_order_value: Decimal,
     max_position_value: Decimal,
     max_leverage: Decimal,
+    #[serde(deserialize_with = "deserialize_i64_from_string_or_number")]
     max_num_orders: i64,
     limit_price_cap: Decimal,
     limit_price_floor: Decimal,
@@ -550,7 +603,7 @@ impl ExtendedConnector {
             "/info/markets",
             vec![("market".to_string(), symbol.to_string())],
         );
-        let markets: Vec<MarketModel> = self.api.get(path, false).await?;
+        let markets: Vec<MarketModel> = self.api.get(path, true).await?;
         let market = markets
             .into_iter()
             .find(|m| m.name == symbol)
@@ -1205,7 +1258,7 @@ impl DexConnector for ExtendedConnector {
             }
         } else {
             let path = format!("/info/markets/{}/orderbook", symbol);
-            let snapshot: OrderbookUpdateModel = self.api.get(path, false).await?;
+            let snapshot: OrderbookUpdateModel = self.api.get(path, true).await?;
             let bids = snapshot
                 .bid
                 .into_iter()
