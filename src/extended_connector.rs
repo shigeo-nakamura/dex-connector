@@ -8,6 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use futures::StreamExt;
 use rust_crypto_lib_base::{get_order_hash, sign_message};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -15,8 +16,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use starknet::core::types::Felt;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 const MAINNET_API_BASE: &str = "https://api.starknet.extended.exchange/api/v1";
 const TESTNET_API_BASE: &str = "https://api.starknet.sepolia.extended.exchange/api/v1";
@@ -26,6 +33,7 @@ const DOMAIN_VERSION: &str = "v0";
 const DOMAIN_REVISION: &str = "1";
 const MAINNET_CHAIN_ID: &str = "SN_MAIN";
 const TESTNET_CHAIN_ID: &str = "SN_SEPOLIA";
+const DEFAULT_ORDERBOOK_DEPTH: usize = 50;
 
 fn default_taker_fee() -> Decimal {
     Decimal::new(5, 4)
@@ -395,10 +403,17 @@ pub struct ExtendedConnector {
     private_key: String,
     vault: u64,
     env: ExtendedEnvironment,
+    websocket_url: Option<String>,
+    tracked_symbols: Vec<String>,
     market_cache: Arc<RwLock<HashMap<String, MarketModel>>>,
+    order_book_cache: Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
+    balance_cache: Arc<RwLock<Option<BalanceResponse>>>,
+    open_orders_cache: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
     last_trades: Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
+    ws_started: AtomicBool,
+    ws_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ExtendedConnector {
@@ -408,6 +423,8 @@ impl ExtendedConnector {
         private_key: String,
         vault: u64,
         base_url: Option<String>,
+        websocket_url: Option<String>,
+        tracked_symbols: Vec<String>,
     ) -> Result<Self, DexError> {
         let env = base_url
             .as_deref()
@@ -422,10 +439,17 @@ impl ExtendedConnector {
             private_key,
             vault,
             env,
+            websocket_url,
+            tracked_symbols,
             market_cache: Arc::new(RwLock::new(HashMap::new())),
+            order_book_cache: Arc::new(RwLock::new(HashMap::new())),
+            balance_cache: Arc::new(RwLock::new(None)),
+            open_orders_cache: Arc::new(RwLock::new(HashMap::new())),
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             last_trades: Arc::new(RwLock::new(HashMap::new())),
+            ws_started: AtomicBool::new(false),
+            ws_tasks: Mutex::new(Vec::new()),
         })
     }
 
@@ -440,6 +464,78 @@ impl ExtendedConnector {
 
     fn domain_chain_id(&self) -> &'static str {
         self.env.chain_id()
+    }
+
+    fn build_ws_url(&self, path: &str) -> Option<String> {
+        let base = self.websocket_url.as_ref()?;
+        let base = base.trim_end_matches('/');
+        Some(format!("{base}{path}"))
+    }
+
+    async fn spawn_ws_tasks(&self) {
+        if self.websocket_url.is_none() {
+            return;
+        }
+        if self.ws_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let mut handles = self.ws_tasks.lock().await;
+        let symbols = self.tracked_symbols.clone();
+
+        for symbol in symbols.iter() {
+            let orderbook_path = format!("/orderbooks/{symbol}?depth={DEFAULT_ORDERBOOK_DEPTH}");
+            if let Some(url) = self.build_ws_url(&orderbook_path) {
+                let order_book_cache = Arc::clone(&self.order_book_cache);
+                let symbol = symbol.clone();
+                handles.push(tokio::spawn(async move {
+                    loop {
+                        if let Err(err) = stream_orderbooks(&url, &symbol, &order_book_cache).await
+                        {
+                            log::warn!("orderbook stream error: {err}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }));
+            }
+
+            let trades_path = format!("/publicTrades/{symbol}");
+            if let Some(url) = self.build_ws_url(&trades_path) {
+                let last_trades = Arc::clone(&self.last_trades);
+                let symbol = symbol.clone();
+                handles.push(tokio::spawn(async move {
+                    loop {
+                        if let Err(err) = stream_trades(&url, &symbol, &last_trades).await {
+                            log::warn!("public trades stream error: {err}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }));
+            }
+        }
+
+        if let Some(url) = self.build_ws_url("/account") {
+            let api_key = self.api.api_key.clone();
+            let balance_cache = Arc::clone(&self.balance_cache);
+            let open_orders_cache = Arc::clone(&self.open_orders_cache);
+            let filled_orders = Arc::clone(&self.filled_orders);
+            handles.push(tokio::spawn(async move {
+                loop {
+                    if let Err(err) = stream_account(
+                        &url,
+                        &api_key,
+                        &balance_cache,
+                        &open_orders_cache,
+                        &filled_orders,
+                    )
+                    .await
+                    {
+                        log::warn!("account stream error: {err}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }));
+        }
     }
 
     async fn get_market(&self, symbol: &str) -> Result<MarketModel, DexError> {
@@ -591,13 +687,261 @@ impl ExtendedConnector {
     }
 }
 
+fn copy_balance(balance: &BalanceResponse) -> BalanceResponse {
+    BalanceResponse {
+        equity: balance.equity,
+        balance: balance.balance,
+        position_entry_price: balance.position_entry_price,
+        position_sign: balance.position_sign,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "camelCase")]
+struct WrappedStreamResponse<T> {
+    #[serde(rename = "type")]
+    msg_type: Option<String>,
+    data: Option<T>,
+    error: Option<String>,
+    ts: i64,
+    seq: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StreamOrderbookQuantity {
+    #[serde(alias = "q")]
+    qty: Decimal,
+    #[serde(alias = "p")]
+    price: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StreamOrderbookUpdate {
+    #[serde(alias = "m")]
+    market: String,
+    #[serde(alias = "b")]
+    bid: Vec<StreamOrderbookQuantity>,
+    #[serde(alias = "a")]
+    ask: Vec<StreamOrderbookQuantity>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StreamTradeModel {
+    #[serde(alias = "i")]
+    id: i64,
+    #[serde(alias = "m")]
+    market: String,
+    #[serde(alias = "S")]
+    side: String,
+    #[serde(alias = "T")]
+    timestamp: i64,
+    #[serde(alias = "p")]
+    price: Decimal,
+    #[serde(alias = "q")]
+    qty: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountStreamData {
+    orders: Option<Vec<OpenOrderModel>>,
+    trades: Option<Vec<AccountTradeModel>>,
+    balance: Option<BalanceModel>,
+}
+
+async fn connect_ws(
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    DexError,
+> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| DexError::Other(format!("Invalid websocket url: {e}")))?;
+    {
+        let headers = request.headers_mut();
+        headers.insert("User-Agent", HeaderValue::from_static("dex-connector"));
+        if let Some(key) = api_key {
+            headers.insert(
+                "X-Api-Key",
+                HeaderValue::from_str(key)
+                    .map_err(|e| DexError::Other(format!("Invalid API key header: {e}")))?,
+            );
+        }
+    }
+    let (stream, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| DexError::Other(format!("Websocket connect failed: {e}")))?;
+    Ok(stream)
+}
+
+async fn stream_orderbooks(
+    url: &str,
+    symbol: &str,
+    order_book_cache: &Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
+) -> Result<(), DexError> {
+    let mut ws = connect_ws(url, None).await?;
+    while let Some(message) = ws.next().await {
+        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        if !message.is_text() {
+            continue;
+        }
+        let payload: WrappedStreamResponse<StreamOrderbookUpdate> =
+            serde_json::from_str(message.to_text().unwrap_or(""))
+                .map_err(|e| DexError::Other(format!("orderbook parse error: {e}")))?;
+        if let Some(update) = payload.data {
+            let bids = update
+                .bid
+                .into_iter()
+                .map(|level| OrderBookLevel {
+                    price: level.price,
+                    size: level.qty,
+                })
+                .collect::<Vec<_>>();
+            let asks = update
+                .ask
+                .into_iter()
+                .map(|level| OrderBookLevel {
+                    price: level.price,
+                    size: level.qty,
+                })
+                .collect::<Vec<_>>();
+            let mut cache = order_book_cache.write().await;
+            cache.insert(symbol.to_string(), OrderBookSnapshot { bids, asks });
+        }
+    }
+    Ok(())
+}
+
+async fn stream_trades(
+    url: &str,
+    symbol: &str,
+    last_trades: &Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
+) -> Result<(), DexError> {
+    let mut ws = connect_ws(url, None).await?;
+    while let Some(message) = ws.next().await {
+        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        if !message.is_text() {
+            continue;
+        }
+        let payload: WrappedStreamResponse<Vec<StreamTradeModel>> =
+            serde_json::from_str(message.to_text().unwrap_or(""))
+                .map_err(|e| DexError::Other(format!("trade parse error: {e}")))?;
+        if let Some(trades) = payload.data {
+            let mut mapped = Vec::new();
+            for trade in trades {
+                let side = match trade.side.as_str() {
+                    "BUY" => Some(OrderSide::Long),
+                    "SELL" => Some(OrderSide::Short),
+                    _ => None,
+                };
+                mapped.push(LastTrade {
+                    price: trade.price,
+                    size: Some(trade.qty),
+                    side,
+                });
+            }
+            let mut cache = last_trades.write().await;
+            let entry = cache.entry(symbol.to_string()).or_default();
+            entry.extend(mapped);
+            if entry.len() > 200 {
+                let excess = entry.len() - 200;
+                entry.drain(0..excess);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn stream_account(
+    url: &str,
+    api_key: &str,
+    balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
+    open_orders_cache: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
+    filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
+) -> Result<(), DexError> {
+    let mut ws = connect_ws(url, Some(api_key)).await?;
+    while let Some(message) = ws.next().await {
+        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        if !message.is_text() {
+            continue;
+        }
+        let payload: WrappedStreamResponse<AccountStreamData> =
+            serde_json::from_str(message.to_text().unwrap_or(""))
+                .map_err(|e| DexError::Other(format!("account parse error: {e}")))?;
+        if let Some(data) = payload.data {
+            if let Some(balance) = data.balance {
+                let mut cache = balance_cache.write().await;
+                *cache = Some(BalanceResponse {
+                    equity: balance.equity,
+                    balance: balance.balance,
+                    position_entry_price: None,
+                    position_sign: None,
+                });
+            }
+
+            if let Some(orders) = data.orders {
+                let mut cache = open_orders_cache.write().await;
+                cache.clear();
+                for order in orders {
+                    let entry = cache.entry(order.market.clone()).or_default();
+                    entry.push(OpenOrder {
+                        order_id: order.external_id.clone(),
+                        symbol: order.market.clone(),
+                        side: if order.side == "BUY" {
+                            OrderSide::Long
+                        } else {
+                            OrderSide::Short
+                        },
+                        size: order.qty,
+                        price: order.price,
+                        status: order.status.clone(),
+                    });
+                }
+            }
+
+            if let Some(trades) = data.trades {
+                let mut cache = filled_orders.write().await;
+                for trade in trades {
+                    let entry = cache.entry(trade.market.clone()).or_default();
+                    entry.push(FilledOrder {
+                        order_id: trade.order_id.to_string(),
+                        is_rejected: false,
+                        trade_id: trade.id.to_string(),
+                        filled_side: match trade.side.as_str() {
+                            "BUY" => Some(OrderSide::Long),
+                            "SELL" => Some(OrderSide::Short),
+                            _ => None,
+                        },
+                        filled_size: Some(trade.qty),
+                        filled_value: Some(trade.value),
+                        filled_fee: Some(trade.fee),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl DexConnector for ExtendedConnector {
     async fn start(&self) -> Result<(), DexError> {
+        self.spawn_ws_tasks().await;
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), DexError> {
+        let mut handles = self.ws_tasks.lock().await;
+        for handle in handles.drain(..) {
+            handle.abort();
+        }
+        self.ws_started.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -623,9 +967,37 @@ impl DexConnector for ExtendedConnector {
         _test_price: Option<Decimal>,
     ) -> Result<TickerResponse, DexError> {
         let market = self.get_market(symbol).await?;
+        let price = if self.websocket_url.is_some() {
+            let trades = self.last_trades.read().await;
+            if let Some(items) = trades.get(symbol).and_then(|v| v.last()) {
+                items.price
+            } else {
+                let orderbooks = self.order_book_cache.read().await;
+                if let Some(snapshot) = orderbooks.get(symbol) {
+                    let bid = snapshot.bids.first().map(|v| v.price);
+                    let ask = snapshot.asks.first().map(|v| v.price);
+                    match (bid, ask) {
+                        (Some(bid), Some(ask)) => (bid + ask) / Decimal::new(2, 0),
+                        (Some(bid), None) => bid,
+                        (None, Some(ask)) => ask,
+                        _ => {
+                            return Err(DexError::Other(
+                                "ticker unavailable: waiting for websocket data".to_string(),
+                            ))
+                        }
+                    }
+                } else {
+                    return Err(DexError::Other(
+                        "ticker unavailable: waiting for websocket data".to_string(),
+                    ));
+                }
+            }
+        } else {
+            market.market_stats.last_price
+        };
         Ok(TickerResponse {
             symbol: market.name.clone(),
-            price: market.market_stats.last_price,
+            price,
             min_tick: Some(market.trading_config.min_price_change),
             min_order: Some(market.trading_config.min_order_size),
             volume: Some(market.market_stats.daily_volume),
@@ -637,31 +1009,39 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
-        let path = build_query(
-            "/user/trades",
-            vec![("market".to_string(), symbol.to_string())],
-        );
-        let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
-        let orders = trades
-            .into_iter()
-            .map(|trade| FilledOrder {
-                order_id: trade.order_id.to_string(),
-                is_rejected: false,
-                trade_id: trade.id.to_string(),
-                filled_side: match trade.side.as_str() {
-                    "BUY" => Some(OrderSide::Long),
-                    "SELL" => Some(OrderSide::Short),
-                    _ => None,
-                },
-                filled_size: Some(trade.qty),
-                filled_value: Some(trade.value),
-                filled_fee: Some(trade.fee),
-            })
-            .collect::<Vec<_>>();
+        if self.websocket_url.is_some() {
+            let cache = self.filled_orders.read().await;
+            let orders = cache.get(symbol).cloned().ok_or_else(|| {
+                DexError::Other("filled orders unavailable: waiting for websocket data".to_string())
+            })?;
+            Ok(FilledOrdersResponse { orders })
+        } else {
+            let path = build_query(
+                "/user/trades",
+                vec![("market".to_string(), symbol.to_string())],
+            );
+            let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
+            let orders = trades
+                .into_iter()
+                .map(|trade| FilledOrder {
+                    order_id: trade.order_id.to_string(),
+                    is_rejected: false,
+                    trade_id: trade.id.to_string(),
+                    filled_side: match trade.side.as_str() {
+                        "BUY" => Some(OrderSide::Long),
+                        "SELL" => Some(OrderSide::Short),
+                        _ => None,
+                    },
+                    filled_size: Some(trade.qty),
+                    filled_value: Some(trade.value),
+                    filled_fee: Some(trade.fee),
+                })
+                .collect::<Vec<_>>();
 
-        let mut cache = self.filled_orders.write().await;
-        cache.insert(symbol.to_string(), orders.clone());
-        Ok(FilledOrdersResponse { orders })
+            let mut cache = self.filled_orders.write().await;
+            cache.insert(symbol.to_string(), orders.clone());
+            Ok(FilledOrdersResponse { orders })
+        }
     }
 
     async fn get_canceled_orders(&self, symbol: &str) -> Result<CanceledOrdersResponse, DexError> {
@@ -685,57 +1065,86 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
-        let path = build_query(
-            "/user/orders",
-            vec![("market".to_string(), symbol.to_string())],
-        );
-        let open_orders: Vec<OpenOrderModel> = self.api.get(path, true).await?;
-        let orders = open_orders
-            .into_iter()
-            .map(|order| OpenOrder {
-                order_id: order.external_id.clone(),
-                symbol: order.market.clone(),
-                side: if order.side == "BUY" {
-                    OrderSide::Long
-                } else {
-                    OrderSide::Short
-                },
-                size: order.qty,
-                price: order.price,
-                status: order.status,
-            })
-            .collect::<Vec<_>>();
+        let orders = if self.websocket_url.is_some() {
+            let cache = self.open_orders_cache.read().await;
+            cache.get(symbol).cloned().unwrap_or_else(|| Vec::new())
+        } else {
+            let path = build_query(
+                "/user/orders",
+                vec![("market".to_string(), symbol.to_string())],
+            );
+            let open_orders: Vec<OpenOrderModel> = self.api.get(path, true).await?;
+            open_orders
+                .into_iter()
+                .map(|order| OpenOrder {
+                    order_id: order.external_id.clone(),
+                    symbol: order.market.clone(),
+                    side: if order.side == "BUY" {
+                        OrderSide::Long
+                    } else {
+                        OrderSide::Short
+                    },
+                    size: order.qty,
+                    price: order.price,
+                    status: order.status,
+                })
+                .collect::<Vec<_>>()
+        };
         Ok(OpenOrdersResponse { orders })
     }
 
     async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
-        let balance: BalanceModel = self.api.get("/user/balance".to_string(), true).await?;
-        if let Some(symbol) = symbol {
-            if symbol != balance.collateral_name {
-                return Err(DexError::Other(format!(
-                    "Unsupported balance symbol {} (collateral: {})",
-                    symbol, balance.collateral_name
-                )));
+        let balance = if self.websocket_url.is_some() {
+            let cache = self.balance_cache.read().await;
+            cache.as_ref().map(copy_balance).ok_or_else(|| {
+                DexError::Other("balance unavailable: waiting for websocket data".to_string())
+            })?
+        } else {
+            let balance: BalanceModel = self.api.get("/user/balance".to_string(), true).await?;
+            if let Some(symbol) = symbol {
+                if symbol != balance.collateral_name {
+                    return Err(DexError::Other(format!(
+                        "Unsupported balance symbol {} (collateral: {})",
+                        symbol, balance.collateral_name
+                    )));
+                }
             }
-        }
-        Ok(BalanceResponse {
-            equity: balance.equity,
-            balance: balance.balance,
-            position_entry_price: None,
-            position_sign: None,
-        })
-    }
-
-    async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
-        let balance: BalanceModel = self.api.get("/user/balance".to_string(), true).await?;
-        let mut token_balances = HashMap::new();
-        token_balances.insert(
-            balance.collateral_name.clone(),
             BalanceResponse {
                 equity: balance.equity,
                 balance: balance.balance,
                 position_entry_price: None,
                 position_sign: None,
+            }
+        };
+        if symbol.is_some() && self.websocket_url.is_some() {
+            // Collateral symbol isn't supplied in account stream payload.
+        }
+        Ok(balance)
+    }
+
+    async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
+        let balance = if self.websocket_url.is_some() {
+            let cache = self.balance_cache.read().await;
+            cache.as_ref().map(copy_balance).ok_or_else(|| {
+                DexError::Other("balance unavailable: waiting for websocket data".to_string())
+            })?
+        } else {
+            let balance: BalanceModel = self.api.get("/user/balance".to_string(), true).await?;
+            BalanceResponse {
+                equity: balance.equity,
+                balance: balance.balance,
+                position_entry_price: None,
+                position_sign: None,
+            }
+        };
+        let mut token_balances = HashMap::new();
+        token_balances.insert(
+            "USD".to_string(),
+            BalanceResponse {
+                equity: balance.equity,
+                balance: balance.balance,
+                position_entry_price: balance.position_entry_price,
+                position_sign: balance.position_sign,
             },
         );
         Ok(CombinedBalanceResponse {
@@ -745,29 +1154,37 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
-        let path = build_query(
-            "/user/trades",
-            vec![("market".to_string(), symbol.to_string())],
-        );
-        let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
-        let last_trades = trades
-            .into_iter()
-            .map(|trade| LastTrade {
-                price: trade.price,
-                size: Some(trade.qty),
-                side: match trade.side.as_str() {
-                    "BUY" => Some(OrderSide::Long),
-                    "SELL" => Some(OrderSide::Short),
-                    _ => None,
-                },
-            })
-            .collect::<Vec<_>>();
+        if self.websocket_url.is_some() {
+            let cache = self.last_trades.read().await;
+            let trades = cache.get(symbol).cloned().ok_or_else(|| {
+                DexError::Other("last trades unavailable: waiting for websocket data".to_string())
+            })?;
+            Ok(LastTradesResponse { trades })
+        } else {
+            let path = build_query(
+                "/user/trades",
+                vec![("market".to_string(), symbol.to_string())],
+            );
+            let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
+            let last_trades = trades
+                .into_iter()
+                .map(|trade| LastTrade {
+                    price: trade.price,
+                    size: Some(trade.qty),
+                    side: match trade.side.as_str() {
+                        "BUY" => Some(OrderSide::Long),
+                        "SELL" => Some(OrderSide::Short),
+                        _ => None,
+                    },
+                })
+                .collect::<Vec<_>>();
 
-        let mut cache = self.last_trades.write().await;
-        cache.insert(symbol.to_string(), last_trades.clone());
-        Ok(LastTradesResponse {
-            trades: last_trades,
-        })
+            let mut cache = self.last_trades.write().await;
+            cache.insert(symbol.to_string(), last_trades.clone());
+            Ok(LastTradesResponse {
+                trades: last_trades,
+            })
+        }
     }
 
     async fn get_order_book(
@@ -775,27 +1192,40 @@ impl DexConnector for ExtendedConnector {
         symbol: &str,
         depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
-        let path = format!("/info/markets/{}/orderbook", symbol);
-        let snapshot: OrderbookUpdateModel = self.api.get(path, false).await?;
-        let bids = snapshot
-            .bid
-            .into_iter()
-            .take(depth)
-            .map(|level| OrderBookLevel {
-                price: level.price,
-                size: level.qty,
-            })
-            .collect::<Vec<_>>();
-        let asks = snapshot
-            .ask
-            .into_iter()
-            .take(depth)
-            .map(|level| OrderBookLevel {
-                price: level.price,
-                size: level.qty,
-            })
-            .collect::<Vec<_>>();
-        Ok(OrderBookSnapshot { bids, asks })
+        if self.websocket_url.is_some() {
+            let cache = self.order_book_cache.read().await;
+            if let Some(snapshot) = cache.get(symbol) {
+                let bids = snapshot.bids.iter().take(depth).cloned().collect();
+                let asks = snapshot.asks.iter().take(depth).cloned().collect();
+                Ok(OrderBookSnapshot { bids, asks })
+            } else {
+                Err(DexError::Other(
+                    "order book unavailable: waiting for websocket data".to_string(),
+                ))
+            }
+        } else {
+            let path = format!("/info/markets/{}/orderbook", symbol);
+            let snapshot: OrderbookUpdateModel = self.api.get(path, false).await?;
+            let bids = snapshot
+                .bid
+                .into_iter()
+                .take(depth)
+                .map(|level| OrderBookLevel {
+                    price: level.price,
+                    size: level.qty,
+                })
+                .collect::<Vec<_>>();
+            let asks = snapshot
+                .ask
+                .into_iter()
+                .take(depth)
+                .map(|level| OrderBookLevel {
+                    price: level.price,
+                    size: level.qty,
+                })
+                .collect::<Vec<_>>();
+            Ok(OrderBookSnapshot { bids, asks })
+        }
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
@@ -1025,9 +1455,19 @@ pub async fn create_extended_connector(
     private_key: String,
     vault: u64,
     base_url: Option<String>,
+    websocket_url: Option<String>,
+    tracked_symbols: Vec<String>,
 ) -> Result<Box<dyn DexConnector>, DexError> {
-    let connector =
-        ExtendedConnector::new(api_key, public_key, private_key, vault, base_url).await?;
+    let connector = ExtendedConnector::new(
+        api_key,
+        public_key,
+        private_key,
+        vault,
+        base_url,
+        websocket_url,
+        tracked_symbols,
+    )
+    .await?;
     Ok(Box::new(connector))
 }
 

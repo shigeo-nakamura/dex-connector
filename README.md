@@ -99,6 +99,8 @@ let extended = create_extended_connector(
     private_key,
     vault,
     Some(base_url),
+    Some(websocket_url),
+    vec!["BTC-USD".to_string()],
 ).await?;
 ```
 
