@@ -3,8 +3,8 @@ use crate::{
     dex_request::{DexError, DexRequest, HttpMethod},
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
-    OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, TickerResponse,
-    TpSl, TriggerOrderStyle,
+    OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
+    TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -1231,6 +1231,12 @@ impl DexConnector for ExtendedConnector {
             usd_balance: balance.equity,
             token_balances,
         })
+    }
+
+    async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
+        Err(DexError::Other(
+            "get_positions not supported for Extended".to_string(),
+        ))
     }
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {

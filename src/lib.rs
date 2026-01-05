@@ -110,6 +110,14 @@ pub struct BalanceResponse {
     pub position_sign: Option<i32>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PositionSnapshot {
+    pub symbol: String,
+    pub size: Decimal,
+    pub sign: i32,
+    pub entry_price: Option<Decimal>,
+}
+
 #[derive(Debug, Default)]
 pub struct CombinedBalanceResponse {
     pub usd_balance: Decimal,

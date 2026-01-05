@@ -28,8 +28,8 @@ use crate::{
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
-    OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, TickerResponse,
-    TpSl, TriggerOrderStyle,
+    OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
+    TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Utc};
@@ -2967,6 +2967,28 @@ impl DexConnector for LighterConnector {
             usd_balance,
             token_balances,
         })
+    }
+
+    async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
+        let combined = self.get_combined_balance().await?;
+        let mut out = Vec::new();
+        for (symbol, balance) in combined.token_balances {
+            let sign = match balance.position_sign {
+                Some(v) if v != 0 => v,
+                _ => continue,
+            };
+            let size = balance.equity.abs();
+            if size.is_zero() {
+                continue;
+            }
+            out.push(PositionSnapshot {
+                symbol,
+                size,
+                sign,
+                entry_price: balance.position_entry_price,
+            });
+        }
+        Ok(out)
     }
 
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {

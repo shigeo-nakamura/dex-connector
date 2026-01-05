@@ -4,7 +4,7 @@ use crate::{
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
-    OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
+    OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1582,6 +1582,35 @@ impl DexConnector for HyperliquidConnector {
         ))
     }
 
+    async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
+        let open_positions = self.get_positions_raw().await?;
+        let mut out = Vec::new();
+        for p in open_positions {
+            let position = p.position;
+            if position.szi.is_zero() {
+                continue;
+            }
+            let sign = if position.szi.is_sign_negative() {
+                -1
+            } else if position.szi.is_sign_positive() {
+                1
+            } else {
+                0
+            };
+            let size = position.szi.abs();
+            if size.is_zero() {
+                continue;
+            }
+            out.push(PositionSnapshot {
+                symbol: position.coin,
+                size,
+                sign,
+                entry_price: None,
+            });
+        }
+        Ok(out)
+    }
+
     async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradesResponse, DexError> {
         // TODO: Implement HyperLiquid last trades functionality
         Err(DexError::Other(
@@ -2026,7 +2055,7 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
-        let open_positions = self.get_positions().await?;
+        let open_positions = self.get_positions_raw().await?;
         for p in open_positions {
             let position = p.position;
             let idx_opt = position
@@ -2118,7 +2147,7 @@ impl HyperliquidConnector {
             .map_err(|e| DexError::Other(e.to_string()))
     }
 
-    async fn get_positions(
+    async fn get_positions_raw(
         &self,
     ) -> Result<Vec<HyperliquidRetriveUserPositionResponseBody>, DexError> {
         let request_url = "/info";
