@@ -382,6 +382,17 @@ struct AccountTradeModel {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
+struct PositionModel {
+    market: String,
+    side: String,
+    size: Decimal,
+    open_price: Option<Decimal>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "camelCase")]
 struct PlacedOrderModel {
     id: i64,
     external_id: String,
@@ -465,6 +476,7 @@ pub struct ExtendedConnector {
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
     last_trades: Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
+    positions_cache: Arc<RwLock<Option<Vec<PositionSnapshot>>>>,
     ws_started: AtomicBool,
     ws_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -501,6 +513,7 @@ impl ExtendedConnector {
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             last_trades: Arc::new(RwLock::new(HashMap::new())),
+            positions_cache: Arc::new(RwLock::new(None)),
             ws_started: AtomicBool::new(false),
             ws_tasks: Mutex::new(Vec::new()),
         })
@@ -572,6 +585,7 @@ impl ExtendedConnector {
             let balance_cache = Arc::clone(&self.balance_cache);
             let open_orders_cache = Arc::clone(&self.open_orders_cache);
             let filled_orders = Arc::clone(&self.filled_orders);
+            let positions_cache = Arc::clone(&self.positions_cache);
             handles.push(tokio::spawn(async move {
                 loop {
                     if let Err(err) = stream_account(
@@ -580,6 +594,7 @@ impl ExtendedConnector {
                         &balance_cache,
                         &open_orders_cache,
                         &filled_orders,
+                        &positions_cache,
                     )
                     .await
                     {
@@ -808,6 +823,7 @@ struct AccountStreamData {
     orders: Option<Vec<OpenOrderModel>>,
     trades: Option<Vec<AccountTradeModel>>,
     balance: Option<BalanceModel>,
+    positions: Option<Vec<PositionModel>>,
 }
 
 async fn connect_ws(
@@ -923,6 +939,7 @@ async fn stream_account(
     balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
     open_orders_cache: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
     filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
+    positions_cache: &Arc<RwLock<Option<Vec<PositionSnapshot>>>>,
 ) -> Result<(), DexError> {
     let mut ws = match connect_ws(url, Some(api_key)).await {
         Ok(ws) => ws,
@@ -1004,9 +1021,46 @@ async fn stream_account(
                     });
                 }
             }
+
+            if let Some(positions) = data.positions {
+                let mut positions_map: HashMap<String, PositionSnapshot> = HashMap::new();
+                for position in positions {
+                    if let Some(snapshot) = position_snapshot_from_model(position) {
+                        positions_map.insert(snapshot.symbol.clone(), snapshot);
+                    }
+                }
+                let mut cache = positions_cache.write().await;
+                *cache = Some(positions_map.into_values().collect());
+            }
         }
     }
     Ok(())
+}
+
+fn position_snapshot_from_model(position: PositionModel) -> Option<PositionSnapshot> {
+    if let Some(status) = position.status.as_ref() {
+        if status != "OPENED" {
+            return None;
+        }
+    }
+    let sign = match position.side.as_str() {
+        "LONG" | "BUY" => 1,
+        "SHORT" | "SELL" => -1,
+        _ => 0,
+    };
+    if sign == 0 {
+        return None;
+    }
+    let size = position.size.abs();
+    if size <= Decimal::ZERO {
+        return None;
+    }
+    Some(PositionSnapshot {
+        symbol: position.market,
+        size,
+        sign,
+        entry_price: position.open_price,
+    })
 }
 
 #[async_trait]
@@ -1234,9 +1288,22 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
-        Err(DexError::Other(
-            "get_positions not supported for Extended".to_string(),
-        ))
+        if self.websocket_url.is_some() {
+            let cache = self.positions_cache.read().await;
+            return cache.clone().ok_or_else(|| {
+                DexError::Other("positions unavailable: waiting for websocket data".to_string())
+            });
+        }
+
+        let positions: Vec<PositionModel> =
+            self.api.get("/user/positions".to_string(), true).await?;
+        let mut out = Vec::new();
+        for position in positions {
+            if let Some(snapshot) = position_snapshot_from_model(position) {
+                out.push(snapshot);
+            }
+        }
+        Ok(out)
     }
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
