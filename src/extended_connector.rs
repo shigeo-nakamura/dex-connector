@@ -438,14 +438,21 @@ struct NewOrderModel {
     fee: Decimal,
     self_trade_protection_level: String,
     nonce: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cancel_id: Option<String>,
     settlement: StarkSettlementModel,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tp_sl_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     take_profit: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stop_loss: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     debugging_amounts: Option<StarkDebuggingOrderAmountsModel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "builderFee")]
     builder_fee: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "builderId")]
     builder_id: Option<i64>,
 }
@@ -1467,7 +1474,7 @@ impl DexConnector for ExtendedConnector {
         let settlement =
             self.compute_settlement(&market, side_str, size, order_price, expire_time, nonce)?;
 
-        let order_id = format!("dex-{}", settlement.order_hash.to_hex_string());
+        let order_id = settlement.order_hash.to_string();
 
         let order = NewOrderModel {
             id: order_id.clone(),
