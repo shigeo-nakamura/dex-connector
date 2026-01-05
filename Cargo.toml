@@ -57,7 +57,7 @@ num-traits = "0.2"
 poseidon-rs = "0.0.10"
 # Simple field arithmetic for Goldilocks
 # Using num-bigint for field operations
-rust-crypto-lib-base = { path = "../stark-crypto-wrapper/rust-crypto-lib-base" }
+rust-crypto-lib-base = "0.2.0"
 starknet = { git = "https://github.com/xJonathanLEI/starknet-rs", tag = "starknet/v0.17.0" }
 
 [dev-dependencies]
