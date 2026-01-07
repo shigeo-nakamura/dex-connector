@@ -300,6 +300,7 @@ pub struct LighterConnector {
     maintenance: Arc<RwLock<MaintenanceInfo>>,
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
+    cached_positions: Arc<RwLock<Vec<PositionSnapshot>>>,
     // Connection epoch counter for race detection
     connection_epoch: Arc<AtomicU64>,
     // Market metadata cache for symbol↔market_id resolution
@@ -1250,6 +1251,7 @@ impl LighterConnector {
             })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
+            cached_positions: Arc::new(RwLock::new(Vec::new())),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
@@ -1306,6 +1308,7 @@ impl LighterConnector {
             })),
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
+            cached_positions: Arc::new(RwLock::new(Vec::new())),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
@@ -2970,25 +2973,8 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
-        let combined = self.get_combined_balance().await?;
-        let mut out = Vec::new();
-        for (symbol, balance) in combined.token_balances {
-            let sign = match balance.position_sign {
-                Some(v) if v != 0 => v,
-                _ => continue,
-            };
-            let size = balance.equity.abs();
-            if size.is_zero() {
-                continue;
-            }
-            out.push(PositionSnapshot {
-                symbol,
-                size,
-                sign,
-                entry_price: balance.position_entry_price,
-            });
-        }
-        Ok(out)
+        let positions_guard = self.cached_positions.read().await;
+        Ok(positions_guard.clone())
     }
 
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
@@ -4197,6 +4183,7 @@ impl LighterConnector {
         let order_book = self.order_book.clone();
         let filled_orders = self.filled_orders.clone();
         let canceled_orders = self.canceled_orders.clone();
+        let cached_positions = self.cached_positions.clone();
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
@@ -4674,6 +4661,7 @@ impl LighterConnector {
                                                 &order_book,
                                                 &filled_orders,
                                                 &canceled_orders,
+                                                &cached_positions,
                                                 account_index,
                                                 &market_cache,
                                                 default_symbol.as_str(),
@@ -4853,6 +4841,7 @@ impl LighterConnector {
         order_book: &Arc<RwLock<Option<LighterOrderBook>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+        cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         account_index: u32,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -4936,6 +4925,7 @@ impl LighterConnector {
                     &message,
                     filled_orders,
                     canceled_orders,
+                    cached_positions,
                     account_index as u64,
                     market_cache,
                     default_symbol,
@@ -4952,11 +4942,37 @@ impl LighterConnector {
         data: &Value,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+        cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         account_id: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
     ) {
         log::trace!("handle_account_update called with data: {:?}", data);
+
+        // Handle positions update
+        if let Some(positions_data) = data.get("positions").and_then(|p| p.as_array()) {
+            let mut new_positions = Vec::new();
+            for pos_val in positions_data {
+                if let Ok(position) = serde_json::from_value::<LighterPosition>(pos_val.clone()) {
+                    let size = match Decimal::from_str(&position.position) {
+                        Ok(s) => s.abs(),
+                        Err(_) => Decimal::ZERO,
+                    };
+                    if !size.is_zero() {
+                        let entry_price = Decimal::from_str(&position.avg_entry_price).ok();
+                        new_positions.push(PositionSnapshot {
+                            symbol: position.symbol,
+                            size,
+                            sign: position.sign as i32,
+                            entry_price,
+                        });
+                    }
+                }
+            }
+            let mut cache = cached_positions.write().await;
+            *cache = new_positions;
+            log::info!("Updated cached positions: {} positions", cache.len());
+        }
 
         // Handle filled orders - try both 'fills' and 'trades' fields
         if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
