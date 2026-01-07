@@ -8,7 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use rust_crypto_lib_base::{get_order_hash, sign_message};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -25,7 +25,6 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
 
 const MAINNET_API_BASE: &str = "https://api.starknet.extended.exchange/api/v1";
 const TESTNET_API_BASE: &str = "https://api.starknet.sepolia.extended.exchange/api/v1";
@@ -867,43 +866,35 @@ async fn stream_orderbooks(
     order_book_cache: &Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
 ) -> Result<(), DexError> {
     let mut ws = connect_ws(url, None).await?;
-    loop {
-        tokio::select! {
-            Some(message) = ws.next() => {
-                let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
-                if !message.is_text() {
-                    continue;
-                }
-                let payload: WrappedStreamResponse<StreamOrderbookUpdate> =
-                    serde_json::from_str(message.to_text().unwrap_or(""))
-                        .map_err(|e| DexError::Other(format!("orderbook parse error: {e}")))?;
-                if let Some(update) = payload.data {
-                    let bids = update
-                        .bid
-                        .into_iter()
-                        .take(DEFAULT_ORDERBOOK_DEPTH)
-                        .map(|level| OrderBookLevel {
-                            price: level.price,
-                            size: level.qty,
-                        })
-                        .collect::<Vec<_>>();
-                    let asks = update
-                        .ask
-                        .into_iter()
-                        .take(DEFAULT_ORDERBOOK_DEPTH)
-                        .map(|level| OrderBookLevel {
-                            price: level.price,
-                            size: level.qty,
-                        })
-                        .collect::<Vec<_>>();
-                    let mut cache = order_book_cache.write().await;
-                    cache.insert(symbol.to_string(), OrderBookSnapshot { bids, asks });
-                }
-            },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
-                ws.send(Message::Ping(Vec::new())).await.map_err(|e| DexError::Other(format!("ws send ping error: {e}")))?;
-            },
-            else => break,
+    while let Some(message) = ws.next().await {
+        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        if !message.is_text() {
+            continue;
+        }
+        let payload: WrappedStreamResponse<StreamOrderbookUpdate> =
+            serde_json::from_str(message.to_text().unwrap_or(""))
+                .map_err(|e| DexError::Other(format!("orderbook parse error: {e}")))?;
+        if let Some(update) = payload.data {
+            let bids = update
+                .bid
+                .into_iter()
+                .take(DEFAULT_ORDERBOOK_DEPTH)
+                .map(|level| OrderBookLevel {
+                    price: level.price,
+                    size: level.qty,
+                })
+                .collect::<Vec<_>>();
+            let asks = update
+                .ask
+                .into_iter()
+                .take(DEFAULT_ORDERBOOK_DEPTH)
+                .map(|level| OrderBookLevel {
+                    price: level.price,
+                    size: level.qty,
+                })
+                .collect::<Vec<_>>();
+            let mut cache = order_book_cache.write().await;
+            cache.insert(symbol.to_string(), OrderBookSnapshot { bids, asks });
         }
     }
     Ok(())
@@ -915,43 +906,35 @@ async fn stream_trades(
     last_trades: &Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
 ) -> Result<(), DexError> {
     let mut ws = connect_ws(url, None).await?;
-    loop {
-        tokio::select! {
-            Some(message) = ws.next() => {
-                let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
-                if !message.is_text() {
-                    continue;
-                }
-                let payload: WrappedStreamResponse<Vec<StreamTradeModel>> =
-                    serde_json::from_str(message.to_text().unwrap_or(""))
-                        .map_err(|e| DexError::Other(format!("trade parse error: {e}")))?;
-                if let Some(trades) = payload.data {
-                    let mut mapped = Vec::new();
-                    for trade in trades {
-                        let side = match trade.side.as_str() {
-                            "BUY" => Some(OrderSide::Long),
-                            "SELL" => Some(OrderSide::Short),
-                            _ => None,
-                        };
-                        mapped.push(LastTrade {
-                            price: trade.price,
-                            size: Some(trade.qty),
-                            side,
-                        });
-                    }
-                    let mut cache = last_trades.write().await;
-                    let entry = cache.entry(symbol.to_string()).or_default();
-                    entry.extend(mapped);
-                    if entry.len() > 200 {
-                        let excess = entry.len() - 200;
-                        entry.drain(0..excess);
-                    }
-                }
-            },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
-                ws.send(Message::Ping(Vec::new())).await.map_err(|e| DexError::Other(format!("ws send ping error: {e}")))?;
-            },
-            else => break,
+    while let Some(message) = ws.next().await {
+        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        if !message.is_text() {
+            continue;
+        }
+        let payload: WrappedStreamResponse<Vec<StreamTradeModel>> =
+            serde_json::from_str(message.to_text().unwrap_or(""))
+                .map_err(|e| DexError::Other(format!("trade parse error: {e}")))?;
+        if let Some(trades) = payload.data {
+            let mut mapped = Vec::new();
+            for trade in trades {
+                let side = match trade.side.as_str() {
+                    "BUY" => Some(OrderSide::Long),
+                    "SELL" => Some(OrderSide::Short),
+                    _ => None,
+                };
+                mapped.push(LastTrade {
+                    price: trade.price,
+                    size: Some(trade.qty),
+                    side,
+                });
+            }
+            let mut cache = last_trades.write().await;
+            let entry = cache.entry(symbol.to_string()).or_default();
+            entry.extend(mapped);
+            if entry.len() > 200 {
+                let excess = entry.len() - 200;
+                entry.drain(0..excess);
+            }
         }
     }
     Ok(())
@@ -975,95 +958,87 @@ async fn stream_account(
         }
     };
     let mut logged_once = false;
-    loop {
-        tokio::select! {
-            Some(message) = ws.next() => {
-                let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
-                if !message.is_text() {
-                    continue;
+    while let Some(message) = ws.next().await {
+        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        if !message.is_text() {
+            continue;
+        }
+        let payload: WrappedStreamResponse<AccountStreamData> =
+            serde_json::from_str(message.to_text().unwrap_or(""))
+                .map_err(|e| DexError::Other(format!("account parse error: {e}")))?;
+        if let Some(data) = payload.data {
+            if !logged_once {
+                let orders_len = data.orders.as_ref().map(|v| v.len()).unwrap_or(0);
+                let trades_len = data.trades.as_ref().map(|v| v.len()).unwrap_or(0);
+                let has_balance = data.balance.is_some();
+                log::debug!(
+                    "account stream update received: balance={}, orders={}, trades={}",
+                    has_balance,
+                    orders_len,
+                    trades_len
+                );
+                logged_once = true;
+            }
+            if let Some(balance) = data.balance {
+                let mut cache = balance_cache.write().await;
+                *cache = Some(BalanceResponse {
+                    equity: balance.equity,
+                    balance: balance.balance,
+                    position_entry_price: None,
+                    position_sign: None,
+                });
+            }
+
+            if let Some(orders) = data.orders {
+                let mut cache = open_orders_cache.write().await;
+                cache.clear();
+                for order in orders {
+                    let entry = cache.entry(order.market.clone()).or_default();
+                    entry.push(OpenOrder {
+                        order_id: order.external_id.clone(),
+                        symbol: order.market.clone(),
+                        side: if order.side == "BUY" {
+                            OrderSide::Long
+                        } else {
+                            OrderSide::Short
+                        },
+                        size: order.qty,
+                        price: order.price,
+                        status: order.status.clone(),
+                    });
                 }
-                let payload: WrappedStreamResponse<AccountStreamData> =
-                    serde_json::from_str(message.to_text().unwrap_or(""))
-                        .map_err(|e| DexError::Other(format!("account parse error: {e}")))?;
-                if let Some(data) = payload.data {
-                    if !logged_once {
-                        let orders_len = data.orders.as_ref().map(|v| v.len()).unwrap_or(0);
-                        let trades_len = data.trades.as_ref().map(|v| v.len()).unwrap_or(0);
-                        let has_balance = data.balance.is_some();
-                        log::debug!(
-                            "account stream update received: balance={}, orders={}, trades={}",
-                            has_balance,
-                            orders_len,
-                            trades_len
-                        );
-                        logged_once = true;
-                    }
-                    if let Some(balance) = data.balance {
-                        let mut cache = balance_cache.write().await;
-                        *cache = Some(BalanceResponse {
-                            equity: balance.equity,
-                            balance: balance.balance,
-                            position_entry_price: None,
-                            position_sign: None,
-                        });
-                    }
+            }
 
-                    if let Some(orders) = data.orders {
-                        let mut cache = open_orders_cache.write().await;
-                        cache.clear();
-                        for order in orders {
-                            let entry = cache.entry(order.market.clone()).or_default();
-                            entry.push(OpenOrder {
-                                order_id: order.external_id.clone(),
-                                symbol: order.market.clone(),
-                                side: if order.side == "BUY" {
-                                    OrderSide::Long
-                                } else {
-                                    OrderSide::Short
-                                },
-                                size: order.qty,
-                                price: order.price,
-                                status: order.status.clone(),
-                            });
-                        }
-                    }
+            if let Some(trades) = data.trades {
+                let mut cache = filled_orders.write().await;
+                for trade in trades {
+                    let entry = cache.entry(trade.market.clone()).or_default();
+                    entry.push(FilledOrder {
+                        order_id: trade.order_id.to_string(),
+                        is_rejected: false,
+                        trade_id: trade.id.to_string(),
+                        filled_side: match trade.side.as_str() {
+                            "BUY" => Some(OrderSide::Long),
+                            "SELL" => Some(OrderSide::Short),
+                            _ => None,
+                        },
+                        filled_size: Some(trade.qty),
+                        filled_value: Some(trade.value),
+                        filled_fee: Some(trade.fee),
+                    });
+                }
+            }
 
-                    if let Some(trades) = data.trades {
-                        let mut cache = filled_orders.write().await;
-                        for trade in trades {
-                            let entry = cache.entry(trade.market.clone()).or_default();
-                            entry.push(FilledOrder {
-                                order_id: trade.order_id.to_string(),
-                                is_rejected: false,
-                                trade_id: trade.id.to_string(),
-                                filled_side: match trade.side.as_str() {
-                                    "BUY" => Some(OrderSide::Long),
-                                    "SELL" => Some(OrderSide::Short),
-                                    _ => None,
-                                },
-                                filled_size: Some(trade.qty),
-                                filled_value: Some(trade.value),
-                                filled_fee: Some(trade.fee),
-                            });
-                        }
-                    }
-
-                    if let Some(positions) = data.positions {
-                        let mut positions_map: HashMap<String, PositionSnapshot> = HashMap::new();
-                        for position in positions {
-                            if let Some(snapshot) = position_snapshot_from_model(position) {
-                                positions_map.insert(snapshot.symbol.clone(), snapshot);
-                            }
-                        }
-                        let mut cache = positions_cache.write().await;
-                        *cache = Some(positions_map.into_values().collect());
+            if let Some(positions) = data.positions {
+                let mut positions_map: HashMap<String, PositionSnapshot> = HashMap::new();
+                for position in positions {
+                    if let Some(snapshot) = position_snapshot_from_model(position) {
+                        positions_map.insert(snapshot.symbol.clone(), snapshot);
                     }
                 }
-            },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
-                ws.send(Message::Ping(Vec::new())).await.map_err(|e| DexError::Other(format!("ws send ping error: {e}")))?;
-            },
-            else => break,
+                let mut cache = positions_cache.write().await;
+                *cache = Some(positions_map.into_values().collect());
+            }
         }
     }
     Ok(())
