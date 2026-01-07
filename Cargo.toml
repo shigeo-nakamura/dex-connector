@@ -23,6 +23,7 @@ reqwest = { version = "0.11.18", features = ["blocking", "json", "cookies", "rus
 async-trait = "0.1.68"
 tokio-tungstenite = { version = "0.20.0", features = ["rustls-tls-webpki-roots"] }
 tokio = { version = "1.29.1", features = ["full"] }
+http = "0.2" # Added for http::request::Request
 ctrlc = "3.1.9"
 futures = "0.3"
 hmac = "0.12"
