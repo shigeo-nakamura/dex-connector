@@ -8,7 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use rust_crypto_lib_base::{get_order_hash, sign_message};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -868,6 +868,17 @@ async fn stream_orderbooks(
     let mut ws = connect_ws(url, None).await?;
     while let Some(message) = ws.next().await {
         let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        match message {
+            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                    .await
+                    .map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+                continue;
+            }
+            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
         if !message.is_text() {
             continue;
         }
@@ -908,6 +919,17 @@ async fn stream_trades(
     let mut ws = connect_ws(url, None).await?;
     while let Some(message) = ws.next().await {
         let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        match message {
+            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                    .await
+                    .map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+                continue;
+            }
+            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
         if !message.is_text() {
             continue;
         }
@@ -960,6 +982,17 @@ async fn stream_account(
     let mut logged_once = false;
     while let Some(message) = ws.next().await {
         let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        match message {
+            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                    .await
+                    .map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+                continue;
+            }
+            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
         if !message.is_text() {
             continue;
         }
