@@ -301,6 +301,7 @@ pub struct LighterConnector {
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
     cached_positions: Arc<RwLock<Vec<PositionSnapshot>>>,
+    balance_cache: Arc<RwLock<Option<BalanceResponse>>>,
     // Connection epoch counter for race detection
     connection_epoch: Arc<AtomicU64>,
     // Market metadata cache for symbol↔market_id resolution
@@ -1252,6 +1253,7 @@ impl LighterConnector {
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_positions: Arc::new(RwLock::new(Vec::new())),
+            balance_cache: Arc::new(RwLock::new(None)),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
@@ -1309,6 +1311,7 @@ impl LighterConnector {
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_positions: Arc::new(RwLock::new(Vec::new())),
+            balance_cache: Arc::new(RwLock::new(None)),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
@@ -2782,6 +2785,37 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
+        if let Some(token_symbol) = symbol {
+            let positions = self.cached_positions.read().await;
+            if let Some(pos) = positions.iter().find(|p| p.symbol == token_symbol) {
+                return Ok(BalanceResponse {
+                    equity: pos.size,
+                    balance: pos.size,
+                    position_entry_price: pos.entry_price,
+                    position_sign: Some(pos.sign),
+                });
+            }
+            let has_ws_balance = self.balance_cache.read().await.is_some();
+            if !positions.is_empty() || has_ws_balance {
+                return Ok(BalanceResponse {
+                    equity: Decimal::ZERO,
+                    balance: Decimal::ZERO,
+                    position_entry_price: None,
+                    position_sign: None,
+                });
+            }
+        } else {
+            let cache = self.balance_cache.read().await;
+            if let Some(balance) = cache.as_ref() {
+                return Ok(BalanceResponse {
+                    equity: balance.equity,
+                    balance: balance.balance,
+                    position_entry_price: balance.position_entry_price,
+                    position_sign: balance.position_sign,
+                });
+            }
+        }
+
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
 
         // First, get the raw response text for debugging
@@ -2905,6 +2939,32 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
+        let cached = {
+            let cache = self.balance_cache.read().await;
+            cache.as_ref().map(|balance| BalanceResponse {
+                equity: balance.equity,
+                balance: balance.balance,
+                position_entry_price: balance.position_entry_price,
+                position_sign: balance.position_sign,
+            })
+        };
+        if let Some(balance) = cached {
+            let mut token_balances = HashMap::new();
+            token_balances.insert(
+                "USD".to_string(),
+                BalanceResponse {
+                    equity: balance.equity,
+                    balance: balance.balance,
+                    position_entry_price: balance.position_entry_price,
+                    position_sign: balance.position_sign,
+                },
+            );
+            return Ok(CombinedBalanceResponse {
+                usd_balance: balance.equity,
+                token_balances,
+            });
+        }
+
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
         let url = format!("{}{}", self.base_url, endpoint);
 
@@ -4003,6 +4063,14 @@ impl LighterConnector {
             _ => None,
         }
     }
+
+    fn value_to_decimal(value: &Value) -> Option<Decimal> {
+        match value {
+            Value::String(s) => string_to_decimal(Some(s.clone())).ok(),
+            Value::Number(n) => string_to_decimal(Some(n.to_string())).ok(),
+            _ => None,
+        }
+    }
 }
 
 impl LighterConnector {
@@ -4184,6 +4252,7 @@ impl LighterConnector {
         let filled_orders = self.filled_orders.clone();
         let canceled_orders = self.canceled_orders.clone();
         let cached_positions = self.cached_positions.clone();
+        let balance_cache = self.balance_cache.clone();
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
@@ -4662,6 +4731,7 @@ impl LighterConnector {
                                                 &filled_orders,
                                                 &canceled_orders,
                                                 &cached_positions,
+                                                &balance_cache,
                                                 account_index,
                                                 &market_cache,
                                                 default_symbol.as_str(),
@@ -4842,6 +4912,7 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
+        balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
         account_index: u32,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -4926,6 +4997,7 @@ impl LighterConnector {
                     filled_orders,
                     canceled_orders,
                     cached_positions,
+                    balance_cache,
                     account_index as u64,
                     market_cache,
                     default_symbol,
@@ -4943,6 +5015,7 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
+        balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
         account_id: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -4983,6 +5056,32 @@ impl LighterConnector {
             let mut cache = cached_positions.write().await;
             *cache = new_positions;
             log::info!("Updated cached positions: {} positions", cache.len());
+        }
+
+        let balance_source = data.get("account").unwrap_or(data);
+        let total_asset_value = balance_source
+            .get("total_asset_value")
+            .and_then(Self::value_to_decimal);
+        let available_balance = balance_source
+            .get("available_balance")
+            .and_then(Self::value_to_decimal);
+        if total_asset_value.is_some() || available_balance.is_some() {
+            let equity = total_asset_value
+                .or(available_balance)
+                .unwrap_or(Decimal::ZERO);
+            let balance = available_balance.or(total_asset_value).unwrap_or(equity);
+            let mut cache = balance_cache.write().await;
+            *cache = Some(BalanceResponse {
+                equity,
+                balance,
+                position_entry_price: None,
+                position_sign: None,
+            });
+            log::debug!(
+                "Updated cached balance from WS: equity={}, balance={}",
+                equity,
+                balance
+            );
         }
 
         // Handle filled orders - try both 'fills' and 'trades' fields
