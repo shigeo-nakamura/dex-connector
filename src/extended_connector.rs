@@ -1571,10 +1571,102 @@ impl DexConnector for ExtendedConnector {
         Ok(())
     }
 
-    async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
-        Err(DexError::Other(
-            "close_all_positions not supported for Extended".to_string(),
-        ))
+    async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
+        let positions = if self.websocket_url.is_some() {
+            let cache = self.positions_cache.read().await;
+            if let Some(cached) = cache.clone() {
+                cached
+            } else {
+                let positions: Vec<PositionModel> =
+                    self.api.get("/user/positions".to_string(), true).await?;
+                positions
+                    .into_iter()
+                    .filter_map(position_snapshot_from_model)
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            let positions: Vec<PositionModel> =
+                self.api.get("/user/positions".to_string(), true).await?;
+            positions
+                .into_iter()
+                .filter_map(position_snapshot_from_model)
+                .collect::<Vec<_>>()
+        };
+
+        let mut last_err: Option<DexError> = None;
+        for position in positions {
+            if symbol.as_deref().map_or(false, |s| s != position.symbol) {
+                continue;
+            }
+
+            let side = if position.sign > 0 {
+                OrderSide::Short
+            } else {
+                OrderSide::Long
+            };
+            let ticker = self.get_ticker(&position.symbol, None).await?;
+            let order_price = slippage_price(ticker.price, side == OrderSide::Long);
+            let expire_time = Utc::now() + Duration::hours(1);
+
+            let nonce = rand::random::<u32>() as u64;
+            let market = self.get_market(&position.symbol).await?;
+            let side_str = match side {
+                OrderSide::Long => "BUY",
+                OrderSide::Short => "SELL",
+            };
+
+            let settlement = self.compute_settlement(
+                &market,
+                side_str,
+                position.size,
+                order_price,
+                expire_time,
+                nonce,
+            )?;
+
+            let order = NewOrderModel {
+                id: settlement.order_hash.to_string(),
+                market: market.name.clone(),
+                order_type: "LIMIT".to_string(),
+                side: side_str.to_string(),
+                qty: position.size,
+                price: order_price,
+                reduce_only: true,
+                post_only: false,
+                time_in_force: "GTT".to_string(),
+                expiry_epoch_millis: Self::to_epoch_millis(expire_time),
+                fee: settlement.fee_rate,
+                self_trade_protection_level: "ACCOUNT".to_string(),
+                nonce: Decimal::from(nonce),
+                cancel_id: None,
+                settlement: settlement.settlement,
+                tp_sl_type: None,
+                take_profit: None,
+                stop_loss: None,
+                debugging_amounts: Some(settlement.debugging_amounts),
+                builder_fee: None,
+                builder_id: None,
+            };
+
+            if let Err(err) = self
+                .api
+                .post::<PlacedOrderModel, _>("/user/order".to_string(), order, true)
+                .await
+            {
+                log::error!(
+                    "[close_all_positions] Failed to close {}: {}",
+                    position.symbol,
+                    err
+                );
+                last_err = Some(err);
+            }
+        }
+
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     async fn clear_last_trades(&self, symbol: &str) -> Result<(), DexError> {
