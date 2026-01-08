@@ -5059,12 +5059,31 @@ impl LighterConnector {
         }
 
         let balance_source = data.get("account").unwrap_or(data);
-        let total_asset_value = balance_source
+        let mut total_asset_value = balance_source
             .get("total_asset_value")
             .and_then(Self::value_to_decimal);
-        let available_balance = balance_source
+        let mut available_balance = balance_source
             .get("available_balance")
             .and_then(Self::value_to_decimal);
+
+        if total_asset_value.is_none() && available_balance.is_none() {
+            if let Some(assets) = data.get("assets").and_then(|a| a.as_object()) {
+                for asset in assets.values() {
+                    if asset
+                        .get("symbol")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("USDC"))
+                        .unwrap_or(false)
+                    {
+                        let asset_balance = asset.get("balance").and_then(Self::value_to_decimal);
+                        total_asset_value = total_asset_value.or(asset_balance);
+                        available_balance = available_balance.or(asset_balance);
+                        break;
+                    }
+                }
+            }
+        }
+
         if total_asset_value.is_some() || available_balance.is_some() {
             let equity = total_asset_value
                 .or(available_balance)
