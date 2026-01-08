@@ -4948,6 +4948,9 @@ impl LighterConnector {
         default_symbol: &str,
     ) {
         log::trace!("handle_account_update called with data: {:?}", data);
+        if std::env::var("LIGHTER_WS_ACCOUNT_DUMP").ok().as_deref() == Some("1") {
+            log::info!("[WS_ACCOUNT_DUMP] {}", data.to_string());
+        }
 
         // Handle positions update
         if let Some(positions_data) = data.get("positions").and_then(|p| p.as_array()) {
