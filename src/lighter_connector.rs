@@ -4952,11 +4952,19 @@ impl LighterConnector {
             log::info!("[WS_ACCOUNT_DUMP] {}", data.to_string());
         }
 
-        // Handle positions update
-        if let Some(positions_data) = data.get("positions").and_then(|p| p.as_array()) {
+        // Handle positions update (can be array or object)
+        let positions_vals: Option<Vec<Value>> =
+            if let Some(arr) = data.get("positions").and_then(|p| p.as_array()) {
+                Some(arr.clone())
+            } else if let Some(map) = data.get("positions").and_then(|p| p.as_object()) {
+                Some(map.values().cloned().collect())
+            } else {
+                None
+            };
+        if let Some(vals) = positions_vals {
             let mut new_positions = Vec::new();
-            for pos_val in positions_data {
-                if let Ok(position) = serde_json::from_value::<LighterPosition>(pos_val.clone()) {
+            for pos_val in vals {
+                if let Ok(position) = serde_json::from_value::<LighterPosition>(pos_val) {
                     let size = match Decimal::from_str(&position.position) {
                         Ok(s) => s.abs(),
                         Err(_) => Decimal::ZERO,
