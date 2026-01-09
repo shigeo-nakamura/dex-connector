@@ -4994,6 +4994,7 @@ impl LighterConnector {
                 // For Lighter DEX, the data is directly in the message, not in a 'data' field
                 Self::handle_account_update(
                     &message,
+                    msg_type,
                     filled_orders,
                     canceled_orders,
                     cached_positions,
@@ -5012,6 +5013,7 @@ impl LighterConnector {
 
     async fn handle_account_update(
         data: &Value,
+        msg_type: &str,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
@@ -5035,27 +5037,35 @@ impl LighterConnector {
                 None
             };
         if let Some(vals) = positions_vals {
-            let mut new_positions = Vec::new();
-            for pos_val in vals {
-                if let Ok(position) = serde_json::from_value::<LighterPosition>(pos_val) {
-                    let size = match Decimal::from_str(&position.position) {
-                        Ok(s) => s.abs(),
-                        Err(_) => Decimal::ZERO,
-                    };
-                    if !size.is_zero() {
-                        let entry_price = Decimal::from_str(&position.avg_entry_price).ok();
-                        new_positions.push(PositionSnapshot {
-                            symbol: position.symbol,
-                            size,
-                            sign: position.sign as i32,
-                            entry_price,
-                        });
+            let allow_empty = msg_type == "subscribed/account_all";
+            if vals.is_empty() && !allow_empty {
+                log::debug!(
+                    "[WS_ACCOUNT_DUMP] Skipping empty positions update for {}",
+                    msg_type
+                );
+            } else {
+                let mut new_positions = Vec::new();
+                for pos_val in vals {
+                    if let Ok(position) = serde_json::from_value::<LighterPosition>(pos_val) {
+                        let size = match Decimal::from_str(&position.position) {
+                            Ok(s) => s.abs(),
+                            Err(_) => Decimal::ZERO,
+                        };
+                        if !size.is_zero() {
+                            let entry_price = Decimal::from_str(&position.avg_entry_price).ok();
+                            new_positions.push(PositionSnapshot {
+                                symbol: position.symbol,
+                                size,
+                                sign: position.sign as i32,
+                                entry_price,
+                            });
+                        }
                     }
                 }
+                let mut cache = cached_positions.write().await;
+                *cache = new_positions;
+                log::info!("Updated cached positions: {} positions", cache.len());
             }
-            let mut cache = cached_positions.write().await;
-            *cache = new_positions;
-            log::info!("Updated cached positions: {} positions", cache.len());
         }
 
         let balance_source = data.get("account").unwrap_or(data);
