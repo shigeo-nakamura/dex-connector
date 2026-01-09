@@ -764,6 +764,33 @@ impl ExtendedConnector {
             debugging_amounts,
         })
     }
+
+    fn round_to_step(value: Decimal, step: Decimal, rounding: RoundingStrategy) -> Decimal {
+        if step <= Decimal::ZERO {
+            return value;
+        }
+        let steps = (value / step).round_dp_with_strategy(0, rounding);
+        let rounded = steps * step;
+        let step_scale = step.normalize().scale();
+        rounded.round_dp_with_strategy(step_scale, RoundingStrategy::ToZero)
+    }
+
+    fn round_size_for_market(size: Decimal, market: &MarketModel) -> Result<Decimal, DexError> {
+        let mut rounded = Self::round_to_step(
+            size,
+            market.trading_config.min_order_size_change,
+            RoundingStrategy::ToNegativeInfinity,
+        );
+        let asset_precision = market.asset_precision.max(0).try_into().unwrap_or(0);
+        rounded = rounded.round_dp_with_strategy(asset_precision, RoundingStrategy::ToZero);
+        if rounded < market.trading_config.min_order_size {
+            return Err(DexError::Other(format!(
+                "Order size {} below min {} for {}",
+                rounded, market.trading_config.min_order_size, market.name
+            )));
+        }
+        Ok(rounded)
+    }
 }
 
 fn copy_balance(balance: &BalanceResponse) -> BalanceResponse {
@@ -1499,13 +1526,20 @@ impl DexConnector for ExtendedConnector {
 
         let nonce = rand::random::<u32>() as u64;
         let market = self.get_market(symbol).await?;
+        let rounded_size = Self::round_size_for_market(size, &market)?;
         let side_str = match side {
             OrderSide::Long => "BUY",
             OrderSide::Short => "SELL",
         };
 
-        let settlement =
-            self.compute_settlement(&market, side_str, size, order_price, expire_time, nonce)?;
+        let settlement = self.compute_settlement(
+            &market,
+            side_str,
+            rounded_size,
+            order_price,
+            expire_time,
+            nonce,
+        )?;
 
         let order_id = settlement.order_hash.to_string();
 
@@ -1514,7 +1548,7 @@ impl DexConnector for ExtendedConnector {
             market: market.name.clone(),
             order_type: "LIMIT".to_string(),
             side: side_str.to_string(),
-            qty: size,
+            qty: rounded_size,
             price: order_price,
             reduce_only: false,
             post_only: false,
@@ -1541,7 +1575,7 @@ impl DexConnector for ExtendedConnector {
         Ok(CreateOrderResponse {
             order_id: response.external_id,
             ordered_price: order_price,
-            ordered_size: size,
+            ordered_size: rounded_size,
         })
     }
 
