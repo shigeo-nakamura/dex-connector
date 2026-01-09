@@ -301,6 +301,7 @@ pub struct LighterConnector {
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
     cached_positions: Arc<RwLock<Vec<PositionSnapshot>>>,
+    positions_ready: Arc<AtomicBool>,
     balance_cache: Arc<RwLock<Option<BalanceResponse>>>,
     // Connection epoch counter for race detection
     connection_epoch: Arc<AtomicU64>,
@@ -1253,6 +1254,7 @@ impl LighterConnector {
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_positions: Arc::new(RwLock::new(Vec::new())),
+            positions_ready: Arc::new(AtomicBool::new(false)),
             balance_cache: Arc::new(RwLock::new(None)),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
@@ -1311,6 +1313,7 @@ impl LighterConnector {
             // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_positions: Arc::new(RwLock::new(Vec::new())),
+            positions_ready: Arc::new(AtomicBool::new(false)),
             balance_cache: Arc::new(RwLock::new(None)),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
@@ -3033,6 +3036,11 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
+        if !self.positions_ready.load(Ordering::SeqCst) {
+            return Err(DexError::Other(
+                "positions not ready from websocket".to_string(),
+            ));
+        }
         let positions_guard = self.cached_positions.read().await;
         Ok(positions_guard.clone())
     }
@@ -4252,6 +4260,7 @@ impl LighterConnector {
         let filled_orders = self.filled_orders.clone();
         let canceled_orders = self.canceled_orders.clone();
         let cached_positions = self.cached_positions.clone();
+        let positions_ready = self.positions_ready.clone();
         let balance_cache = self.balance_cache.clone();
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
@@ -4731,6 +4740,7 @@ impl LighterConnector {
                                                 &filled_orders,
                                                 &canceled_orders,
                                                 &cached_positions,
+                                                &positions_ready,
                                                 &balance_cache,
                                                 account_index,
                                                 &market_cache,
@@ -4912,6 +4922,7 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
+        positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
         account_index: u32,
         market_cache: &Arc<RwLock<MarketCache>>,
@@ -4998,6 +5009,7 @@ impl LighterConnector {
                     filled_orders,
                     canceled_orders,
                     cached_positions,
+                    positions_ready,
                     balance_cache,
                     account_index as u64,
                     market_cache,
@@ -5017,11 +5029,13 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
+        positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
         account_id: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
     ) {
+        positions_ready.store(true, Ordering::SeqCst);
         log::trace!("handle_account_update called with data: {:?}", data);
         if std::env::var("LIGHTER_WS_ACCOUNT_DUMP").ok().as_deref() == Some("1") {
             log::info!("[WS_ACCOUNT_DUMP] {}", data.to_string());
@@ -5044,27 +5058,53 @@ impl LighterConnector {
                     msg_type
                 );
             } else {
-                let mut new_positions = Vec::new();
+                let mut updates: Vec<(String, Option<PositionSnapshot>)> = Vec::new();
                 for pos_val in vals {
                     if let Ok(position) = serde_json::from_value::<LighterPosition>(pos_val) {
                         let size = match Decimal::from_str(&position.position) {
                             Ok(s) => s.abs(),
                             Err(_) => Decimal::ZERO,
                         };
-                        if !size.is_zero() {
-                            let entry_price = Decimal::from_str(&position.avg_entry_price).ok();
-                            new_positions.push(PositionSnapshot {
+                        if size.is_zero() {
+                            updates.push((position.symbol.clone(), None));
+                            continue;
+                        }
+                        let entry_price = Decimal::from_str(&position.avg_entry_price).ok();
+                        updates.push((
+                            position.symbol.clone(),
+                            Some(PositionSnapshot {
                                 symbol: position.symbol,
                                 size,
                                 sign: position.sign as i32,
                                 entry_price,
-                            });
-                        }
+                            }),
+                        ));
                     }
                 }
-                let mut cache = cached_positions.write().await;
-                *cache = new_positions;
-                log::info!("Updated cached positions: {} positions", cache.len());
+                if msg_type == "subscribed/account_all" {
+                    let mut cache = cached_positions.write().await;
+                    *cache = updates.into_iter().filter_map(|(_, snap)| snap).collect();
+                    log::info!("Updated cached positions: {} positions", cache.len());
+                } else {
+                    let mut cache = cached_positions.write().await;
+                    let mut map: HashMap<String, PositionSnapshot> = cache
+                        .iter()
+                        .cloned()
+                        .map(|p| (p.symbol.clone(), p))
+                        .collect();
+                    for (symbol, maybe_snap) in updates {
+                        match maybe_snap {
+                            Some(snap) => {
+                                map.insert(symbol, snap);
+                            }
+                            None => {
+                                map.remove(&symbol);
+                            }
+                        }
+                    }
+                    *cache = map.into_values().collect();
+                    log::info!("Merged cached positions: {} positions", cache.len());
+                }
             }
         }
 
@@ -5175,13 +5215,29 @@ impl LighterConnector {
 
                 if let Some(trades_array) = trade_array.as_array() {
                     for trade in trades_array {
-                        if let (Some(ask_id), Some(bid_id), Some(size_str), Some(price_str)) = (
+                        if let (
+                            Some(ask_id),
+                            Some(bid_id),
+                            Some(ask_account_id),
+                            Some(_bid_account_id),
+                            Some(size_str),
+                            Some(price_str),
+                        ) = (
                             trade.get("ask_id").and_then(|v| v.as_u64()),
                             trade.get("bid_id").and_then(|v| v.as_u64()),
+                            trade.get("ask_account_id").and_then(|v| v.as_u64()),
+                            trade.get("bid_account_id").and_then(|v| v.as_u64()),
                             trade.get("size").and_then(|v| v.as_str()),
                             trade.get("price").and_then(|v| v.as_str()),
                         ) {
-                            let order_id = if account_id == ask_id { ask_id } else { bid_id };
+                            let is_ask = account_id == ask_account_id;
+                            let client_id = if is_ask {
+                                trade.get("ask_client_id").and_then(|v| v.as_u64())
+                            } else {
+                                trade.get("bid_client_id").and_then(|v| v.as_u64())
+                            };
+                            let order_id =
+                                client_id.unwrap_or_else(|| if is_ask { ask_id } else { bid_id });
 
                             log::info!(
                                 "✅ [FILL_DETECTION] Trade detected: order_id={}, size={}, price={}, market_id={}",
@@ -5200,7 +5256,7 @@ impl LighterConnector {
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0)
                                         .to_string(),
-                                    filled_side: if account_id == ask_id {
+                                    filled_side: if is_ask {
                                         Some(OrderSide::Short)
                                     } else {
                                         Some(OrderSide::Long)
