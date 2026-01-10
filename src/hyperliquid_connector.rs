@@ -1678,6 +1678,7 @@ impl DexConnector for HyperliquidConnector {
         side: OrderSide,
         price: Option<Decimal>,
         spread: Option<i64>,
+        reduce_only: bool,
         _expiry_secs: Option<u64>, // Ignored for Hyperliquid
     ) -> Result<CreateOrderResponse, DexError> {
         let (price, time_in_force) = match price {
@@ -1751,7 +1752,7 @@ impl DexConnector for HyperliquidConnector {
         let order = ClientOrderRequest {
             asset,
             is_buy: side == OrderSide::Long,
-            reduce_only: false,
+            reduce_only,
             limit_px: rounded_price
                 .to_f64()
                 .ok_or_else(|| DexError::Other("Conversion to f64 failed".to_string()))?,
@@ -2073,7 +2074,7 @@ impl DexConnector for HyperliquidConnector {
                 };
                 let size = position.szi.abs();
                 let _ = self
-                    .create_order(&external_sym, size, reversed_side, None, None, None) // No expiry for position closing
+                    .create_order(&external_sym, size, reversed_side, None, None, true, None) // No expiry for position closing
                     .await;
             }
         }

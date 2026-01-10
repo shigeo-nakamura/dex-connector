@@ -78,6 +78,7 @@ pub trait DexConnector: Send + Sync {
         side: OrderSide,
         price: Option<Decimal>,
         spread: Option<i64>,
+        reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError>;
 

@@ -3204,6 +3204,7 @@ impl DexConnector for LighterConnector {
         side: OrderSide,
         price: Option<Decimal>,
         _spread: Option<i64>,
+        reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         // Resolve market metadata for symbol
@@ -3339,7 +3340,7 @@ impl DexConnector for LighterConnector {
                 price_value,
                 None,
                 order_type,
-                false,
+                reduce_only,
                 expiry_secs,
             )
             .await;
@@ -4129,6 +4130,34 @@ impl LighterConnector {
             );
         }
     }
+
+    async fn remove_tracked_order(
+        cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
+        symbol: &str,
+        order_id: &str,
+    ) {
+        let normalized = normalize_symbol(symbol);
+        let mut keys = vec![symbol.to_string()];
+        if normalized != symbol {
+            keys.push(normalized);
+        }
+
+        let mut orders_guard = cached_open_orders.write().await;
+        for key in keys {
+            if let Some(orders) = orders_guard.get_mut(&key) {
+                let before = orders.len();
+                orders.retain(|order| order.order_id != order_id);
+                if before != orders.len() {
+                    log::debug!(
+                        "[WS_ORDER_TRACKING] Removed order {} from tracking for {} (remaining: {} orders)",
+                        order_id,
+                        key,
+                        orders.len()
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl LighterConnector {
@@ -4260,6 +4289,7 @@ impl LighterConnector {
         let filled_orders = self.filled_orders.clone();
         let canceled_orders = self.canceled_orders.clone();
         let cached_positions = self.cached_positions.clone();
+        let cached_open_orders = self.cached_open_orders.clone();
         let positions_ready = self.positions_ready.clone();
         let balance_cache = self.balance_cache.clone();
         let is_running = self.is_running.clone();
@@ -4739,6 +4769,7 @@ impl LighterConnector {
                                                 &order_book,
                                                 &filled_orders,
                                                 &canceled_orders,
+                                                &cached_open_orders,
                                                 &cached_positions,
                                                 &positions_ready,
                                                 &balance_cache,
@@ -4921,6 +4952,7 @@ impl LighterConnector {
         order_book: &Arc<RwLock<Option<LighterOrderBook>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+        cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
@@ -5008,6 +5040,7 @@ impl LighterConnector {
                     msg_type,
                     filled_orders,
                     canceled_orders,
+                    cached_open_orders,
                     cached_positions,
                     positions_ready,
                     balance_cache,
@@ -5028,6 +5061,7 @@ impl LighterConnector {
         msg_type: &str,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+        cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
@@ -5164,12 +5198,19 @@ impl LighterConnector {
             for fill in fills {
                 log::debug!("🔍 [FILL_DETECTION] Processing fill: {:?}", fill);
                 if let Ok(filled_order) = Self::parse_filled_order(fill, account_id) {
+                    let order_id = filled_order.order_id.clone();
                     log::info!("✅ [FILL_DETECTION] Added filled order: order_id={}, size={:?}, value={:?}",
                               filled_order.order_id, filled_order.filled_size, filled_order.filled_value);
                     filled_map
                         .entry(default_symbol.clone())
                         .or_insert_with(Vec::new)
                         .push(filled_order);
+                    Self::remove_tracked_order(
+                        cached_open_orders,
+                        &default_symbol,
+                        &order_id,
+                    )
+                    .await;
                 } else {
                     log::warn!("Failed to parse filled order: {:?}", fill);
                 }
@@ -5271,6 +5312,12 @@ impl LighterConnector {
                                     "✅ [FILL_DETECTION] Added filled order from trade: order_id={}",
                                     order_id
                                 );
+                                Self::remove_tracked_order(
+                                    cached_open_orders,
+                                    &market_symbol,
+                                    &order_id.to_string(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -5305,12 +5352,88 @@ impl LighterConnector {
         }
     }
 
-    fn parse_filled_order(_data: &Value, _account_id: u64) -> Result<FilledOrder, DexError> {
-        // Filled order tracking is not supported for Lighter DEX
-        // MarketMake strategy will use timeout-based order management instead
-        Err(DexError::Other(
-            "Filled order tracking not supported for Lighter DEX".to_string(),
-        ))
+    fn parse_filled_order(data: &Value, account_id: u64) -> Result<FilledOrder, DexError> {
+        let order_id = data
+            .get("order_id")
+            .or_else(|| data.get("orderId"))
+            .or_else(|| data.get("oid"))
+            .or_else(|| data.get("client_order_id"))
+            .or_else(|| data.get("clientOrderId"))
+            .or_else(|| data.get("client_order_index"))
+            .or_else(|| data.get("clientOrderIndex"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            });
+
+        let order_id =
+            order_id.ok_or_else(|| DexError::Other("Missing order_id in fill".to_string()))?;
+
+        let trade_id = data
+            .get("trade_id")
+            .or_else(|| data.get("tradeId"))
+            .or_else(|| data.get("id"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
+            .unwrap_or_else(|| "0".to_string());
+
+        let filled_size = data
+            .get("size")
+            .or_else(|| data.get("filled_size"))
+            .or_else(|| data.get("filledSize"))
+            .or_else(|| data.get("base_amount"))
+            .or_else(|| data.get("baseAmount"))
+            .and_then(Self::value_to_decimal)
+            .ok_or_else(|| DexError::Other("Missing filled size in fill".to_string()))?;
+
+        let filled_price = data
+            .get("price")
+            .or_else(|| data.get("fill_price"))
+            .or_else(|| data.get("fillPrice"))
+            .and_then(Self::value_to_decimal);
+
+        let filled_side = if let Some(side) = data.get("side").and_then(|v| v.as_str()) {
+            match side.to_ascii_lowercase().as_str() {
+                "buy" | "long" => Some(OrderSide::Long),
+                "sell" | "short" => Some(OrderSide::Short),
+                _ => None,
+            }
+        } else if let Some(is_ask) = data.get("is_ask").and_then(|v| v.as_bool()) {
+            if is_ask {
+                Some(OrderSide::Short)
+            } else {
+                Some(OrderSide::Long)
+            }
+        } else if let (Some(ask_account_id), Some(bid_account_id)) = (
+            data.get("ask_account_id").and_then(|v| v.as_u64()),
+            data.get("bid_account_id").and_then(|v| v.as_u64()),
+        ) {
+            if account_id == ask_account_id {
+                Some(OrderSide::Short)
+            } else if account_id == bid_account_id {
+                Some(OrderSide::Long)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let filled_value = filled_price.map(|price| filled_size * price);
+
+        Ok(FilledOrder {
+            order_id,
+            is_rejected: false,
+            trade_id,
+            filled_side,
+            filled_size: Some(filled_size),
+            filled_value,
+            filled_fee: None,
+        })
     }
 
     fn parse_canceled_order(data: &Value) -> Result<CanceledOrder, DexError> {

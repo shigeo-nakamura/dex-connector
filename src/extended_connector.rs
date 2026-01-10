@@ -1543,6 +1543,7 @@ impl DexConnector for ExtendedConnector {
         side: OrderSide,
         price: Option<Decimal>,
         _spread: Option<i64>,
+        reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let order_price = match price {
@@ -1603,7 +1604,7 @@ impl DexConnector for ExtendedConnector {
             side: side_str.to_string(),
             qty: rounded_size,
             price: rounded_price,
-            reduce_only: false,
+            reduce_only,
             post_only: false,
             time_in_force: "GTT".to_string(),
             expiry_epoch_millis: Self::to_epoch_millis(expire_time),
