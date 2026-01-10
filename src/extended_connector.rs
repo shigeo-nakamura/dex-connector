@@ -793,11 +793,37 @@ impl ExtendedConnector {
     }
 
     fn round_price_for_market(price: Decimal, market: &MarketModel, side: OrderSide) -> Decimal {
+        let floor = market.trading_config.limit_price_floor;
+        let cap = market.trading_config.limit_price_cap;
+        let mut bounded = price;
+        if cap > Decimal::ZERO && bounded > cap {
+            bounded = cap;
+        }
+        if floor > Decimal::ZERO && bounded < floor {
+            bounded = floor;
+        }
+
         let rounding = match side {
             OrderSide::Long => RoundingStrategy::ToNegativeInfinity,
             OrderSide::Short => RoundingStrategy::ToPositiveInfinity,
         };
-        Self::round_to_step(price, market.trading_config.min_price_change, rounding)
+        let mut rounded =
+            Self::round_to_step(bounded, market.trading_config.min_price_change, rounding);
+        if cap > Decimal::ZERO && rounded > cap {
+            rounded = Self::round_to_step(
+                cap,
+                market.trading_config.min_price_change,
+                RoundingStrategy::ToNegativeInfinity,
+            );
+        }
+        if floor > Decimal::ZERO && rounded < floor {
+            rounded = Self::round_to_step(
+                floor,
+                market.trading_config.min_price_change,
+                RoundingStrategy::ToPositiveInfinity,
+            );
+        }
+        rounded
     }
 }
 
@@ -1540,6 +1566,24 @@ impl DexConnector for ExtendedConnector {
             OrderSide::Long => "BUY",
             OrderSide::Short => "SELL",
         };
+        if rounded_price <= Decimal::ZERO {
+            return Err(DexError::Other(format!(
+                "Rounded price {} is non-positive for {}",
+                rounded_price, market.name
+            )));
+        }
+        log::debug!(
+            "[create_order][extended] sym={} side={} raw_price={} rounded_price={} min_price_change={} limit_floor={} limit_cap={} raw_size={} rounded_size={}",
+            market.name,
+            side_str,
+            order_price,
+            rounded_price,
+            market.trading_config.min_price_change,
+            market.trading_config.limit_price_floor,
+            market.trading_config.limit_price_cap,
+            size,
+            rounded_size
+        );
 
         let settlement = self.compute_settlement(
             &market,
