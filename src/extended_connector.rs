@@ -505,6 +505,16 @@ impl ExtendedConnector {
         let api_base = base_url.unwrap_or_else(|| env.api_base().to_string());
         let api = ExtendedApi::new(api_base, api_key).await?;
 
+        let market_cache = Arc::new(RwLock::new(HashMap::new()));
+        // Fetch all markets during initialization
+        let markets: Vec<MarketModel> = api.get("/info/markets".to_string(), true).await?;
+        {
+            let mut cache = market_cache.write().await;
+            for market in markets {
+                cache.insert(market.name.clone(), market);
+            }
+        }
+
         Ok(Self {
             api,
             public_key,
@@ -513,7 +523,7 @@ impl ExtendedConnector {
             env,
             websocket_url,
             tracked_symbols,
-            market_cache: Arc::new(RwLock::new(HashMap::new())),
+            market_cache,
             order_book_cache: Arc::new(RwLock::new(HashMap::new())),
             balance_cache: Arc::new(RwLock::new(None)),
             open_orders_cache: Arc::new(RwLock::new(HashMap::new())),
