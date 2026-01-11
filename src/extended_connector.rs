@@ -817,7 +817,24 @@ impl ExtendedConnector {
             rounded = Self::round_to_step(cap, tick, RoundingStrategy::ToNegativeInfinity);
         }
 
-        rounded
+        if tick > Decimal::ZERO && rounded < tick {
+            rounded = tick;
+        }
+
+        Self::clamp_positive_price(rounded, tick, floor)
+    }
+
+    fn clamp_positive_price(price: Decimal, tick: Decimal, floor: Decimal) -> Decimal {
+        if price > Decimal::ZERO {
+            return price;
+        }
+        if floor > Decimal::ZERO {
+            return floor;
+        }
+        if tick > Decimal::ZERO {
+            return tick;
+        }
+        Decimal::ONE
     }
 }
 
@@ -906,6 +923,14 @@ mod tests {
             rounded.scale(),
             market.trading_config.min_price_change.scale()
         );
+    }
+
+    #[test]
+    fn round_price_for_market_clamps_to_tick_when_zero() {
+        let market = sample_market(dec("0.05"));
+        let rounded =
+            ExtendedConnector::round_price_for_market(Decimal::ZERO, &market, OrderSide::Long);
+        assert_eq!(rounded, dec("0.05"));
     }
 }
 
