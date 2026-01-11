@@ -1372,6 +1372,7 @@ impl DexConnector for HyperliquidConnector {
             price,
             min_tick,
             min_order: None,
+            size_decimals: None,
             volume: Some(delta_vol),
             num_trades,
             funding_rate,

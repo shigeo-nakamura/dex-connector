@@ -1236,6 +1236,13 @@ impl DexConnector for ExtendedConnector {
             price,
             min_tick: Some(market.trading_config.min_price_change),
             min_order: Some(market.trading_config.min_order_size),
+            size_decimals: Some(
+                market
+                    .trading_config
+                    .min_order_size_change
+                    .normalize()
+                    .scale(),
+            ),
             volume: Some(market.market_stats.daily_volume),
             num_trades: None,
             open_interest: Some(market.market_stats.open_interest),

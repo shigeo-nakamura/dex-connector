@@ -53,6 +53,7 @@ pub struct TickerResponse {
     pub price: Decimal,
     pub min_tick: Option<Decimal>,
     pub min_order: Option<Decimal>,
+    pub size_decimals: Option<u32>,
     pub volume: Option<Decimal>,
     pub num_trades: Option<u64>,
     pub open_interest: Option<Decimal>,
