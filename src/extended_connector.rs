@@ -793,8 +793,10 @@ impl ExtendedConnector {
     }
 
     fn round_price_for_market(price: Decimal, market: &MarketModel, side: OrderSide) -> Decimal {
+        let tick = market.trading_config.min_price_change;
         let floor = market.trading_config.limit_price_floor;
         let cap = market.trading_config.limit_price_cap;
+
         let mut bounded = price;
         if cap > Decimal::ZERO && bounded > cap {
             bounded = cap;
@@ -807,22 +809,21 @@ impl ExtendedConnector {
             OrderSide::Long => RoundingStrategy::ToNegativeInfinity,
             OrderSide::Short => RoundingStrategy::ToPositiveInfinity,
         };
-        let mut rounded =
-            Self::round_to_step(bounded, market.trading_config.min_price_change, rounding);
-        if cap > Decimal::ZERO && rounded > cap {
-            rounded = Self::round_to_step(
-                cap,
-                market.trading_config.min_price_change,
-                RoundingStrategy::ToNegativeInfinity,
-            );
-        }
+        let mut rounded = Self::round_to_step(bounded, tick, rounding);
         if floor > Decimal::ZERO && rounded < floor {
-            rounded = Self::round_to_step(
-                floor,
-                market.trading_config.min_price_change,
-                RoundingStrategy::ToPositiveInfinity,
-            );
+            rounded = Self::round_to_step(floor, tick, RoundingStrategy::ToPositiveInfinity);
         }
+        if cap > Decimal::ZERO && rounded > cap {
+            rounded = Self::round_to_step(cap, tick, RoundingStrategy::ToNegativeInfinity);
+        }
+
+        if floor > Decimal::ZERO && rounded < floor {
+            rounded = floor;
+        }
+        if cap > Decimal::ZERO && rounded > cap {
+            rounded = cap;
+        }
+
         rounded
     }
 }
@@ -1735,12 +1736,14 @@ impl DexConnector for ExtendedConnector {
                 OrderSide::Long => "BUY",
                 OrderSide::Short => "SELL",
             };
+            let rounded_price = Self::round_price_for_market(order_price, &market, side);
+            let rounded_size = Self::round_size_for_market(position.size, &market)?;
 
             let settlement = self.compute_settlement(
                 &market,
                 side_str,
-                position.size,
-                order_price,
+                rounded_size,
+                rounded_price,
                 expire_time,
                 nonce,
             )?;
@@ -1750,8 +1753,8 @@ impl DexConnector for ExtendedConnector {
                 market: market.name.clone(),
                 order_type: "LIMIT".to_string(),
                 side: side_str.to_string(),
-                qty: position.size,
-                price: order_price,
+                qty: rounded_size,
+                price: rounded_price,
                 reduce_only: true,
                 post_only: false,
                 time_in_force: "GTT".to_string(),
