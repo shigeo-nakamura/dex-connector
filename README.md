@@ -157,3 +157,15 @@ Err(DexError::Other(
 ```
 
 This allows applications to handle missing functionality gracefully.
+
+## Testing Extended Rounding
+
+Some `ExtendedConnector` tests expect the environment defined in `debot/scripts/debot_extended.env`. To run the rounding test locally, use:
+
+```bash
+source ~/bot/debot/scripts/debot_extended.env
+cd ~/bot/dex-connector
+cargo test round_price_by_tick
+```
+
+That command keeps parity with the bot runtime while running the `round_price_by_tick` unit test inside the `dex-connector` crate.

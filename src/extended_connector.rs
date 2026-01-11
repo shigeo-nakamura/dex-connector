@@ -771,7 +771,7 @@ impl ExtendedConnector {
         }
         let steps = (value / step).round_dp_with_strategy(0, rounding);
         let rounded = steps * step;
-        let step_scale = step.normalize().scale();
+        let step_scale = step.scale();
         rounded.round_dp_with_strategy(step_scale, RoundingStrategy::ToZero)
     }
 
@@ -817,13 +817,6 @@ impl ExtendedConnector {
             rounded = Self::round_to_step(cap, tick, RoundingStrategy::ToNegativeInfinity);
         }
 
-        if floor > Decimal::ZERO && rounded < floor {
-            rounded = floor;
-        }
-        if cap > Decimal::ZERO && rounded > cap {
-            rounded = cap;
-        }
-
         rounded
     }
 }
@@ -834,6 +827,85 @@ fn copy_balance(balance: &BalanceResponse) -> BalanceResponse {
         balance: balance.balance,
         position_entry_price: balance.position_entry_price,
         position_sign: balance.position_sign,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn dec(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
+    fn sample_market(min_price_change: Decimal) -> MarketModel {
+        MarketModel {
+            name: "TEST-USD".to_string(),
+            asset_name: "TEST".to_string(),
+            asset_precision: 6,
+            collateral_asset_name: "USD".to_string(),
+            collateral_asset_precision: 6,
+            active: true,
+            market_stats: MarketStatsModel {
+                daily_volume: Decimal::ZERO,
+                daily_volume_base: Decimal::ZERO,
+                daily_price_change: Decimal::ZERO,
+                daily_low: Decimal::ZERO,
+                daily_high: Decimal::ZERO,
+                last_price: Decimal::ZERO,
+                ask_price: Decimal::ZERO,
+                bid_price: Decimal::ZERO,
+                mark_price: Decimal::ZERO,
+                index_price: Decimal::ZERO,
+                funding_rate: Decimal::ZERO,
+                next_funding_rate: 0,
+                open_interest: Decimal::ZERO,
+                open_interest_base: Decimal::ZERO,
+            },
+            trading_config: TradingConfigModel {
+                min_order_size: dec("0.001"),
+                min_order_size_change: dec("0.001"),
+                min_price_change,
+                max_market_order_value: Decimal::ZERO,
+                max_limit_order_value: Decimal::ZERO,
+                max_position_value: Decimal::ZERO,
+                max_leverage: Decimal::ZERO,
+                max_num_orders: 0,
+                limit_price_cap: Decimal::ZERO,
+                limit_price_floor: Decimal::ZERO,
+            },
+            l2_config: L2ConfigModel {
+                l2_type: "stark".to_string(),
+                collateral_id: "0".to_string(),
+                collateral_resolution: 1,
+                synthetic_id: "0".to_string(),
+                synthetic_resolution: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn round_to_step_preserves_step_scale() {
+        let step = dec("0.10");
+        let rounded = ExtendedConnector::round_to_step(
+            dec("1.234"),
+            step,
+            RoundingStrategy::ToNegativeInfinity,
+        );
+        assert_eq!(rounded, dec("1.20"));
+        assert_eq!(rounded.scale(), step.scale());
+    }
+
+    #[test]
+    fn round_price_for_market_preserves_tick_scale() {
+        let market = sample_market(dec("0.10"));
+        let rounded =
+            ExtendedConnector::round_price_for_market(dec("100.123"), &market, OrderSide::Long);
+        assert_eq!(
+            rounded.scale(),
+            market.trading_config.min_price_change.scale()
+        );
     }
 }
 
@@ -1236,13 +1308,7 @@ impl DexConnector for ExtendedConnector {
             price,
             min_tick: Some(market.trading_config.min_price_change),
             min_order: Some(market.trading_config.min_order_size),
-            size_decimals: Some(
-                market
-                    .trading_config
-                    .min_order_size_change
-                    .normalize()
-                    .scale(),
-            ),
+            size_decimals: Some(market.trading_config.min_order_size_change.scale()),
             volume: Some(market.market_stats.daily_volume),
             num_trades: None,
             open_interest: Some(market.market_stats.open_interest),

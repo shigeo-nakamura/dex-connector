@@ -5615,6 +5615,7 @@ mod tests {
             account_index,
             base_url,
             "dummy_websocket_url".to_string(),
+            Vec::new(),
         ) {
             Ok(c) => c,
             Err(e) => {
