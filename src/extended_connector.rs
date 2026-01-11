@@ -640,6 +640,29 @@ impl ExtendedConnector {
         Ok(market)
     }
 
+    async fn refresh_market(&self, symbol: &str) -> Result<MarketModel, DexError> {
+        let path = build_query(
+            "/info/markets",
+            vec![("market".to_string(), symbol.to_string())],
+        );
+        let markets: Vec<MarketModel> = self.api.get(path, true).await?;
+        let market = markets
+            .into_iter()
+            .find(|m| m.name == symbol)
+            .ok_or_else(|| DexError::Other(format!("Market not found: {}", symbol)))?;
+
+        let mut cache = self.market_cache.write().await;
+        cache.insert(symbol.to_string(), market.clone());
+        Ok(market)
+    }
+
+    fn is_invalid_price_error(err: &DexError) -> bool {
+        match err {
+            DexError::ServerResponse(message) => message.to_lowercase().contains("invalid price"),
+            _ => false,
+        }
+    }
+
     fn parse_private_key(&self) -> Result<Felt, DexError> {
         Felt::from_hex(&self.private_key)
             .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))

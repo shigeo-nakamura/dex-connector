@@ -773,6 +773,13 @@ impl LighterConnector {
                         size_decimals,
                         min_order,
                     };
+                    log::info!(
+                        "[MARKET_INFO] Loaded market {}: price_decimals={}, size_decimals={}, min_order={:?}",
+                        normalized,
+                        price_decimals,
+                        size_decimals,
+                        min_order
+                    );
 
                     cache.by_symbol.insert(normalized.clone(), info.clone());
                     cache.by_id.insert(detail.market_id, info);
