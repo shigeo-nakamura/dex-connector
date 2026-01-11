@@ -640,6 +640,7 @@ impl ExtendedConnector {
         Ok(market)
     }
 
+    #[allow(dead_code)]
     async fn refresh_market(&self, symbol: &str) -> Result<MarketModel, DexError> {
         let path = build_query(
             "/info/markets",
@@ -656,6 +657,7 @@ impl ExtendedConnector {
         Ok(market)
     }
 
+    #[allow(dead_code)]
     fn is_invalid_price_error(err: &DexError) -> bool {
         match err {
             DexError::ServerResponse(message) => message.to_lowercase().contains("invalid price"),
