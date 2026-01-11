@@ -87,6 +87,7 @@ struct MarketInfo {
     market_id: u32,
     price_decimals: u32,
     size_decimals: u32,
+    min_order: Option<Decimal>,
 }
 
 #[derive(Default, Debug)]
@@ -430,6 +431,8 @@ struct LighterOrderBookDetailsResponse {
 struct LighterOrderBookDetail {
     market_id: u32,
     symbol: String,
+    #[serde(rename = "min_base_amount")]
+    min_base_amount: Option<String>,
     #[serde(rename = "supported_price_decimals")]
     supported_price_decimals: Option<u32>,
     #[serde(rename = "supported_size_decimals")]
@@ -759,11 +762,16 @@ impl LighterConnector {
 
                     detail_decimals.insert(detail.market_id, (price_decimals, size_decimals));
 
+                    let min_order = detail
+                        .min_base_amount
+                        .as_deref()
+                        .and_then(|v| Decimal::from_str(v).ok());
                     let info = MarketInfo {
                         canonical_symbol: normalized.clone(),
                         market_id: detail.market_id,
                         price_decimals,
                         size_decimals,
+                        min_order,
                     };
 
                     cache.by_symbol.insert(normalized.clone(), info.clone());
@@ -797,6 +805,7 @@ impl LighterConnector {
                     market_id: entry.market_id,
                     price_decimals,
                     size_decimals,
+                    min_order: None,
                 };
                 cache.by_symbol.insert(normalized.clone(), info.clone());
                 cache.by_id.insert(entry.market_id, info);
@@ -2572,6 +2581,7 @@ impl DexConnector for LighterConnector {
 
         let market_info = self.resolve_market_info(symbol).await?;
         let canonical_symbol = market_info.canonical_symbol.clone();
+        let min_order = market_info.min_order.clone();
 
         // Get statistics data from API
         let stats_data = self.get_exchange_stats().await.ok();
@@ -2643,7 +2653,7 @@ impl DexConnector for LighterConnector {
                     symbol: symbol.to_string(),
                     price: ws_price,
                     min_tick: Some(min_tick),
-                    min_order: None,
+                    min_order: min_order.clone(),
                     volume,
                     num_trades,
                     open_interest: None,
@@ -2755,7 +2765,7 @@ impl DexConnector for LighterConnector {
             symbol: symbol.to_string(),
             price,
             min_tick: Some(min_tick),
-            min_order: None,
+            min_order,
             volume,
             num_trades,
             open_interest: None,
@@ -5205,12 +5215,8 @@ impl LighterConnector {
                         .entry(default_symbol.clone())
                         .or_insert_with(Vec::new)
                         .push(filled_order);
-                    Self::remove_tracked_order(
-                        cached_open_orders,
-                        &default_symbol,
-                        &order_id,
-                    )
-                    .await;
+                    Self::remove_tracked_order(cached_open_orders, &default_symbol, &order_id)
+                        .await;
                 } else {
                     log::warn!("Failed to parse filled order: {:?}", fill);
                 }
