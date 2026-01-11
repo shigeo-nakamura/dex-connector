@@ -820,6 +820,15 @@ impl ExtendedConnector {
         let floor = market.trading_config.limit_price_floor;
         let cap = market.trading_config.limit_price_cap;
 
+        log::debug!(
+            "[round_price_for_market] raw_price={} tick={} floor={} cap={} side={:?}",
+            price,
+            tick,
+            floor,
+            cap,
+            side
+        );
+
         let mut bounded = price;
         if cap > Decimal::ZERO && bounded > cap {
             bounded = cap;
@@ -844,7 +853,9 @@ impl ExtendedConnector {
             rounded = tick;
         }
 
-        Self::clamp_positive_price(rounded, tick, floor)
+        let final_price = Self::clamp_positive_price(rounded, tick, floor);
+        log::debug!("[round_price_for_market] final_price={}", final_price);
+        final_price
     }
 
     fn clamp_positive_price(price: Decimal, tick: Decimal, floor: Decimal) -> Decimal {
