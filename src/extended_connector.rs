@@ -1308,6 +1308,174 @@ fn position_snapshot_from_model(position: PositionModel) -> Option<PositionSnaps
     })
 }
 
+impl ExtendedConnector {
+    async fn fetch_filled_orders_via_http(
+        &self,
+        symbol: &str,
+    ) -> Result<Vec<FilledOrder>, DexError> {
+        let path = build_query(
+            "/user/trades",
+            vec![("market".to_string(), symbol.to_string())],
+        );
+        let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
+        let orders = trades
+            .into_iter()
+            .map(|trade| FilledOrder {
+                order_id: trade.order_id.to_string(),
+                is_rejected: false,
+                trade_id: trade.id.to_string(),
+                filled_side: match trade.side.as_str() {
+                    "BUY" => Some(OrderSide::Long),
+                    "SELL" => Some(OrderSide::Short),
+                    _ => None,
+                },
+                filled_size: Some(trade.qty),
+                filled_value: Some(trade.value),
+                filled_fee: Some(trade.fee),
+            })
+            .collect::<Vec<_>>();
+        Ok(orders)
+    }
+
+    async fn create_order_internal(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        price: Option<Decimal>,
+        reduce_only: bool,
+        expiry_secs: Option<u64>,
+        refreshed: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let mut refreshed_once = refreshed;
+        loop {
+            let market = if refreshed_once {
+                self.refresh_market(symbol).await?
+            } else {
+                self.get_market(symbol).await?
+            };
+
+            let order_price = match price {
+                Some(price) => price,
+                None => {
+                    let ticker = self.get_ticker(symbol, None).await?;
+                    slippage_price(ticker.price, side == OrderSide::Long)
+                }
+            };
+
+            match self
+                .submit_order_with_market(
+                    &market,
+                    size,
+                    side,
+                    order_price,
+                    reduce_only,
+                    expiry_secs,
+                )
+                .await
+            {
+                Ok(res) => return Ok(res),
+                Err(err) if !refreshed_once && Self::is_invalid_price_error(&err) => {
+                    log::warn!(
+                        "[create_order][extended] Invalid price for {}; refreshing market data and retrying once",
+                        symbol
+                    );
+                    refreshed_once = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn submit_order_with_market(
+        &self,
+        market: &MarketModel,
+        size: Decimal,
+        side: OrderSide,
+        order_price: Decimal,
+        reduce_only: bool,
+        expiry_secs: Option<u64>,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let expire_time = match expiry_secs {
+            Some(secs) => Utc::now() + Duration::seconds(secs as i64),
+            None => Utc::now() + Duration::hours(1),
+        };
+
+        let nonce = rand::random::<u32>() as u64;
+        let rounded_size = Self::round_size_for_market(size, market)?;
+        let rounded_price = Self::round_price_for_market(order_price, market, side);
+        let side_str = match side {
+            OrderSide::Long => "BUY",
+            OrderSide::Short => "SELL",
+        };
+        if rounded_price <= Decimal::ZERO {
+            return Err(DexError::Other(format!(
+                "Rounded price {} is non-positive for {}",
+                rounded_price, market.name
+            )));
+        }
+        log::debug!(
+            "[create_order][extended] sym={} side={} raw_price={} rounded_price={} min_price_change={} limit_floor={} limit_cap={} raw_size={} rounded_size={}",
+            market.name,
+            side_str,
+            order_price,
+            rounded_price,
+            market.trading_config.min_price_change,
+            market.trading_config.limit_price_floor,
+            market.trading_config.limit_price_cap,
+            size,
+            rounded_size
+        );
+
+        let settlement = self.compute_settlement(
+            market,
+            side_str,
+            rounded_size,
+            rounded_price,
+            expire_time,
+            nonce,
+        )?;
+
+        let order_id = settlement.order_hash.to_string();
+
+        let order = NewOrderModel {
+            id: order_id.clone(),
+            market: market.name.clone(),
+            order_type: "LIMIT".to_string(),
+            side: side_str.to_string(),
+            qty: rounded_size,
+            price: rounded_price,
+            reduce_only,
+            post_only: false,
+            time_in_force: "GTT".to_string(),
+            expiry_epoch_millis: Self::to_epoch_millis(expire_time),
+            fee: settlement.fee_rate,
+            self_trade_protection_level: "ACCOUNT".to_string(),
+            nonce: Decimal::from(nonce),
+            cancel_id: None,
+            settlement: settlement.settlement,
+            tp_sl_type: None,
+            take_profit: None,
+            stop_loss: None,
+            debugging_amounts: Some(settlement.debugging_amounts),
+            builder_fee: None,
+            builder_id: None,
+        };
+
+        let response: PlacedOrderModel = self
+            .api
+            .post("/user/order".to_string(), order, true)
+            .await?;
+
+        Ok(CreateOrderResponse {
+            order_id: response.external_id,
+            ordered_price: rounded_price,
+            ordered_size: rounded_size,
+        })
+    }
+}
+
 #[async_trait]
 impl DexConnector for ExtendedConnector {
     async fn start(&self) -> Result<(), DexError> {
@@ -1391,37 +1559,21 @@ impl DexConnector for ExtendedConnector {
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
         if self.websocket_url.is_some() {
             let cache = self.filled_orders.read().await;
-            let orders = cache.get(symbol).cloned().ok_or_else(|| {
-                DexError::Other("filled orders unavailable: waiting for websocket data".to_string())
-            })?;
-            Ok(FilledOrdersResponse { orders })
-        } else {
-            let path = build_query(
-                "/user/trades",
-                vec![("market".to_string(), symbol.to_string())],
+            if let Some(orders) = cache.get(symbol) {
+                return Ok(FilledOrdersResponse {
+                    orders: orders.clone(),
+                });
+            }
+            log::debug!(
+                "[filled_orders][extended] cache miss for {}; falling back to REST",
+                symbol
             );
-            let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
-            let orders = trades
-                .into_iter()
-                .map(|trade| FilledOrder {
-                    order_id: trade.order_id.to_string(),
-                    is_rejected: false,
-                    trade_id: trade.id.to_string(),
-                    filled_side: match trade.side.as_str() {
-                        "BUY" => Some(OrderSide::Long),
-                        "SELL" => Some(OrderSide::Short),
-                        _ => None,
-                    },
-                    filled_size: Some(trade.qty),
-                    filled_value: Some(trade.value),
-                    filled_fee: Some(trade.fee),
-                })
-                .collect::<Vec<_>>();
-
-            let mut cache = self.filled_orders.write().await;
-            cache.insert(symbol.to_string(), orders.clone());
-            Ok(FilledOrdersResponse { orders })
         }
+
+        let orders = self.fetch_filled_orders_via_http(symbol).await?;
+        let mut cache = self.filled_orders.write().await;
+        cache.insert(symbol.to_string(), orders.clone());
+        Ok(FilledOrdersResponse { orders })
     }
 
     async fn get_canceled_orders(&self, symbol: &str) -> Result<CanceledOrdersResponse, DexError> {
@@ -1691,91 +1843,8 @@ impl DexConnector for ExtendedConnector {
         reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        let order_price = match price {
-            Some(price) => price,
-            None => {
-                let ticker = self.get_ticker(symbol, None).await?;
-                slippage_price(ticker.price, side == OrderSide::Long)
-            }
-        };
-
-        let expire_time = match expiry_secs {
-            Some(secs) => Utc::now() + Duration::seconds(secs as i64),
-            None => Utc::now() + Duration::hours(1),
-        };
-
-        let nonce = rand::random::<u32>() as u64;
-        let market = self.get_market(symbol).await?;
-        let rounded_size = Self::round_size_for_market(size, &market)?;
-        let rounded_price = Self::round_price_for_market(order_price, &market, side);
-        let side_str = match side {
-            OrderSide::Long => "BUY",
-            OrderSide::Short => "SELL",
-        };
-        if rounded_price <= Decimal::ZERO {
-            return Err(DexError::Other(format!(
-                "Rounded price {} is non-positive for {}",
-                rounded_price, market.name
-            )));
-        }
-        log::debug!(
-            "[create_order][extended] sym={} side={} raw_price={} rounded_price={} min_price_change={} limit_floor={} limit_cap={} raw_size={} rounded_size={}",
-            market.name,
-            side_str,
-            order_price,
-            rounded_price,
-            market.trading_config.min_price_change,
-            market.trading_config.limit_price_floor,
-            market.trading_config.limit_price_cap,
-            size,
-            rounded_size
-        );
-
-        let settlement = self.compute_settlement(
-            &market,
-            side_str,
-            rounded_size,
-            rounded_price,
-            expire_time,
-            nonce,
-        )?;
-
-        let order_id = settlement.order_hash.to_string();
-
-        let order = NewOrderModel {
-            id: order_id.clone(),
-            market: market.name.clone(),
-            order_type: "LIMIT".to_string(),
-            side: side_str.to_string(),
-            qty: rounded_size,
-            price: rounded_price,
-            reduce_only,
-            post_only: false,
-            time_in_force: "GTT".to_string(),
-            expiry_epoch_millis: Self::to_epoch_millis(expire_time),
-            fee: settlement.fee_rate,
-            self_trade_protection_level: "ACCOUNT".to_string(),
-            nonce: Decimal::from(nonce),
-            cancel_id: None,
-            settlement: settlement.settlement,
-            tp_sl_type: None,
-            take_profit: None,
-            stop_loss: None,
-            debugging_amounts: Some(settlement.debugging_amounts),
-            builder_fee: None,
-            builder_id: None,
-        };
-
-        let response: PlacedOrderModel = self
-            .api
-            .post("/user/order".to_string(), order, true)
-            .await?;
-
-        Ok(CreateOrderResponse {
-            order_id: response.external_id,
-            ordered_price: rounded_price,
-            ordered_size: rounded_size,
-        })
+        self.create_order_internal(symbol, size, side, price, reduce_only, expiry_secs, false)
+            .await
     }
 
     async fn create_advanced_trigger_order(
