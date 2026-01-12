@@ -1574,6 +1574,7 @@ impl LighterConnector {
 
             Ok(CreateOrderResponse {
                 order_id,
+                exchange_order_id: None,
                 ordered_price: i64::try_from(price)
                     .ok()
                     .map(|p| Decimal::new(p, price_decimals))
@@ -1771,6 +1772,7 @@ impl LighterConnector {
 
             Ok(CreateOrderResponse {
                 order_id,
+                exchange_order_id: None,
                 ordered_price: i64::try_from(price)
                     .ok()
                     .map(|p| Decimal::new(p, price_decimals))
@@ -1882,6 +1884,7 @@ impl LighterConnector {
 
             Ok(CreateOrderResponse {
                 order_id,
+                exchange_order_id: None,
                 ordered_price: i64::try_from(price)
                     .ok()
                     .map(|p| Decimal::new(p, price_decimals))

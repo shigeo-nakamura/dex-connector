@@ -128,6 +128,7 @@ pub struct CombinedBalanceResponse {
 #[derive(Deserialize, Debug, Default)]
 pub struct CreateOrderResponse {
     pub order_id: String,
+    pub exchange_order_id: Option<String>,
     pub ordered_price: Decimal,
     pub ordered_size: Decimal,
 }

@@ -1713,6 +1713,7 @@ impl ExtendedConnector {
 
         Ok(CreateOrderResponse {
             order_id: response.external_id,
+            exchange_order_id: Some(response.id.to_string()),
             ordered_price: rounded_price,
             ordered_size: rounded_size,
         })

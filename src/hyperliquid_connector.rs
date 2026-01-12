@@ -1793,6 +1793,7 @@ impl DexConnector for HyperliquidConnector {
 
         Ok(CreateOrderResponse {
             order_id: order_id.to_string(),
+            exchange_order_id: None,
             ordered_price: rounded_price,
             ordered_size: rounded_size,
         })
@@ -1969,6 +1970,7 @@ impl DexConnector for HyperliquidConnector {
 
         Ok(CreateOrderResponse {
             order_id,
+            exchange_order_id: None,
             ordered_price,
             ordered_size: rounded_size,
         })
