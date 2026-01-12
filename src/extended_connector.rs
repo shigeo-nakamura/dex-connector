@@ -956,6 +956,74 @@ impl ExtendedConnector {
         final_price
     }
 
+    fn round_price_for_market_aggressive(
+        price: Decimal,
+        market: &MarketModel,
+        side: OrderSide,
+    ) -> Decimal {
+        let tick = market.trading_config.min_price_change;
+        let raw_floor = market.trading_config.limit_price_floor;
+        let raw_cap = market.trading_config.limit_price_cap;
+        let idx = market.market_stats.index_price;
+
+        // Interpret floor/cap as % bands when <= 1.0, otherwise absolute prices.
+        let (floor_px, cap_px) = if raw_cap > Decimal::ZERO && raw_cap <= Decimal::ONE {
+            let floor_pct = if raw_floor > Decimal::ZERO {
+                raw_floor
+            } else {
+                Decimal::ZERO
+            };
+            let cap_pct = raw_cap;
+            (
+                if floor_pct > Decimal::ZERO {
+                    idx * (Decimal::ONE - floor_pct)
+                } else {
+                    Decimal::ZERO
+                },
+                idx * (Decimal::ONE + cap_pct),
+            )
+        } else {
+            (
+                if raw_floor > Decimal::ZERO {
+                    raw_floor
+                } else {
+                    Decimal::ZERO
+                },
+                if raw_cap > Decimal::ZERO {
+                    raw_cap
+                } else {
+                    Decimal::ZERO
+                },
+            )
+        };
+
+        let mut bounded = price;
+        if cap_px > Decimal::ZERO && bounded > cap_px {
+            bounded = cap_px;
+        }
+        if floor_px > Decimal::ZERO && bounded < floor_px {
+            bounded = floor_px;
+        }
+
+        let rounding = match side {
+            OrderSide::Long => RoundingStrategy::ToPositiveInfinity,
+            OrderSide::Short => RoundingStrategy::ToNegativeInfinity,
+        };
+        let mut rounded = Self::round_to_step(bounded, tick, rounding);
+        if floor_px > Decimal::ZERO && rounded < floor_px {
+            rounded = Self::round_to_step(floor_px, tick, RoundingStrategy::ToPositiveInfinity);
+        }
+        if cap_px > Decimal::ZERO && rounded > cap_px {
+            rounded = Self::round_to_step(cap_px, tick, RoundingStrategy::ToNegativeInfinity);
+        }
+
+        if tick > Decimal::ZERO && rounded < tick {
+            rounded = tick;
+        }
+
+        Self::clamp_positive_price(rounded, tick, floor_px)
+    }
+
     fn clamp_positive_price(price: Decimal, tick: Decimal, floor: Decimal) -> Decimal {
         if price > Decimal::ZERO {
             return price;
@@ -1937,14 +2005,35 @@ impl DexConnector for ExtendedConnector {
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
         if self.websocket_url.is_some() {
-            let cache = self.positions_cache.read().await;
-            if let Some(cached) = cache.clone() {
-                if !cached.is_empty() {
-                    return Ok(cached);
+            match self
+                .api
+                .get::<Vec<PositionModel>>("/user/positions".to_string(), true)
+                .await
+            {
+                Ok(positions) => {
+                    let mut out = Vec::new();
+                    for position in positions {
+                        if let Some(snapshot) = position_snapshot_from_model(position) {
+                            out.push(snapshot);
+                        }
+                    }
+                    let mut cache = self.positions_cache.write().await;
+                    *cache = Some(out.clone());
+                    return Ok(out);
                 }
-                log::debug!("[positions][extended] WS cache empty; falling back to REST");
-            } else {
-                log::debug!("[positions][extended] WS cache missing; falling back to REST");
+                Err(err) => {
+                    let cache = self.positions_cache.read().await;
+                    if let Some(cached) = cache.clone() {
+                        if !cached.is_empty() {
+                            log::warn!(
+                                "[positions][extended] REST fetch failed; using WS cache: {}",
+                                err
+                            );
+                            return Ok(cached);
+                        }
+                    }
+                    return Err(err);
+                }
             }
         }
 
@@ -1955,10 +2044,6 @@ impl DexConnector for ExtendedConnector {
             if let Some(snapshot) = position_snapshot_from_model(position) {
                 out.push(snapshot);
             }
-        }
-        if self.websocket_url.is_some() {
-            let mut cache = self.positions_cache.write().await;
-            *cache = Some(out.clone());
         }
         Ok(out)
     }
@@ -2167,16 +2252,36 @@ impl DexConnector for ExtendedConnector {
 
     async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
         let positions = if self.websocket_url.is_some() {
-            let cache = self.positions_cache.read().await;
-            if let Some(cached) = cache.clone() {
-                cached
-            } else {
-                let positions: Vec<PositionModel> =
-                    self.api.get("/user/positions".to_string(), true).await?;
-                positions
-                    .into_iter()
-                    .filter_map(position_snapshot_from_model)
-                    .collect::<Vec<_>>()
+            match self
+                .api
+                .get::<Vec<PositionModel>>("/user/positions".to_string(), true)
+                .await
+            {
+                Ok(positions) => {
+                    let snapshots = positions
+                        .into_iter()
+                        .filter_map(position_snapshot_from_model)
+                        .collect::<Vec<_>>();
+                    let mut cache = self.positions_cache.write().await;
+                    *cache = Some(snapshots.clone());
+                    snapshots
+                }
+                Err(err) => {
+                    let cache = self.positions_cache.read().await;
+                    if let Some(cached) = cache.clone() {
+                        if !cached.is_empty() {
+                            log::warn!(
+                                "[close_all_positions][extended] REST fetch failed; using WS cache: {}",
+                                err
+                            );
+                            cached
+                        } else {
+                            return Err(err);
+                        }
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
         } else {
             let positions: Vec<PositionModel> =
@@ -2198,7 +2303,6 @@ impl DexConnector for ExtendedConnector {
             } else {
                 OrderSide::Long
             };
-            let order_price = self.choose_base_price(&position.symbol, side, None).await?;
             let expire_time = Utc::now() + Duration::hours(1);
 
             let nonce = rand::random::<u32>() as u64;
@@ -2207,7 +2311,45 @@ impl DexConnector for ExtendedConnector {
                 OrderSide::Long => "BUY",
                 OrderSide::Short => "SELL",
             };
-            let rounded_price = Self::round_price_for_market(order_price, &market, side);
+            let tick = market.trading_config.min_price_change;
+            let mut base_price: Option<Decimal> = None;
+            if let Ok(ob) = self.get_order_book_rest(&position.symbol, 1).await {
+                base_price = match side {
+                    OrderSide::Long => ob.asks.first().map(|level| level.price),
+                    OrderSide::Short => ob.bids.first().map(|level| level.price),
+                };
+            }
+            if base_price.is_none() {
+                if let Ok(ob) = self.get_order_book(&position.symbol, 1).await {
+                    base_price = match side {
+                        OrderSide::Long => ob.asks.first().map(|level| level.price),
+                        OrderSide::Short => ob.bids.first().map(|level| level.price),
+                    };
+                }
+            }
+            let (mut order_price, used_market_stats) = if let Some(px) = base_price {
+                (px, false)
+            } else {
+                let stats_price = if market.market_stats.index_price > Decimal::ZERO {
+                    market.market_stats.index_price
+                } else {
+                    market.market_stats.last_price
+                };
+                (stats_price, true)
+            };
+            if used_market_stats {
+                order_price = slippage_price(order_price, side == OrderSide::Long);
+            } else if tick > Decimal::ZERO {
+                match side {
+                    OrderSide::Long => {
+                        order_price += tick;
+                    }
+                    OrderSide::Short => {
+                        order_price -= tick;
+                    }
+                }
+            }
+            let rounded_price = Self::round_price_for_market_aggressive(order_price, &market, side);
             let rounded_size = Self::round_size_for_market(position.size, &market)?;
 
             let settlement = self.compute_settlement(
