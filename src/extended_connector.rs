@@ -870,35 +870,57 @@ impl ExtendedConnector {
         let tick = market.trading_config.min_price_change;
         let raw_floor = market.trading_config.limit_price_floor;
         let raw_cap = market.trading_config.limit_price_cap;
+        let idx = market.market_stats.index_price;
 
-        // Some markets report tiny floor/cap (e.g., 0.05) which are clearly invalid for large-price assets.
-        // Treat floor/cap below or equal to one tick as “not set”.
-        let floor = if raw_floor > tick {
-            raw_floor
+        // Interpret floor/cap as % bands when <= 1.0, otherwise absolute prices.
+        let (floor_px, cap_px) = if raw_cap > Decimal::ZERO && raw_cap <= Decimal::ONE {
+            let floor_pct = if raw_floor > Decimal::ZERO {
+                raw_floor
+            } else {
+                Decimal::ZERO
+            };
+            let cap_pct = raw_cap;
+            (
+                if floor_pct > Decimal::ZERO {
+                    idx * (Decimal::ONE - floor_pct)
+                } else {
+                    Decimal::ZERO
+                },
+                idx * (Decimal::ONE + cap_pct),
+            )
         } else {
-            Decimal::ZERO
-        };
-        let cap = if raw_cap > tick {
-            raw_cap
-        } else {
-            Decimal::ZERO
+            (
+                if raw_floor > Decimal::ZERO {
+                    raw_floor
+                } else {
+                    Decimal::ZERO
+                },
+                if raw_cap > Decimal::ZERO {
+                    raw_cap
+                } else {
+                    Decimal::ZERO
+                },
+            )
         };
 
         log::debug!(
-            "[round_price_for_market] raw_price={} tick={} floor={} cap={} side={:?}",
+            "[round_price_for_market] raw_price={} tick={} floor_px={} cap_px={} raw_floor={} raw_cap={} idx={} side={:?}",
             price,
             tick,
-            floor,
-            cap,
+            floor_px,
+            cap_px,
+            raw_floor,
+            raw_cap,
+            idx,
             side
         );
 
         let mut bounded = price;
-        if cap > Decimal::ZERO && bounded > cap {
-            bounded = cap;
+        if cap_px > Decimal::ZERO && bounded > cap_px {
+            bounded = cap_px;
         }
-        if floor > Decimal::ZERO && bounded < floor {
-            bounded = floor;
+        if floor_px > Decimal::ZERO && bounded < floor_px {
+            bounded = floor_px;
         }
 
         let rounding = match side {
@@ -906,26 +928,26 @@ impl ExtendedConnector {
             OrderSide::Short => RoundingStrategy::ToPositiveInfinity,
         };
         let mut rounded = Self::round_to_step(bounded, tick, rounding);
-        if floor > Decimal::ZERO && rounded < floor {
-            rounded = Self::round_to_step(floor, tick, RoundingStrategy::ToPositiveInfinity);
+        if floor_px > Decimal::ZERO && rounded < floor_px {
+            rounded = Self::round_to_step(floor_px, tick, RoundingStrategy::ToPositiveInfinity);
         }
-        if cap > Decimal::ZERO && rounded > cap {
-            rounded = Self::round_to_step(cap, tick, RoundingStrategy::ToNegativeInfinity);
+        if cap_px > Decimal::ZERO && rounded > cap_px {
+            rounded = Self::round_to_step(cap_px, tick, RoundingStrategy::ToNegativeInfinity);
         }
 
         if tick > Decimal::ZERO && rounded < tick {
             rounded = tick;
         }
 
-        let final_price = Self::clamp_positive_price(rounded, tick, floor);
+        let final_price = Self::clamp_positive_price(rounded, tick, floor_px);
         log::debug!(
-            "[round_price_for_market] final_price={} bounded={} rounded={} tick={} floor={} cap={}",
+            "[round_price_for_market] final_price={} bounded={} rounded={} tick={} floor_px={} cap_px={}",
             final_price,
             bounded,
             rounded,
             tick,
-            floor,
-            cap
+            floor_px,
+            cap_px
         );
         final_price
     }
