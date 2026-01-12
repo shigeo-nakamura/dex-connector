@@ -2084,8 +2084,7 @@ impl DexConnector for ExtendedConnector {
             } else {
                 OrderSide::Long
             };
-            let ticker = self.get_ticker(&position.symbol, None).await?;
-            let order_price = slippage_price(ticker.price, side == OrderSide::Long);
+            let order_price = self.choose_base_price(&position.symbol, side, None).await?;
             let expire_time = Utc::now() + Duration::hours(1);
 
             let nonce = rand::random::<u32>() as u64;
@@ -2115,7 +2114,7 @@ impl DexConnector for ExtendedConnector {
                 price: rounded_price,
                 reduce_only: true,
                 post_only: false,
-                time_in_force: "GTT".to_string(),
+                time_in_force: "IOC".to_string(),
                 expiry_epoch_millis: Self::to_epoch_millis(expire_time),
                 fee: settlement.fee_rate,
                 self_trade_protection_level: "ACCOUNT".to_string(),
@@ -2129,6 +2128,14 @@ impl DexConnector for ExtendedConnector {
                 builder_fee: None,
                 builder_id: None,
             };
+
+            log::info!(
+                "[close_all_positions] {} side={} size={} price={} tif=IOC reduce_only=true",
+                position.symbol,
+                side_str,
+                rounded_size,
+                rounded_price
+            );
 
             if let Err(err) = self
                 .api
