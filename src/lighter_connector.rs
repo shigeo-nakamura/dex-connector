@@ -4413,12 +4413,29 @@ impl LighterConnector {
                 .await;
 
                 match connection_result {
-                    Ok((mut ws_stream, _)) => {
+                    Ok((mut ws_stream, response)) => {
+                        let headers = response.headers();
+                        let header_value = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("-")
+                        };
+                        log::info!(
+                            "WebSocket handshake ok: status={}, server={}, upgrade={}, connection={}, extensions={}",
+                            response.status(),
+                            header_value("server"),
+                            header_value("upgrade"),
+                            header_value("connection"),
+                            header_value("sec-websocket-extensions"),
+                        );
+                        log::debug!("WebSocket handshake headers: {:?}", headers);
+
                         // Increment connection epoch for race detection
                         let current_epoch = connection_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
                         // Extract connection information for logging
-                        let (local_addr, peer_addr) = match ws_stream.get_ref() {
+                        let (local_addr, peer_addr, stream_kind) = match ws_stream.get_ref() {
                             tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream) => {
                                 let tcp_stream = tls_stream.get_ref().0;
 
@@ -4428,13 +4445,40 @@ impl LighterConnector {
                                 }
 
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
-                                    (Ok(local), Ok(peer)) => (local, peer),
+                                    (Ok(local), Ok(peer)) => (local, peer, "rustls"),
                                     _ => {
                                         log::warn!(
                                             "Failed to get TLS socket addresses for epoch {}",
                                             current_epoch
                                         );
-                                        ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
+                                        (
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "rustls",
+                                        )
+                                    }
+                                }
+                            }
+                            tokio_tungstenite::MaybeTlsStream::NativeTls(tls_stream) => {
+                                let tcp_stream = tls_stream.get_ref().get_ref().get_ref();
+
+                                // Apply TCP optimizations for native TLS connection
+                                if let Err(e) = tcp_stream.set_nodelay(true) {
+                                    log::warn!("Failed to set TCP_NODELAY on native TLS: {}", e);
+                                }
+
+                                match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
+                                    (Ok(local), Ok(peer)) => (local, peer, "native-tls"),
+                                    _ => {
+                                        log::warn!(
+                                            "Failed to get native TLS socket addresses for epoch {}",
+                                            current_epoch
+                                        );
+                                        (
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "native-tls",
+                                        )
                                     }
                                 }
                             }
@@ -4443,13 +4487,17 @@ impl LighterConnector {
                                     log::warn!("Failed to set TCP_NODELAY on plain WS: {}", e);
                                 }
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
-                                    (Ok(local), Ok(peer)) => (local, peer),
+                                    (Ok(local), Ok(peer)) => (local, peer, "plain"),
                                     _ => {
                                         log::warn!(
                                             "Failed to get plain socket addresses for epoch {}",
                                             current_epoch
                                         );
-                                        ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
+                                        (
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "0.0.0.0:0".parse().unwrap(),
+                                            "plain",
+                                        )
                                     }
                                 }
                             }
@@ -4459,17 +4507,26 @@ impl LighterConnector {
                                     other,
                                     current_epoch
                                 );
-                                ("0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap())
+                                (
+                                    "0.0.0.0:0".parse().unwrap(),
+                                    "0.0.0.0:0".parse().unwrap(),
+                                    "unknown",
+                                )
                             }
                         };
 
                         let epoch_prefix = format!("[{:03}]", current_epoch);
+                        let conn_label = format!(
+                            "{} {} -> {} ({})",
+                            epoch_prefix, local_addr, peer_addr, stream_kind
+                        );
 
                         log::info!(
-                            "{} WebSocket connected successfully: {} -> {}",
+                            "{} WebSocket connected successfully: {} -> {} ({})",
                             epoch_prefix,
                             local_addr,
-                            peer_addr
+                            peer_addr,
+                            stream_kind
                         );
 
                         // Send subscription messages
@@ -4533,6 +4590,7 @@ impl LighterConnector {
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
                         let ws_writer_for_task = ws_writer_arc.clone();
+                        let writer_conn_label = conn_label.clone();
                         let _writer_task = tokio::spawn(async move {
                             loop {
                                 if !writer_is_running.load(Ordering::SeqCst) {
@@ -4552,7 +4610,11 @@ impl LighterConnector {
                                 // Use shared writer with short-lived lock
                                 let mut ws_write = ws_writer_for_task.lock().await;
                                 if let Err(e) = ws_write.send(msg.into_message()).await {
-                                    log::error!("WebSocket send failed: {:?}", e);
+                                    log::error!(
+                                        "WebSocket send failed: {:?} (conn={})",
+                                        e,
+                                        writer_conn_label
+                                    );
                                     break;
                                 }
 
@@ -4601,14 +4663,15 @@ impl LighterConnector {
 
                         // Create ping/heartbeat task with priority channel access
                         let ping_is_running = is_running.clone();
-                        let _ping_last_rx = last_rx.clone();
+                        let ping_last_rx = last_rx.clone();
                         let ping_last_tx = last_tx.clone();
                         let ping_last_app_ping = last_app_ping.clone();
-                        let _ping_last_server_ping = last_server_ping.clone();
+                        let ping_last_server_ping = last_server_ping.clone();
                         let ping_pending_client_ping = pending_client_ping.clone();
                         let ping_pending_app_pong = pending_app_pong.clone();
                         let ping_last_client_ping_payload = last_client_ping_payload.clone();
                         let ping_tx_ctrl = tx_ctrl.clone();
+                        let ping_conn_label = conn_label.clone();
 
                         let _ping_task = tokio::spawn(async move {
                             let mut heartbeat_interval = tokio::time::interval(
@@ -4641,18 +4704,29 @@ impl LighterConnector {
                                                 tokio_tungstenite::tungstenite::Message::Ping(payload.to_vec())
                                             );
                                             if let Err(e) = ping_tx_ctrl.send(ping_msg).await {
-                                                log::warn!("Failed to send client ping: {:?}", e);
+                                                log::warn!(
+                                                    "Failed to send client ping: {:?} (conn={})",
+                                                    e,
+                                                    ping_conn_label
+                                                );
                                                 break;
                                             }
 
                                             ping_pending_client_ping.store(true, Ordering::SeqCst);
                                             ping_last_tx.store(now, Ordering::SeqCst);
+                                            log::debug!(
+                                                "Sent client ping (conn={}, payload={:?})",
+                                                ping_conn_label,
+                                                payload
+                                            );
                                         }
 
 
                                         // Send application-layer ping (every 20s) for servers that require JSON ping-pong
                                         let idle_app_ping = now.saturating_sub(ping_last_app_ping.load(Ordering::SeqCst));
-                                        if !ping_pending_app_pong.load(Ordering::SeqCst) && idle_app_ping >= IDLE_PING_SECS {
+                                        if !ping_pending_app_pong.load(Ordering::SeqCst)
+                                            && idle_app_ping >= IDLE_PING_SECS
+                                        {
                                             // Send application-layer ping with timestamp
                                             let app_ping = serde_json::json!({
                                                 "type": "ping",
@@ -4663,19 +4737,47 @@ impl LighterConnector {
                                                 tokio_tungstenite::tungstenite::Message::Text(app_ping.to_string())
                                             );
                                             if let Err(e) = ping_tx_ctrl.send(ping_msg).await {
-                                                log::warn!("Failed to send application-layer ping: {:?}", e);
+                                                log::warn!(
+                                                    "Failed to send application-layer ping: {:?} (conn={})",
+                                                    e,
+                                                    ping_conn_label
+                                                );
                                                 break;
                                             }
 
                                             ping_pending_app_pong.store(true, Ordering::SeqCst);
                                             ping_last_app_ping.store(now, Ordering::SeqCst);
+                                            log::debug!(
+                                                "Sent application-layer ping (conn={}, ts={})",
+                                                ping_conn_label,
+                                                now
+                                            );
                                         }
 
                                         // Check for control frame pong timeout
                                         if ping_pending_client_ping.load(Ordering::SeqCst) {
                                             let waited = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
                                             if waited >= PONG_TIMEOUT_SECS {
-                                                log::warn!("Control pong timeout ({}s), reconnecting", waited);
+                                                let idle_rx =
+                                                    now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
+                                                let last_server_ping_at =
+                                                    ping_last_server_ping.load(Ordering::SeqCst);
+                                                let server_ping_age = if last_server_ping_at == 0 {
+                                                    "n/a".to_string()
+                                                } else {
+                                                    format!(
+                                                        "{}s",
+                                                        now.saturating_sub(last_server_ping_at)
+                                                    )
+                                                };
+                                                log::warn!(
+                                                    "Control pong timeout ({}s), reconnecting (conn={}, idle_rx={}s, idle_tx={}s, last_server_ping_age={})",
+                                                    waited,
+                                                    ping_conn_label,
+                                                    idle_rx,
+                                                    waited,
+                                                    server_ping_age
+                                                );
                                                 let close_msg = OutboundMessage::Control(
                                                     tokio_tungstenite::tungstenite::Message::Close(None)
                                                 );
@@ -4688,7 +4790,28 @@ impl LighterConnector {
                                         if ping_pending_app_pong.load(Ordering::SeqCst) {
                                             let waited = now.saturating_sub(ping_last_app_ping.load(Ordering::SeqCst));
                                             if waited >= PONG_TIMEOUT_SECS {
-                                                log::warn!("Application pong timeout ({}s), reconnecting", waited);
+                                                let idle_rx =
+                                                    now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
+                                                let last_server_ping_at =
+                                                    ping_last_server_ping.load(Ordering::SeqCst);
+                                                let server_ping_age = if last_server_ping_at == 0 {
+                                                    "n/a".to_string()
+                                                } else {
+                                                    format!(
+                                                        "{}s",
+                                                        now.saturating_sub(last_server_ping_at)
+                                                    )
+                                                };
+                                                log::warn!(
+                                                    "Application pong timeout ({}s), reconnecting (conn={}, idle_rx={}s, idle_tx={}s, last_server_ping_age={})",
+                                                    waited,
+                                                    ping_conn_label,
+                                                    idle_rx,
+                                                    now.saturating_sub(
+                                                        ping_last_tx.load(Ordering::SeqCst)
+                                                    ),
+                                                    server_ping_age
+                                                );
                                                 let close_msg = OutboundMessage::Control(
                                                     tokio_tungstenite::tungstenite::Message::Close(None)
                                                 );
@@ -4743,6 +4866,10 @@ impl LighterConnector {
                                                 parsed.get("type").and_then(|t| t.as_str())
                                             {
                                                 if msg_type == "ping" {
+                                                    log::debug!(
+                                                        "Received application-layer ping (conn={})",
+                                                        conn_label
+                                                    );
                                                     // Immediate application-layer pong response
                                                     let mut pong =
                                                         serde_json::json!({"type": "pong"});
@@ -4762,13 +4889,30 @@ impl LighterConnector {
                                                     if let Ok(mut ws_write) =
                                                         ws_writer_for_reader.try_lock()
                                                     {
-                                                        if let Err(e) = ws_write.send(
-                                                            tokio_tungstenite::tungstenite::Message::Text(pong.to_string())
-                                                        ).await {
-                                                            log::error!("Failed to send application-layer pong: {:?}", e);
+                                                        if let Err(e) = ws_write
+                                                            .send(
+                                                                tokio_tungstenite::tungstenite::Message::Text(
+                                                                    pong.to_string(),
+                                                                ),
+                                                            )
+                                                            .await
+                                                        {
+                                                            log::error!(
+                                                                "Failed to send application-layer pong: {:?} (conn={})",
+                                                                e,
+                                                                conn_label
+                                                            );
                                                         } else {
-                                                                        }
+                                                            log::debug!(
+                                                                "Sent application-layer pong (conn={})",
+                                                                conn_label
+                                                            );
+                                                        }
                                                     } else {
+                                                        log::warn!(
+                                                            "Failed to acquire ws_writer for application pong (conn={})",
+                                                            conn_label
+                                                        );
                                                     }
 
                                                     // Continue to next message (don't process ping as business data)
@@ -4776,6 +4920,10 @@ impl LighterConnector {
                                                 } else if msg_type == "pong" {
                                                     // Application-layer pong received - clear pending state
                                                     pending_app_pong.store(false, Ordering::SeqCst);
+                                                    log::debug!(
+                                                        "Received application-layer pong (conn={})",
+                                                        conn_label
+                                                    );
 
                                                     // Continue to next message (don't process pong as business data)
                                                     continue;
@@ -4819,6 +4967,11 @@ impl LighterConnector {
                                     }
                                     tokio_tungstenite::tungstenite::Message::Ping(payload) => {
                                         // Server ping -> immediate manual pong response
+                                        log::debug!(
+                                            "Received control ping: {} bytes (conn={})",
+                                            payload.len(),
+                                            conn_label
+                                        );
                                         let now = now_secs();
                                         last_server_ping.store(now, Ordering::SeqCst);
                                         last_rx.store(now, Ordering::SeqCst);
@@ -4839,13 +4992,21 @@ impl LighterConnector {
                                                 )
                                                 .await
                                             {
-                                                log::error!("🚨 [CRITICAL] Failed to send pong directly: {:?}", e);
+                                                log::error!(
+                                                    "🚨 [CRITICAL] Failed to send pong directly: {:?} (conn={})",
+                                                    e,
+                                                    conn_label
+                                                );
                                                 break;
                                             }
                                             if let Err(e) =
                                                 futures::SinkExt::flush(&mut *ws_write).await
                                             {
-                                                log::error!("🚨 [CRITICAL] Failed to flush after pong: {:?}", e);
+                                                log::error!(
+                                                    "🚨 [CRITICAL] Failed to flush after pong: {:?} (conn={})",
+                                                    e,
+                                                    conn_label
+                                                );
                                                 break;
                                             }
                                             last_tx.store(now, Ordering::SeqCst);
@@ -4873,14 +5034,24 @@ impl LighterConnector {
                                                     ws_writer_for_reader.try_lock()
                                                 {
                                                     if let Err(e) = ws_write.send(tokio_tungstenite::tungstenite::Message::Pong(pong_payload.clone())).await {
-                                                        log::error!("Failed to send pong on retry {}: {:?}", retry, e);
+                                                        log::error!(
+                                                            "Failed to send pong on retry {}: {:?} (conn={})",
+                                                            retry,
+                                                            e,
+                                                            conn_label
+                                                        );
                                                         break;
                                                     }
                                                     if let Err(e) =
                                                         futures::SinkExt::flush(&mut *ws_write)
                                                             .await
                                                     {
-                                                        log::error!("Failed to flush after pong retry {}: {:?}", retry, e);
+                                                        log::error!(
+                                                            "Failed to flush after pong retry {}: {:?} (conn={})",
+                                                            retry,
+                                                            e,
+                                                            conn_label
+                                                        );
                                                         break;
                                                     }
                                                     last_tx.store(now, Ordering::SeqCst);
@@ -4890,7 +5061,10 @@ impl LighterConnector {
                                                 }
                                             }
                                             if !pong_sent {
-                                                log::warn!("Pong timeout, closing connection");
+                                                log::warn!(
+                                                    "Pong timeout, closing connection (conn={})",
+                                                    conn_label
+                                                );
                                                 // Proactively close to trigger reconnect before server timeout
                                                 let mut ws_write =
                                                     ws_writer_for_reader.lock().await;
@@ -4910,11 +5084,41 @@ impl LighterConnector {
                                             && payload == expected_payload
                                         {
                                             pending_client_ping.store(false, Ordering::SeqCst);
+                                            log::debug!(
+                                                "Received control pong (conn={}, payload={:?})",
+                                                conn_label,
+                                                payload
+                                            );
+                                        } else if expected_payload.is_empty() {
+                                            log::debug!(
+                                                "Received unsolicited control pong (conn={}, payload={:?})",
+                                                conn_label,
+                                                payload
+                                            );
                                         } else {
+                                            log::warn!(
+                                                "Control pong payload mismatch (conn={}, expected={:?}, got={:?})",
+                                                conn_label,
+                                                expected_payload,
+                                                payload
+                                            );
                                         }
                                     }
                                     tokio_tungstenite::tungstenite::Message::Close(frame) => {
-                                        log::warn!("WebSocket close frame received: {:?}", frame);
+                                        let now = now_secs();
+                                        let idle_rx =
+                                            now.saturating_sub(last_rx.load(Ordering::SeqCst));
+                                        let idle_tx =
+                                            now.saturating_sub(last_tx.load(Ordering::SeqCst));
+                                        log::warn!(
+                                            "WebSocket close frame received: {:?} (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}, pending_app_pong={})",
+                                            frame,
+                                            conn_label,
+                                            idle_rx,
+                                            idle_tx,
+                                            pending_client_ping.load(Ordering::SeqCst),
+                                            pending_app_pong.load(Ordering::SeqCst)
+                                        );
                                         break;
                                     }
                                     tokio_tungstenite::tungstenite::Message::Binary(data) => {
@@ -4928,10 +5132,56 @@ impl LighterConnector {
                                     }
                                 },
                                 Err(e) => {
+                                    let now = now_secs();
+                                    let last_rx_at = last_rx.load(Ordering::SeqCst);
+                                    let last_tx_at = last_tx.load(Ordering::SeqCst);
+                                    let last_app_ping_at = last_app_ping.load(Ordering::SeqCst);
+                                    let last_server_ping_at =
+                                        last_server_ping.load(Ordering::SeqCst);
+                                    let server_ping_age = if last_server_ping_at == 0 {
+                                        "n/a".to_string()
+                                    } else {
+                                        format!("{}s", now.saturating_sub(last_server_ping_at))
+                                    };
                                     log::error!(
-                                        "WebSocket error: {} (type: {:?}). Will attempt reconnection.",
-                                        e, std::any::type_name_of_val(&e)
+                                        "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, last_app_ping_age={}s, last_server_ping_age={}, pending_client_ping={}, pending_app_pong={}). Will attempt reconnection.",
+                                        e,
+                                        std::any::type_name_of_val(&e),
+                                        conn_label,
+                                        now.saturating_sub(last_rx_at),
+                                        now.saturating_sub(last_tx_at),
+                                        now.saturating_sub(last_app_ping_at),
+                                        server_ping_age,
+                                        pending_client_ping.load(Ordering::SeqCst),
+                                        pending_app_pong.load(Ordering::SeqCst)
                                     );
+                                    match &e {
+                                        tokio_tungstenite::tungstenite::Error::Protocol(
+                                            protocol_err,
+                                        ) => {
+                                            log::error!(
+                                                "WebSocket protocol error detail: {:?} (conn={})",
+                                                protocol_err,
+                                                conn_label
+                                            );
+                                        }
+                                        tokio_tungstenite::tungstenite::Error::Io(io_err) => {
+                                            log::error!(
+                                                "WebSocket IO error detail: kind={:?}, error={} (conn={})",
+                                                io_err.kind(),
+                                                io_err,
+                                                conn_label
+                                            );
+                                        }
+                                        tokio_tungstenite::tungstenite::Error::Tls(tls_err) => {
+                                            log::error!(
+                                                "WebSocket TLS error detail: {:?} (conn={})",
+                                                tls_err,
+                                                conn_label
+                                            );
+                                        }
+                                        _ => {}
+                                    }
                                     break; // Break inner loop to attempt reconnection
                                 }
                             }

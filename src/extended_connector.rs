@@ -1833,9 +1833,14 @@ impl DexConnector for ExtendedConnector {
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
         if self.websocket_url.is_some() {
             let cache = self.positions_cache.read().await;
-            return cache.clone().ok_or_else(|| {
-                DexError::Other("positions unavailable: waiting for websocket data".to_string())
-            });
+            if let Some(cached) = cache.clone() {
+                if !cached.is_empty() {
+                    return Ok(cached);
+                }
+                log::warn!("[positions][extended] WS cache empty; falling back to REST");
+            } else {
+                log::warn!("[positions][extended] WS cache missing; falling back to REST");
+            }
         }
 
         let positions: Vec<PositionModel> =
@@ -1845,6 +1850,10 @@ impl DexConnector for ExtendedConnector {
             if let Some(snapshot) = position_snapshot_from_model(position) {
                 out.push(snapshot);
             }
+        }
+        if self.websocket_url.is_some() {
+            let mut cache = self.positions_cache.write().await;
+            *cache = Some(out.clone());
         }
         Ok(out)
     }
