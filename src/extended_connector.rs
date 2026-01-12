@@ -480,6 +480,7 @@ pub struct ExtendedConnector {
     order_book_cache: Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
     balance_cache: Arc<RwLock<Option<BalanceResponse>>>,
     open_orders_cache: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
+    order_id_map: Arc<RwLock<HashMap<i64, String>>>,
     filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
     last_trades: Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
@@ -543,6 +544,7 @@ impl ExtendedConnector {
             order_book_cache: Arc::new(RwLock::new(HashMap::new())),
             balance_cache: Arc::new(RwLock::new(None)),
             open_orders_cache: Arc::new(RwLock::new(HashMap::new())),
+            order_id_map: Arc::new(RwLock::new(HashMap::new())),
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             last_trades: Arc::new(RwLock::new(HashMap::new())),
@@ -618,6 +620,7 @@ impl ExtendedConnector {
             let api_key = self.api.api_key.clone();
             let balance_cache = Arc::clone(&self.balance_cache);
             let open_orders_cache = Arc::clone(&self.open_orders_cache);
+            let order_id_map = Arc::clone(&self.order_id_map);
             let filled_orders = Arc::clone(&self.filled_orders);
             let positions_cache = Arc::clone(&self.positions_cache);
             handles.push(tokio::spawn(async move {
@@ -627,6 +630,7 @@ impl ExtendedConnector {
                         &api_key,
                         &balance_cache,
                         &open_orders_cache,
+                        &order_id_map,
                         &filled_orders,
                         &positions_cache,
                     )
@@ -1254,6 +1258,7 @@ async fn stream_account(
     api_key: &str,
     balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
     open_orders_cache: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
+    order_id_map: &Arc<RwLock<HashMap<i64, String>>>,
     filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     positions_cache: &Arc<RwLock<Option<Vec<PositionSnapshot>>>>,
 ) -> Result<(), DexError> {
@@ -1310,6 +1315,12 @@ async fn stream_account(
             }
 
             if let Some(orders) = data.orders {
+                {
+                    let mut map = order_id_map.write().await;
+                    for order in orders.iter() {
+                        map.insert(order.id, order.external_id.clone());
+                    }
+                }
                 let mut cache = open_orders_cache.write().await;
                 cache.clear();
                 for order in orders {
@@ -1330,11 +1341,22 @@ async fn stream_account(
             }
 
             if let Some(trades) = data.trades {
+                let mut mapped_trades = Vec::new();
+                {
+                    let map = order_id_map.read().await;
+                    for trade in trades {
+                        let order_id = map
+                            .get(&trade.order_id)
+                            .cloned()
+                            .unwrap_or_else(|| trade.order_id.to_string());
+                        mapped_trades.push((trade, order_id));
+                    }
+                }
                 let mut cache = filled_orders.write().await;
-                for trade in trades {
+                for (trade, order_id) in mapped_trades {
                     let entry = cache.entry(trade.market.clone()).or_default();
                     entry.push(FilledOrder {
-                        order_id: trade.order_id.to_string(),
+                        order_id,
                         is_rejected: false,
                         trade_id: trade.id.to_string(),
                         filled_side: match trade.side.as_str() {
@@ -1479,20 +1501,48 @@ impl ExtendedConnector {
             vec![("market".to_string(), symbol.to_string())],
         );
         let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
+        let mut needs_history = false;
+        {
+            let map = self.order_id_map.read().await;
+            for trade in &trades {
+                if !map.contains_key(&trade.order_id) {
+                    needs_history = true;
+                    break;
+                }
+            }
+        }
+        if needs_history {
+            let history_path = build_query(
+                "/user/orders/history",
+                vec![("market".to_string(), symbol.to_string())],
+            );
+            let orders_history: Vec<OpenOrderModel> = self.api.get(history_path, true).await?;
+            let mut map = self.order_id_map.write().await;
+            for order in orders_history {
+                map.insert(order.id, order.external_id.clone());
+            }
+        }
+        let map = self.order_id_map.read().await;
         let orders = trades
             .into_iter()
-            .map(|trade| FilledOrder {
-                order_id: trade.order_id.to_string(),
-                is_rejected: false,
-                trade_id: trade.id.to_string(),
-                filled_side: match trade.side.as_str() {
-                    "BUY" => Some(OrderSide::Long),
-                    "SELL" => Some(OrderSide::Short),
-                    _ => None,
-                },
-                filled_size: Some(trade.qty),
-                filled_value: Some(trade.value),
-                filled_fee: Some(trade.fee),
+            .map(|trade| {
+                let order_id = map
+                    .get(&trade.order_id)
+                    .cloned()
+                    .unwrap_or_else(|| trade.order_id.to_string());
+                FilledOrder {
+                    order_id,
+                    is_rejected: false,
+                    trade_id: trade.id.to_string(),
+                    filled_side: match trade.side.as_str() {
+                        "BUY" => Some(OrderSide::Long),
+                        "SELL" => Some(OrderSide::Short),
+                        _ => None,
+                    },
+                    filled_size: Some(trade.qty),
+                    filled_value: Some(trade.value),
+                    filled_fee: Some(trade.fee),
+                }
             })
             .collect::<Vec<_>>();
         Ok(orders)
@@ -1799,6 +1849,12 @@ impl DexConnector for ExtendedConnector {
                 vec![("market".to_string(), symbol.to_string())],
             );
             let open_orders: Vec<OpenOrderModel> = self.api.get(path, true).await?;
+            {
+                let mut map = self.order_id_map.write().await;
+                for order in open_orders.iter() {
+                    map.insert(order.id, order.external_id.clone());
+                }
+            }
             open_orders
                 .into_iter()
                 .map(|order| OpenOrder {
