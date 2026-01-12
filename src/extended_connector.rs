@@ -1885,9 +1885,9 @@ impl DexConnector for ExtendedConnector {
                 if !cached.is_empty() {
                     return Ok(cached);
                 }
-                log::warn!("[positions][extended] WS cache empty; falling back to REST");
+                log::debug!("[positions][extended] WS cache empty; falling back to REST");
             } else {
-                log::warn!("[positions][extended] WS cache missing; falling back to REST");
+                log::debug!("[positions][extended] WS cache missing; falling back to REST");
             }
         }
 
