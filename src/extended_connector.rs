@@ -1391,6 +1391,34 @@ fn position_snapshot_from_model(position: PositionModel) -> Option<PositionSnaps
 }
 
 impl ExtendedConnector {
+    async fn get_order_book_rest(
+        &self,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<OrderBookSnapshot, DexError> {
+        let path = format!("/info/markets/{}/orderbook", symbol);
+        let snapshot: OrderbookUpdateModel = self.api.get(path, true).await?;
+        let bids = snapshot
+            .bid
+            .into_iter()
+            .take(depth)
+            .map(|level| OrderBookLevel {
+                price: level.price,
+                size: level.qty,
+            })
+            .collect::<Vec<_>>();
+        let asks = snapshot
+            .ask
+            .into_iter()
+            .take(depth)
+            .map(|level| OrderBookLevel {
+                price: level.price,
+                size: level.qty,
+            })
+            .collect::<Vec<_>>();
+        Ok(OrderBookSnapshot { bids, asks })
+    }
+
     async fn choose_base_price(
         &self,
         symbol: &str,
@@ -1417,9 +1445,29 @@ impl ExtendedConnector {
             }
         }
 
-        // Fall back to ticker mid with slippage bias
-        let ticker = self.get_ticker(symbol, None).await?;
-        Ok(slippage_price(ticker.price, side == OrderSide::Long))
+        if let Ok(ob) = self.get_order_book_rest(symbol, 1).await {
+            match side {
+                OrderSide::Long => {
+                    if let Some(level) = ob.asks.first() {
+                        return Ok(level.price);
+                    }
+                }
+                OrderSide::Short => {
+                    if let Some(level) = ob.bids.first() {
+                        return Ok(level.price);
+                    }
+                }
+            }
+        }
+
+        // Fall back to market stats when WS data isn't ready
+        let market = self.get_market(symbol).await?;
+        let base_price = if market.market_stats.index_price > Decimal::ZERO {
+            market.market_stats.index_price
+        } else {
+            market.market_stats.last_price
+        };
+        Ok(slippage_price(base_price, side == OrderSide::Long))
     }
 
     async fn fetch_filled_orders_via_http(
