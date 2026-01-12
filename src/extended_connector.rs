@@ -1348,6 +1348,7 @@ impl ExtendedConnector {
         refreshed: bool,
     ) -> Result<CreateOrderResponse, DexError> {
         let mut refreshed_once = refreshed;
+        let mut fallback_price: Option<Decimal> = None;
         loop {
             let market = if refreshed_once {
                 self.refresh_market(symbol).await?
@@ -1355,12 +1356,15 @@ impl ExtendedConnector {
                 self.get_market(symbol).await?
             };
 
-            let order_price = match price {
-                Some(price) => price,
-                None => {
-                    let ticker = self.get_ticker(symbol, None).await?;
-                    slippage_price(ticker.price, side == OrderSide::Long)
-                }
+            let order_price = match fallback_price {
+                Some(px) => px,
+                None => match price {
+                    Some(price) => price,
+                    None => {
+                        let ticker = self.get_ticker(symbol, None).await?;
+                        slippage_price(ticker.price, side == OrderSide::Long)
+                    }
+                },
             };
 
             match self
@@ -1377,11 +1381,44 @@ impl ExtendedConnector {
                 Ok(res) => return Ok(res),
                 Err(err) if !refreshed_once && Self::is_invalid_price_error(&err) => {
                     log::warn!(
-                        "[create_order][extended] Invalid price for {}; refreshing market data and retrying once",
-                        symbol
+                        "[create_order][extended] Invalid price for {}; refreshing market data and retrying once (raw_price={} min_tick={} floor={} cap={})",
+                        symbol,
+                        order_price,
+                        market.trading_config.min_price_change,
+                        market.trading_config.limit_price_floor,
+                        market.trading_config.limit_price_cap
                     );
                     refreshed_once = true;
                     continue;
+                }
+                Err(err) if fallback_price.is_none() && Self::is_invalid_price_error(&err) => {
+                    let ob = self.order_book_cache.read().await;
+                    let level_price = match side {
+                        OrderSide::Long => ob
+                            .get(symbol)
+                            .and_then(|snap| snap.asks.first())
+                            .map(|l| l.price),
+                        OrderSide::Short => ob
+                            .get(symbol)
+                            .and_then(|snap| snap.bids.first())
+                            .map(|l| l.price),
+                    };
+                    if let Some(px) = level_price {
+                        log::warn!(
+                            "[create_order][extended] Invalid price persisted; retrying with best level price {} for {}",
+                            px,
+                            symbol
+                        );
+                        fallback_price = Some(px);
+                        refreshed_once = true;
+                        continue;
+                    }
+
+                    log::warn!(
+                        "[create_order][extended] Invalid price persisted and no orderbook price available for {}; giving up",
+                        symbol
+                    );
+                    return Err(err);
                 }
                 Err(err) => return Err(err),
             }
