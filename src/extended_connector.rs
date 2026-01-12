@@ -16,7 +16,7 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use starknet::core::types::Felt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -486,6 +486,7 @@ pub struct ExtendedConnector {
     positions_cache: Arc<RwLock<Option<Vec<PositionSnapshot>>>>,
     ws_started: AtomicBool,
     ws_tasks: Mutex<Vec<JoinHandle<()>>>,
+    market_logged: Mutex<HashSet<String>>,
 }
 
 impl ExtendedConnector {
@@ -514,6 +515,21 @@ impl ExtendedConnector {
                 cache.insert(market.name.clone(), market);
             }
         }
+        {
+            let cache = market_cache.read().await;
+            let mut logged = HashSet::new();
+            for (name, m) in cache.iter() {
+                let tc = &m.trading_config;
+                log::info!(
+                    "[MARKET][init] {} tick={} floor={} cap={}",
+                    name,
+                    tc.min_price_change,
+                    tc.limit_price_floor,
+                    tc.limit_price_cap
+                );
+                logged.insert(name.clone());
+            }
+        }
 
         Ok(Self {
             api,
@@ -533,6 +549,7 @@ impl ExtendedConnector {
             positions_cache: Arc::new(RwLock::new(None)),
             ws_started: AtomicBool::new(false),
             ws_tasks: Mutex::new(Vec::new()),
+            market_logged: Mutex::new(HashSet::new()),
         })
     }
 
@@ -644,6 +661,19 @@ impl ExtendedConnector {
             .into_iter()
             .find(|m| m.name == symbol)
             .ok_or_else(|| DexError::Other(format!("Market not found: {}", symbol)))?;
+        {
+            let mut logged = self.market_logged.lock().await;
+            if logged.insert(symbol.to_string()) {
+                let tc = &market.trading_config;
+                log::info!(
+                    "[MARKET] {} tick={} floor={} cap={}",
+                    symbol,
+                    tc.min_price_change,
+                    tc.limit_price_floor,
+                    tc.limit_price_cap
+                );
+            }
+        }
 
         let mut cache = self.market_cache.write().await;
         cache.insert(symbol.to_string(), market.clone());
@@ -661,6 +691,15 @@ impl ExtendedConnector {
             .into_iter()
             .find(|m| m.name == symbol)
             .ok_or_else(|| DexError::Other(format!("Market not found: {}", symbol)))?;
+
+        let tc = &market.trading_config;
+        log::info!(
+            "[MARKET][refresh] {} tick={} floor={} cap={}",
+            symbol,
+            tc.min_price_change,
+            tc.limit_price_floor,
+            tc.limit_price_cap
+        );
 
         let mut cache = self.market_cache.write().await;
         cache.insert(symbol.to_string(), market.clone());
@@ -829,8 +868,21 @@ impl ExtendedConnector {
 
     fn round_price_for_market(price: Decimal, market: &MarketModel, side: OrderSide) -> Decimal {
         let tick = market.trading_config.min_price_change;
-        let floor = market.trading_config.limit_price_floor;
-        let cap = market.trading_config.limit_price_cap;
+        let raw_floor = market.trading_config.limit_price_floor;
+        let raw_cap = market.trading_config.limit_price_cap;
+
+        // Some markets report tiny floor/cap (e.g., 0.05) which are clearly invalid for large-price assets.
+        // Treat floor/cap below or equal to one tick as “not set”.
+        let floor = if raw_floor > tick {
+            raw_floor
+        } else {
+            Decimal::ZERO
+        };
+        let cap = if raw_cap > tick {
+            raw_cap
+        } else {
+            Decimal::ZERO
+        };
 
         log::debug!(
             "[round_price_for_market] raw_price={} tick={} floor={} cap={} side={:?}",
@@ -866,7 +918,15 @@ impl ExtendedConnector {
         }
 
         let final_price = Self::clamp_positive_price(rounded, tick, floor);
-        log::debug!("[round_price_for_market] final_price={}", final_price);
+        log::debug!(
+            "[round_price_for_market] final_price={} bounded={} rounded={} tick={} floor={} cap={}",
+            final_price,
+            bounded,
+            rounded,
+            tick,
+            floor,
+            cap
+        );
         final_price
     }
 
@@ -1477,15 +1537,16 @@ impl ExtendedConnector {
                 rounded_price, market.name
             )));
         }
+        let tc = &market.trading_config;
         log::debug!(
-            "[create_order][extended] sym={} side={} raw_price={} rounded_price={} min_price_change={} limit_floor={} limit_cap={} raw_size={} rounded_size={}",
+            "[create_order][extended] sym={} side={} raw_price={} rounded_price={} tick={} floor={} cap={} raw_size={} rounded_size={}",
             market.name,
             side_str,
             order_price,
             rounded_price,
-            market.trading_config.min_price_change,
-            market.trading_config.limit_price_floor,
-            market.trading_config.limit_price_cap,
+            tc.min_price_change,
+            tc.limit_price_floor,
+            tc.limit_price_cap,
             size,
             rounded_size
         );
