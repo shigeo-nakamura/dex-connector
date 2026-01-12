@@ -1309,6 +1309,37 @@ fn position_snapshot_from_model(position: PositionModel) -> Option<PositionSnaps
 }
 
 impl ExtendedConnector {
+    async fn choose_base_price(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        explicit_price: Option<Decimal>,
+    ) -> Result<Decimal, DexError> {
+        if let Some(px) = explicit_price {
+            return Ok(px);
+        }
+
+        // Prefer top of book to stay within current price band
+        if let Ok(ob) = self.get_order_book(symbol, 1).await {
+            match side {
+                OrderSide::Long => {
+                    if let Some(level) = ob.asks.first() {
+                        return Ok(level.price);
+                    }
+                }
+                OrderSide::Short => {
+                    if let Some(level) = ob.bids.first() {
+                        return Ok(level.price);
+                    }
+                }
+            }
+        }
+
+        // Fall back to ticker mid with slippage bias
+        let ticker = self.get_ticker(symbol, None).await?;
+        Ok(slippage_price(ticker.price, side == OrderSide::Long))
+    }
+
     async fn fetch_filled_orders_via_http(
         &self,
         symbol: &str,
@@ -1358,13 +1389,7 @@ impl ExtendedConnector {
 
             let order_price = match fallback_price {
                 Some(px) => px,
-                None => match price {
-                    Some(price) => price,
-                    None => {
-                        let ticker = self.get_ticker(symbol, None).await?;
-                        slippage_price(ticker.price, side == OrderSide::Long)
-                    }
-                },
+                None => self.choose_base_price(symbol, side, price).await?,
             };
 
             match self
