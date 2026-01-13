@@ -18,9 +18,10 @@ use serde_json::json;
 use starknet::core::types::Felt;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
+use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -35,6 +36,7 @@ const DOMAIN_REVISION: &str = "1";
 const MAINNET_CHAIN_ID: &str = "SN_MAIN";
 const TESTNET_CHAIN_ID: &str = "SN_SEPOLIA";
 const DEFAULT_ORDERBOOK_DEPTH: usize = 50;
+static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn default_taker_fee() -> Decimal {
     Decimal::new(5, 4)
@@ -1192,6 +1194,112 @@ struct AccountStreamData {
     positions: Option<Vec<PositionModel>>,
 }
 
+struct WsStreamState {
+    conn_id: u64,
+    started_at: Instant,
+    last_msg_at: Instant,
+    last_ping_at: Option<Instant>,
+    last_pong_at: Option<Instant>,
+    messages_seen: u64,
+}
+
+impl WsStreamState {
+    fn new(conn_id: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            conn_id,
+            started_at: now,
+            last_msg_at: now,
+            last_ping_at: None,
+            last_pong_at: None,
+            messages_seen: 0,
+        }
+    }
+
+    fn on_message(&mut self) {
+        self.messages_seen = self.messages_seen.saturating_add(1);
+        self.last_msg_at = Instant::now();
+    }
+
+    fn on_ping(&mut self) {
+        self.last_ping_at = Some(Instant::now());
+    }
+
+    fn on_pong(&mut self) {
+        self.last_pong_at = Some(Instant::now());
+    }
+
+    fn context(&self, stream: &str, symbol: Option<&str>, url: &str) -> String {
+        let now = Instant::now();
+        let age_secs = now.duration_since(self.started_at).as_secs();
+        let idle_secs = now.duration_since(self.last_msg_at).as_secs();
+        let last_ping_age = self.last_ping_at.map(|ts| now.duration_since(ts).as_secs());
+        let last_pong_age = self.last_pong_at.map(|ts| now.duration_since(ts).as_secs());
+        format!(
+            "stream={stream} symbol={} url={url} conn={} age={}s idle={}s messages={} last_ping_age={:?} last_pong_age={:?}",
+            symbol.unwrap_or("-"),
+            self.conn_id,
+            age_secs,
+            idle_secs,
+            self.messages_seen,
+            last_ping_age,
+            last_pong_age
+        )
+    }
+}
+
+fn next_ws_conn_id() -> u64 {
+    WS_CONN_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+fn log_ws_error_detail(
+    stream: &str,
+    symbol: Option<&str>,
+    conn_id: u64,
+    err: &tokio_tungstenite::tungstenite::Error,
+) {
+    let symbol = symbol.unwrap_or("-");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Protocol(protocol_err) => {
+            log::debug!(
+                "WebSocket protocol error detail: {:?} (stream={}, symbol={}, conn={})",
+                protocol_err,
+                stream,
+                symbol,
+                conn_id
+            );
+        }
+        tokio_tungstenite::tungstenite::Error::Io(io_err) => {
+            log::debug!(
+                "WebSocket IO error detail: kind={:?}, error={} (stream={}, symbol={}, conn={})",
+                io_err.kind(),
+                io_err,
+                stream,
+                symbol,
+                conn_id
+            );
+        }
+        tokio_tungstenite::tungstenite::Error::Tls(tls_err) => {
+            log::debug!(
+                "WebSocket TLS error detail: {:?} (stream={}, symbol={}, conn={})",
+                tls_err,
+                stream,
+                symbol,
+                conn_id
+            );
+        }
+        _ => {
+            log::debug!(
+                "WebSocket error detail: {:?} (stream={}, symbol={}, conn={})",
+                err,
+                stream,
+                symbol,
+                conn_id
+            );
+        }
+    }
+}
+
 async fn connect_ws(
     url: &str,
     api_key: Option<&str>,
@@ -1224,18 +1332,62 @@ async fn stream_orderbooks(
     symbol: &str,
     order_book_cache: &Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
 ) -> Result<(), DexError> {
-    let mut ws = connect_ws(url, None).await?;
+    let conn_id = next_ws_conn_id();
+    let mut ws = match connect_ws(url, None).await {
+        Ok(ws) => ws,
+        Err(err) => {
+            return Err(DexError::Other(format!(
+                "ws connect error: {err} (stream=orderbook symbol={symbol} url={url} conn={conn_id})"
+            )));
+        }
+    };
+    let mut ws_state = WsStreamState::new(conn_id);
+    log::debug!(
+        "WebSocket connected ({})",
+        ws_state.context("orderbook", Some(symbol), url)
+    );
     while let Some(message) = ws.next().await {
-        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        let message = match message {
+            Ok(message) => {
+                ws_state.on_message();
+                message
+            }
+            Err(err) => {
+                log_ws_error_detail("orderbook", Some(symbol), ws_state.conn_id, &err);
+                return Err(DexError::Other(format!(
+                    "ws error: {err} ({})",
+                    ws_state.context("orderbook", Some(symbol), url)
+                )));
+            }
+        };
         match message {
             tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                ws_state.on_ping();
+                if let Err(err) = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
                     .await
-                    .map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+                {
+                    log_ws_error_detail("orderbook", Some(symbol), ws_state.conn_id, &err);
+                    return Err(DexError::Other(format!(
+                        "ws error: {err} ({})",
+                        ws_state.context("orderbook", Some(symbol), url)
+                    )));
+                }
+                ws_state.on_pong();
                 continue;
             }
-            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
-            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            tokio_tungstenite::tungstenite::Message::Pong(_) => {
+                ws_state.on_pong();
+                continue;
+            }
+            tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                log::debug!(
+                    "WebSocket close frame received: {:?} ({})",
+                    frame,
+                    ws_state.context("orderbook", Some(symbol), url)
+                );
+                break;
+            }
             _ => {}
         }
         if !message.is_text() {
@@ -1267,6 +1419,10 @@ async fn stream_orderbooks(
             cache.insert(symbol.to_string(), OrderBookSnapshot { bids, asks });
         }
     }
+    log::debug!(
+        "WebSocket stream ended ({})",
+        ws_state.context("orderbook", Some(symbol), url)
+    );
     Ok(())
 }
 
@@ -1275,18 +1431,62 @@ async fn stream_trades(
     symbol: &str,
     last_trades: &Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
 ) -> Result<(), DexError> {
-    let mut ws = connect_ws(url, None).await?;
+    let conn_id = next_ws_conn_id();
+    let mut ws = match connect_ws(url, None).await {
+        Ok(ws) => ws,
+        Err(err) => {
+            return Err(DexError::Other(format!(
+                "ws connect error: {err} (stream=trades symbol={symbol} url={url} conn={conn_id})"
+            )));
+        }
+    };
+    let mut ws_state = WsStreamState::new(conn_id);
+    log::debug!(
+        "WebSocket connected ({})",
+        ws_state.context("trades", Some(symbol), url)
+    );
     while let Some(message) = ws.next().await {
-        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        let message = match message {
+            Ok(message) => {
+                ws_state.on_message();
+                message
+            }
+            Err(err) => {
+                log_ws_error_detail("trades", Some(symbol), ws_state.conn_id, &err);
+                return Err(DexError::Other(format!(
+                    "ws error: {err} ({})",
+                    ws_state.context("trades", Some(symbol), url)
+                )));
+            }
+        };
         match message {
             tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                ws_state.on_ping();
+                if let Err(err) = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
                     .await
-                    .map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+                {
+                    log_ws_error_detail("trades", Some(symbol), ws_state.conn_id, &err);
+                    return Err(DexError::Other(format!(
+                        "ws error: {err} ({})",
+                        ws_state.context("trades", Some(symbol), url)
+                    )));
+                }
+                ws_state.on_pong();
                 continue;
             }
-            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
-            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            tokio_tungstenite::tungstenite::Message::Pong(_) => {
+                ws_state.on_pong();
+                continue;
+            }
+            tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                log::debug!(
+                    "WebSocket close frame received: {:?} ({})",
+                    frame,
+                    ws_state.context("trades", Some(symbol), url)
+                );
+                break;
+            }
             _ => {}
         }
         if !message.is_text() {
@@ -1318,6 +1518,10 @@ async fn stream_trades(
             }
         }
     }
+    log::debug!(
+        "WebSocket stream ended ({})",
+        ws_state.context("trades", Some(symbol), url)
+    );
     Ok(())
 }
 
@@ -1330,27 +1534,66 @@ async fn stream_account(
     filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     positions_cache: &Arc<RwLock<Option<Vec<PositionSnapshot>>>>,
 ) -> Result<(), DexError> {
+    let conn_id = next_ws_conn_id();
     let mut ws = match connect_ws(url, Some(api_key)).await {
         Ok(ws) => ws,
         Err(err) => {
             if err.to_string().contains("401 Unauthorized") {
                 return Err(DexError::ApiKeyRegistrationRequired);
             }
-            return Err(err);
+            return Err(DexError::Other(format!(
+                "ws connect error: {err} (stream=account url={url} conn={conn_id})"
+            )));
         }
     };
+    let mut ws_state = WsStreamState::new(conn_id);
+    log::debug!(
+        "WebSocket connected ({})",
+        ws_state.context("account", None, url)
+    );
     let mut logged_once = false;
     while let Some(message) = ws.next().await {
-        let message = message.map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+        let message = match message {
+            Ok(message) => {
+                ws_state.on_message();
+                message
+            }
+            Err(err) => {
+                log_ws_error_detail("account", None, ws_state.conn_id, &err);
+                return Err(DexError::Other(format!(
+                    "ws error: {err} ({})",
+                    ws_state.context("account", None, url)
+                )));
+            }
+        };
         match message {
             tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                ws_state.on_ping();
+                if let Err(err) = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
                     .await
-                    .map_err(|e| DexError::Other(format!("ws error: {e}")))?;
+                {
+                    log_ws_error_detail("account", None, ws_state.conn_id, &err);
+                    return Err(DexError::Other(format!(
+                        "ws error: {err} ({})",
+                        ws_state.context("account", None, url)
+                    )));
+                }
+                ws_state.on_pong();
                 continue;
             }
-            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
-            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            tokio_tungstenite::tungstenite::Message::Pong(_) => {
+                ws_state.on_pong();
+                continue;
+            }
+            tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                log::debug!(
+                    "WebSocket close frame received: {:?} ({})",
+                    frame,
+                    ws_state.context("account", None, url)
+                );
+                break;
+            }
             _ => {}
         }
         if !message.is_text() {
@@ -1451,6 +1694,10 @@ async fn stream_account(
             }
         }
     }
+    log::debug!(
+        "WebSocket stream ended ({})",
+        ws_state.context("account", None, url)
+    );
     Ok(())
 }
 
