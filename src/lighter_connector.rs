@@ -280,7 +280,7 @@ pub struct LighterConnector {
     api_private_key_hex: String, // API private key for signing (40-byte)
     #[cfg(feature = "lighter-sdk")]
     evm_wallet_private_key: Option<String>, // EVM wallet private key for API key registration
-    account_index: u32,          // account_index query param
+    account_index: u64,          // account_index query param
     base_url: String,
     websocket_url: String,
     _l1_address: String, // derived from wallet for logging purposes
@@ -449,7 +449,7 @@ struct LighterNonceResponse {
 struct ApiKeyInfo {
     #[serde(rename = "account_index")]
     #[allow(dead_code)]
-    account_index: u32,
+    account_index: u64,
     #[serde(rename = "api_key_index")]
     #[allow(dead_code)]
     api_key_index: u32,
@@ -1228,7 +1228,7 @@ impl LighterConnector {
         api_key_index: u32,
         api_private_key_hex: String,
         evm_wallet_private_key: Option<String>,
-        account_index: u32,
+        account_index: u64,
         base_url: String,
         websocket_url: String,
         tracked_symbols: Vec<String>,
@@ -1288,7 +1288,7 @@ impl LighterConnector {
         api_key_index: u32,
         api_private_key_hex: String,
         _evm_wallet_private_key: Option<String>,
-        account_index: u32,
+        account_index: u64,
         base_url: String,
         websocket_url: String,
         tracked_symbols: Vec<String>,
@@ -1980,7 +1980,7 @@ impl LighterConnector {
     }
 
     #[allow(dead_code)]
-    async fn discover_account_index(&self) -> Result<u32, DexError> {
+    async fn discover_account_index(&self) -> Result<u64, DexError> {
         // For now, just return the configured account_index
         // In production, this could query the API to find the correct index
         Ok(self.account_index)
@@ -5229,7 +5229,7 @@ impl LighterConnector {
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
-        account_index: u32,
+        account_index: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
     ) {
@@ -5800,7 +5800,7 @@ pub fn create_lighter_connector(
     api_key_index: u32,
     api_private_key_hex: String,
     evm_wallet_private_key: Option<String>,
-    account_index: u32,
+    account_index: u64,
     base_url: String,
     websocket_url: String,
     tracked_symbols: Vec<String>,
@@ -5863,7 +5863,7 @@ mod tests {
 
         let account_index = env::var("LIGHTER_ACCOUNT_INDEX")
             .unwrap_or_else(|_| "0".to_string())
-            .parse::<u32>()
+            .parse::<u64>()
             .unwrap_or(0);
 
         // Create connector using the proper constructor
