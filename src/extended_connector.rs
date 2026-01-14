@@ -21,7 +21,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -36,6 +36,7 @@ const DOMAIN_REVISION: &str = "1";
 const MAINNET_CHAIN_ID: &str = "SN_MAIN";
 const TESTNET_CHAIN_ID: &str = "SN_SEPOLIA";
 const DEFAULT_ORDERBOOK_DEPTH: usize = 50;
+const ORDERBOOK_STALE_AFTER: StdDuration = StdDuration::from_secs(5);
 static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn default_taker_fee() -> Decimal {
@@ -479,7 +480,7 @@ pub struct ExtendedConnector {
     websocket_url: Option<String>,
     tracked_symbols: Vec<String>,
     market_cache: Arc<RwLock<HashMap<String, MarketModel>>>,
-    order_book_cache: Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
+    order_book_cache: Arc<RwLock<HashMap<String, OrderBookCacheEntry>>>,
     balance_cache: Arc<RwLock<Option<BalanceResponse>>>,
     open_orders_cache: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
     order_id_map: Arc<RwLock<HashMap<i64, String>>>,
@@ -490,6 +491,12 @@ pub struct ExtendedConnector {
     ws_started: AtomicBool,
     ws_tasks: Mutex<Vec<JoinHandle<()>>>,
     market_logged: Mutex<HashSet<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct OrderBookCacheEntry {
+    snapshot: OrderBookSnapshot,
+    updated_at: Instant,
 }
 
 impl ExtendedConnector {
@@ -574,6 +581,28 @@ impl ExtendedConnector {
         let base = self.websocket_url.as_ref()?;
         let base = base.trim_end_matches('/');
         Some(format!("{base}{path}"))
+    }
+
+    async fn get_cached_order_book(&self, symbol: &str, depth: usize) -> Option<OrderBookSnapshot> {
+        let (snapshot, updated_at) = {
+            let cache = self.order_book_cache.read().await;
+            let entry = cache.get(symbol)?;
+            (entry.snapshot.clone(), entry.updated_at)
+        };
+        let age = updated_at.elapsed();
+        if age > ORDERBOOK_STALE_AFTER {
+            let mut cache = self.order_book_cache.write().await;
+            if let Some(entry) = cache.get(symbol) {
+                if entry.updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
+                    cache.remove(symbol);
+                }
+            }
+            log::debug!("orderbook {} stale (age={}ms)", symbol, age.as_millis());
+            return None;
+        }
+        let bids = snapshot.bids.into_iter().take(depth).collect();
+        let asks = snapshot.asks.into_iter().take(depth).collect();
+        Some(OrderBookSnapshot { bids, asks })
     }
 
     async fn spawn_ws_tasks(&self) {
@@ -1330,12 +1359,14 @@ async fn connect_ws(
 async fn stream_orderbooks(
     url: &str,
     symbol: &str,
-    order_book_cache: &Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
+    order_book_cache: &Arc<RwLock<HashMap<String, OrderBookCacheEntry>>>,
 ) -> Result<(), DexError> {
     let conn_id = next_ws_conn_id();
     let mut ws = match connect_ws(url, None).await {
         Ok(ws) => ws,
         Err(err) => {
+            let mut cache = order_book_cache.write().await;
+            cache.remove(symbol);
             return Err(DexError::Other(format!(
                 "ws connect error: {err} (stream=orderbook symbol={symbol} url={url} conn={conn_id})"
             )));
@@ -1346,19 +1377,20 @@ async fn stream_orderbooks(
         "WebSocket connected ({})",
         ws_state.context("orderbook", Some(symbol), url)
     );
-    while let Some(message) = ws.next().await {
-        let message = match message {
-            Ok(message) => {
+    let result = loop {
+        let message = match ws.next().await {
+            Some(Ok(message)) => {
                 ws_state.on_message();
                 message
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 log_ws_error_detail("orderbook", Some(symbol), ws_state.conn_id, &err);
-                return Err(DexError::Other(format!(
+                break Err(DexError::Other(format!(
                     "ws error: {err} ({})",
                     ws_state.context("orderbook", Some(symbol), url)
                 )));
             }
+            None => break Ok(()),
         };
         match message {
             tokio_tungstenite::tungstenite::Message::Ping(payload) => {
@@ -1368,7 +1400,7 @@ async fn stream_orderbooks(
                     .await
                 {
                     log_ws_error_detail("orderbook", Some(symbol), ws_state.conn_id, &err);
-                    return Err(DexError::Other(format!(
+                    break Err(DexError::Other(format!(
                         "ws error: {err} ({})",
                         ws_state.context("orderbook", Some(symbol), url)
                     )));
@@ -1386,7 +1418,7 @@ async fn stream_orderbooks(
                     frame,
                     ws_state.context("orderbook", Some(symbol), url)
                 );
-                break;
+                break Ok(());
             }
             _ => {}
         }
@@ -1394,8 +1426,10 @@ async fn stream_orderbooks(
             continue;
         }
         let payload: WrappedStreamResponse<StreamOrderbookUpdate> =
-            serde_json::from_str(message.to_text().unwrap_or(""))
-                .map_err(|e| DexError::Other(format!("orderbook parse error: {e}")))?;
+            match serde_json::from_str(message.to_text().unwrap_or("")) {
+                Ok(payload) => payload,
+                Err(err) => break Err(DexError::Other(format!("orderbook parse error: {err}"))),
+            };
         if let Some(update) = payload.data {
             let bids = update
                 .bid
@@ -1416,14 +1450,22 @@ async fn stream_orderbooks(
                 })
                 .collect::<Vec<_>>();
             let mut cache = order_book_cache.write().await;
-            cache.insert(symbol.to_string(), OrderBookSnapshot { bids, asks });
+            cache.insert(
+                symbol.to_string(),
+                OrderBookCacheEntry {
+                    snapshot: OrderBookSnapshot { bids, asks },
+                    updated_at: Instant::now(),
+                },
+            );
         }
-    }
+    };
     log::debug!(
         "WebSocket stream ended ({})",
         ws_state.context("orderbook", Some(symbol), url)
     );
-    Ok(())
+    let mut cache = order_book_cache.write().await;
+    cache.remove(symbol);
+    result
 }
 
 async fn stream_trades(
@@ -1912,17 +1954,13 @@ impl ExtendedConnector {
                     continue;
                 }
                 Err(err) if fallback_price.is_none() && Self::is_invalid_price_error(&err) => {
-                    let ob = self.order_book_cache.read().await;
-                    let level_price = match side {
-                        OrderSide::Long => ob
-                            .get(symbol)
-                            .and_then(|snap| snap.asks.first())
-                            .map(|l| l.price),
-                        OrderSide::Short => ob
-                            .get(symbol)
-                            .and_then(|snap| snap.bids.first())
-                            .map(|l| l.price),
-                    };
+                    let level_price =
+                        self.get_cached_order_book(symbol, 1)
+                            .await
+                            .and_then(|snap| match side {
+                                OrderSide::Long => snap.asks.first().map(|l| l.price),
+                                OrderSide::Short => snap.bids.first().map(|l| l.price),
+                            });
                     if let Some(px) = level_price {
                         log::warn!(
                             "[create_order][extended] Invalid price persisted; retrying with best level price {} for {}",
@@ -2078,8 +2116,7 @@ impl DexConnector for ExtendedConnector {
             if let Some(items) = trades.get(symbol).and_then(|v| v.last()) {
                 items.price
             } else {
-                let orderbooks = self.order_book_cache.read().await;
-                if let Some(snapshot) = orderbooks.get(symbol) {
+                if let Some(snapshot) = self.get_cached_order_book(symbol, 1).await {
                     let bid = snapshot.bids.first().map(|v| v.price);
                     let ask = snapshot.asks.first().map(|v| v.price);
                     match (bid, ask) {
@@ -2335,16 +2372,13 @@ impl DexConnector for ExtendedConnector {
         depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
         if self.websocket_url.is_some() {
-            let cache = self.order_book_cache.read().await;
-            if let Some(snapshot) = cache.get(symbol) {
-                let bids = snapshot.bids.iter().take(depth).cloned().collect();
-                let asks = snapshot.asks.iter().take(depth).cloned().collect();
-                Ok(OrderBookSnapshot { bids, asks })
-            } else {
-                Err(DexError::Other(
-                    "order book unavailable: waiting for websocket data".to_string(),
-                ))
-            }
+            self.get_cached_order_book(symbol, depth)
+                .await
+                .ok_or_else(|| {
+                    DexError::Other(
+                        "order book unavailable: waiting for websocket data".to_string(),
+                    )
+                })
         } else {
             let path = format!("/info/markets/{}/orderbook", symbol);
             let snapshot: OrderbookUpdateModel = self.api.get(path, true).await?;
@@ -2565,14 +2599,6 @@ impl DexConnector for ExtendedConnector {
                     OrderSide::Long => ob.asks.first().map(|level| level.price),
                     OrderSide::Short => ob.bids.first().map(|level| level.price),
                 };
-            }
-            if base_price.is_none() {
-                if let Ok(ob) = self.get_order_book(&position.symbol, 1).await {
-                    base_price = match side {
-                        OrderSide::Long => ob.asks.first().map(|level| level.price),
-                        OrderSide::Short => ob.bids.first().map(|level| level.price),
-                    };
-                }
             }
             let (mut order_price, used_market_stats) = if let Some(px) = base_price {
                 (px, false)

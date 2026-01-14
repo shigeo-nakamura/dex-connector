@@ -21,6 +21,7 @@ const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
 const LIGHTER_ANNOUNCEMENT_ENDPOINT: &str = "/api/v1/announcement";
 const MAINTENANCE_CACHE_TTL_MINS: i64 = 10;
+const ORDERBOOK_STALE_AFTER: Duration = Duration::from_secs(5);
 
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
@@ -297,7 +298,7 @@ pub struct LighterConnector {
     // WebSocket data storage
     current_price: Arc<RwLock<HashMap<String, (Decimal, u64)>>>, // symbol -> (price, timestamp)
     current_volume: Arc<RwLock<Option<Decimal>>>,
-    order_book: Arc<RwLock<Option<LighterOrderBook>>>,
+    order_book: Arc<RwLock<Option<LighterOrderBookCacheEntry>>>,
     maintenance: Arc<RwLock<MaintenanceInfo>>,
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
@@ -326,6 +327,12 @@ struct NonceCache {
 struct LighterOrderBook {
     bids: Vec<LighterOrderBookEntry>,
     asks: Vec<LighterOrderBookEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct LighterOrderBookCacheEntry {
+    order_book: LighterOrderBook,
+    updated_at: Instant,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -3143,32 +3150,46 @@ impl DexConnector for LighterConnector {
         _symbol: &str,
         depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
-        let ob_guard = self.order_book.read().await;
-        if let Some(ob) = ob_guard.as_ref() {
-            let mut bids = Vec::new();
-            let mut asks = Vec::new();
-            for entry in ob.bids.iter().take(depth) {
-                if let (Ok(price), Ok(size)) = (
-                    string_to_decimal(Some(entry.price.clone())),
-                    string_to_decimal(Some(entry.size.clone())),
-                ) {
-                    bids.push(OrderBookLevel { price, size });
+        let (ob, updated_at) = {
+            let ob_guard = self.order_book.read().await;
+            if let Some(entry) = ob_guard.as_ref() {
+                (entry.order_book.clone(), entry.updated_at)
+            } else {
+                return Err(DexError::Other(
+                    "order book snapshot unavailable (no recent update)".to_string(),
+                ));
+            }
+        };
+        if updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
+            let mut ob_guard = self.order_book.write().await;
+            if let Some(entry) = ob_guard.as_ref() {
+                if entry.updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
+                    ob_guard.take();
                 }
             }
-            for entry in ob.asks.iter().take(depth) {
-                if let (Ok(price), Ok(size)) = (
-                    string_to_decimal(Some(entry.price.clone())),
-                    string_to_decimal(Some(entry.size.clone())),
-                ) {
-                    asks.push(OrderBookLevel { price, size });
-                }
-            }
-            return Ok(OrderBookSnapshot { bids, asks });
+            return Err(DexError::Other(
+                "order book snapshot unavailable (no recent update)".to_string(),
+            ));
         }
-
-        Err(DexError::Other(
-            "order book snapshot unavailable (no recent update)".to_string(),
-        ))
+        let mut bids = Vec::new();
+        let mut asks = Vec::new();
+        for entry in ob.bids.iter().take(depth) {
+            if let (Ok(price), Ok(size)) = (
+                string_to_decimal(Some(entry.price.clone())),
+                string_to_decimal(Some(entry.size.clone())),
+            ) {
+                bids.push(OrderBookLevel { price, size });
+            }
+        }
+        for entry in ob.asks.iter().take(depth) {
+            if let (Ok(price), Ok(size)) = (
+                string_to_decimal(Some(entry.price.clone())),
+                string_to_decimal(Some(entry.size.clone())),
+            ) {
+                asks.push(OrderBookLevel { price, size });
+            }
+        }
+        Ok(OrderBookSnapshot { bids, asks })
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
@@ -5190,6 +5211,17 @@ impl LighterConnector {
                             }
                         }
 
+                        {
+                            let mut ob_guard = order_book.write().await;
+                            if ob_guard.is_some() {
+                                ob_guard.take();
+                                log::debug!(
+                                    "Cleared order book cache after websocket disconnect (conn={})",
+                                    conn_label
+                                );
+                            }
+                        }
+
                         reconnect_attempt += 1;
                     }
                     Err(e) => {
@@ -5222,7 +5254,7 @@ impl LighterConnector {
         message: Value,
         current_price: &Arc<RwLock<HashMap<String, (Decimal, u64)>>>,
         current_volume: &Arc<RwLock<Option<Decimal>>>,
-        order_book: &Arc<RwLock<Option<LighterOrderBook>>>,
+        order_book: &Arc<RwLock<Option<LighterOrderBookCacheEntry>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
@@ -5296,7 +5328,10 @@ impl LighterConnector {
                             .sum();
                         *current_volume.write().await = Some(total_volume);
 
-                        *order_book.write().await = Some(ob);
+                        *order_book.write().await = Some(LighterOrderBookCacheEntry {
+                            order_book: ob,
+                            updated_at: Instant::now(),
+                        });
                     }
                 }
             }
