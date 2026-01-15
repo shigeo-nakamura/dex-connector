@@ -37,6 +37,7 @@ const MAINNET_CHAIN_ID: &str = "SN_MAIN";
 const TESTNET_CHAIN_ID: &str = "SN_SEPOLIA";
 const DEFAULT_ORDERBOOK_DEPTH: usize = 50;
 const ORDERBOOK_STALE_AFTER: StdDuration = StdDuration::from_secs(5);
+const DEFAULT_CLOSE_ALL_POSITIONS_SLIPPAGE_BPS: u32 = 50;
 static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn default_taker_fee() -> Decimal {
@@ -488,6 +489,7 @@ pub struct ExtendedConnector {
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
     last_trades: Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
     positions_cache: Arc<RwLock<Option<Vec<PositionSnapshot>>>>,
+    close_all_positions_slippage_bps: u32,
     ws_started: AtomicBool,
     ws_tasks: Mutex<Vec<JoinHandle<()>>>,
     market_logged: Mutex<HashSet<String>>,
@@ -515,6 +517,11 @@ impl ExtendedConnector {
             .unwrap_or(ExtendedEnvironment::Mainnet);
         let api_base = base_url.unwrap_or_else(|| env.api_base().to_string());
         let api = ExtendedApi::new(api_base, api_key).await?;
+        let close_all_positions_slippage_bps =
+            std::env::var("CLOSE_ALL_POSITIONS_SLIPPAGE_BPS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_CLOSE_ALL_POSITIONS_SLIPPAGE_BPS);
 
         let market_cache = Arc::new(RwLock::new(HashMap::new()));
         // Fetch all markets during initialization
@@ -558,6 +565,7 @@ impl ExtendedConnector {
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             last_trades: Arc::new(RwLock::new(HashMap::new())),
             positions_cache: Arc::new(RwLock::new(None)),
+            close_all_positions_slippage_bps,
             ws_started: AtomicBool::new(false),
             ws_tasks: Mutex::new(Vec::new()),
             market_logged: Mutex::new(HashSet::new()),
@@ -1053,6 +1061,17 @@ impl ExtendedConnector {
         }
 
         Self::clamp_positive_price(rounded, tick, floor_px)
+    }
+
+    fn apply_close_slippage_bps(price: Decimal, bps: u32, side: OrderSide) -> Decimal {
+        if bps == 0 {
+            return price;
+        }
+        let adj = Decimal::from(bps) / Decimal::new(10_000, 0);
+        match side {
+            OrderSide::Long => price * (Decimal::ONE + adj),
+            OrderSide::Short => price * (Decimal::ONE - adj),
+        }
     }
 
     fn clamp_positive_price(price: Decimal, tick: Decimal, floor: Decimal) -> Decimal {
@@ -2612,15 +2631,22 @@ impl DexConnector for ExtendedConnector {
             };
             if used_market_stats {
                 order_price = slippage_price(order_price, side == OrderSide::Long);
-            } else if tick > Decimal::ZERO {
-                match side {
-                    OrderSide::Long => {
-                        order_price += tick;
-                    }
-                    OrderSide::Short => {
-                        order_price -= tick;
+            } else {
+                if tick > Decimal::ZERO {
+                    match side {
+                        OrderSide::Long => {
+                            order_price += tick;
+                        }
+                        OrderSide::Short => {
+                            order_price -= tick;
+                        }
                     }
                 }
+                order_price = Self::apply_close_slippage_bps(
+                    order_price,
+                    self.close_all_positions_slippage_bps,
+                    side,
+                );
             }
             let rounded_price = Self::round_price_for_market_aggressive(order_price, &market, side);
             let rounded_size = Self::round_size_for_market(position.size, &market)?;
@@ -2659,24 +2685,40 @@ impl DexConnector for ExtendedConnector {
             };
 
             log::info!(
-                "[close_all_positions] {} side={} size={} price={} tif=IOC reduce_only=true",
+                "[close_all_positions] {} side={} size={} price={} tif=IOC reduce_only=true source={} slippage_bps={}",
                 position.symbol,
                 side_str,
                 rounded_size,
-                rounded_price
+                rounded_price,
+                if used_market_stats { "stats" } else { "order_book" },
+                if used_market_stats {
+                    0
+                } else {
+                    self.close_all_positions_slippage_bps
+                }
             );
 
-            if let Err(err) = self
+            match self
                 .api
                 .post::<PlacedOrderModel, _>("/user/order".to_string(), order, true)
                 .await
             {
-                log::error!(
-                    "[close_all_positions] Failed to close {}: {}",
-                    position.symbol,
-                    err
-                );
-                last_err = Some(err);
+                Ok(response) => {
+                    log::info!(
+                        "[close_all_positions] {} order placed id={} external_id={}",
+                        position.symbol,
+                        response.id,
+                        response.external_id
+                    );
+                }
+                Err(err) => {
+                    log::error!(
+                        "[close_all_positions] Failed to close {}: {}",
+                        position.symbol,
+                        err
+                    );
+                    last_err = Some(err);
+                }
             }
         }
 
