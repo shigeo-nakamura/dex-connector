@@ -517,11 +517,10 @@ impl ExtendedConnector {
             .unwrap_or(ExtendedEnvironment::Mainnet);
         let api_base = base_url.unwrap_or_else(|| env.api_base().to_string());
         let api = ExtendedApi::new(api_base, api_key).await?;
-        let close_all_positions_slippage_bps =
-            std::env::var("CLOSE_ALL_POSITIONS_SLIPPAGE_BPS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(DEFAULT_CLOSE_ALL_POSITIONS_SLIPPAGE_BPS);
+        let close_all_positions_slippage_bps = std::env::var("CLOSE_ALL_POSITIONS_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_CLOSE_ALL_POSITIONS_SLIPPAGE_BPS);
 
         let market_cache = Arc::new(RwLock::new(HashMap::new()));
         // Fetch all markets during initialization
@@ -1932,6 +1931,7 @@ impl ExtendedConnector {
         price: Option<Decimal>,
         reduce_only: bool,
         expiry_secs: Option<u64>,
+        post_only: bool,
         refreshed: bool,
     ) -> Result<CreateOrderResponse, DexError> {
         let mut refreshed_once = refreshed;
@@ -1956,6 +1956,7 @@ impl ExtendedConnector {
                     order_price,
                     reduce_only,
                     expiry_secs,
+                    post_only,
                 )
                 .await
             {
@@ -2010,6 +2011,7 @@ impl ExtendedConnector {
         order_price: Decimal,
         reduce_only: bool,
         expiry_secs: Option<u64>,
+        post_only: bool,
     ) -> Result<CreateOrderResponse, DexError> {
         let expire_time = match expiry_secs {
             Some(secs) => Utc::now() + Duration::seconds(secs as i64),
@@ -2031,7 +2033,7 @@ impl ExtendedConnector {
         }
         let tc = &market.trading_config;
         log::debug!(
-            "[create_order][extended] sym={} side={} raw_price={} rounded_price={} tick={} floor={} cap={} raw_size={} rounded_size={}",
+            "[create_order][extended] sym={} side={} raw_price={} rounded_price={} tick={} floor={} cap={} raw_size={} rounded_size={} post_only={}",
             market.name,
             side_str,
             order_price,
@@ -2040,7 +2042,8 @@ impl ExtendedConnector {
             tc.limit_price_floor,
             tc.limit_price_cap,
             size,
-            rounded_size
+            rounded_size,
+            post_only
         );
 
         let settlement = self.compute_settlement(
@@ -2062,7 +2065,7 @@ impl ExtendedConnector {
             qty: rounded_size,
             price: rounded_price,
             reduce_only,
-            post_only: false,
+            post_only,
             time_in_force: "GTT".to_string(),
             expiry_epoch_millis: Self::to_epoch_millis(expire_time),
             fee: settlement.fee_rate,
@@ -2483,12 +2486,22 @@ impl DexConnector for ExtendedConnector {
         size: Decimal,
         side: OrderSide,
         price: Option<Decimal>,
-        _spread: Option<i64>,
+        spread: Option<i64>,
         reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        self.create_order_internal(symbol, size, side, price, reduce_only, expiry_secs, false)
-            .await
+        let post_only = matches!(spread, Some(-2));
+        self.create_order_internal(
+            symbol,
+            size,
+            side,
+            price,
+            reduce_only,
+            expiry_secs,
+            post_only,
+            false,
+        )
+        .await
     }
 
     async fn create_advanced_trigger_order(
