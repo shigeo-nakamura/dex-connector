@@ -4610,6 +4610,7 @@ impl LighterConnector {
                         // Control channel for high-priority messages (ping/pong)
                         let (tx_ctrl, mut rx_ctrl) =
                             tokio::sync::mpsc::channel::<OutboundMessage>(32);
+                        let tx_ctrl_for_reader = tx_ctrl.clone();
 
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
@@ -4909,32 +4910,23 @@ impl LighterConnector {
                                                         pong["nonce"] = nonce.clone();
                                                     }
 
-                                                    // Send application-layer pong (NOT control frame pong)
-                                                    if let Ok(mut ws_write) =
-                                                        ws_writer_for_reader.try_lock()
+                                                    // Send application-layer pong via control channel to avoid writer lock contention
+                                                    let pong_msg = OutboundMessage::Control(
+                                                        tokio_tungstenite::tungstenite::Message::Text(
+                                                            pong.to_string(),
+                                                        ),
+                                                    );
+                                                    if let Err(e) =
+                                                        tx_ctrl_for_reader.send(pong_msg).await
                                                     {
-                                                        if let Err(e) = ws_write
-                                                            .send(
-                                                                tokio_tungstenite::tungstenite::Message::Text(
-                                                                    pong.to_string(),
-                                                                ),
-                                                            )
-                                                            .await
-                                                        {
-                                                            log::error!(
-                                                                "Failed to send application-layer pong: {:?} (conn={})",
-                                                                e,
-                                                                conn_label
-                                                            );
-                                                        } else {
-                                                            log::debug!(
-                                                                "Sent application-layer pong (conn={})",
-                                                                conn_label
-                                                            );
-                                                        }
-                                                    } else {
                                                         log::warn!(
-                                                            "Failed to acquire ws_writer for application pong (conn={})",
+                                                            "Failed to enqueue application-layer pong: {:?} (conn={})",
+                                                            e,
+                                                            conn_label
+                                                        );
+                                                    } else {
+                                                        log::debug!(
+                                                            "Enqueued application-layer pong (conn={})",
                                                             conn_label
                                                         );
                                                     }
