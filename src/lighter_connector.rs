@@ -5275,16 +5275,34 @@ impl LighterConnector {
                             .rsplit(|c| c == '/' || c == ':')
                             .next()
                             .and_then(|id| id.parse::<u32>().ok());
-                        let symbol = if let Some(market_id) = market_id {
-                            let cache = market_cache.read().await;
-                            cache
-                                .by_id
-                                .get(&market_id)
-                                .map(|info| info.canonical_symbol.clone())
-                        } else {
-                            None
-                        }
-                        .unwrap_or_else(|| default_symbol.to_string());
+                        let symbol = match market_id {
+                            Some(market_id) => {
+                                let cache = market_cache.read().await;
+                                cache
+                                    .by_id
+                                    .get(&market_id)
+                                    .map(|info| info.canonical_symbol.clone())
+                            }
+                            None => None,
+                        };
+                        let symbol = match symbol {
+                            Some(symbol) => symbol,
+                            None => {
+                                if let Some(market_id) = market_id {
+                                    log::warn!(
+                                        "[WS] order_book update missing symbol for market_id={} (channel='{}'); skipping",
+                                        market_id,
+                                        channel
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "[WS] order_book update missing market_id (channel='{}'); skipping",
+                                        channel
+                                    );
+                                }
+                                return;
+                            }
+                        };
 
                         // Update current price from best bid/ask
                         if let (Some(best_bid), Some(best_ask)) = (ob.bids.first(), ob.asks.first())
