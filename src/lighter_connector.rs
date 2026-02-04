@@ -4300,15 +4300,9 @@ impl LighterConnector {
 
         log::info!("Connecting to WebSocket: {}", ws_url);
 
-        let ws = match self._ws.as_ref() {
-            Some(ws) => ws,
-            None => return Err(DexError::Other("WebSocket not initialized".to_string())),
-        };
-
-        let (_sink, _stream) = ws
-            .connect()
-            .await
-            .map_err(|_| DexError::Other("Failed to connect to WebSocket".to_string()))?;
+        if self._ws.is_none() {
+            return Err(DexError::Other("WebSocket not initialized".to_string()));
+        }
 
         let primary_market_id = if let Some(symbol) = self.tracked_symbols.first() {
             match self.resolve_market_info(symbol).await {
@@ -4611,14 +4605,18 @@ impl LighterConnector {
                         let (tx_ctrl, mut rx_ctrl) =
                             tokio::sync::mpsc::channel::<OutboundMessage>(32);
                         let tx_ctrl_for_reader = tx_ctrl.clone();
+                        let connection_alive = Arc::new(AtomicBool::new(true));
 
                         // Create unified writer task with priority handling
                         let writer_is_running = is_running.clone();
+                        let writer_connection_alive = connection_alive.clone();
                         let ws_writer_for_task = ws_writer_arc.clone();
                         let writer_conn_label = conn_label.clone();
-                        let _writer_task = tokio::spawn(async move {
+                        let writer_task = tokio::spawn(async move {
                             loop {
-                                if !writer_is_running.load(Ordering::SeqCst) {
+                                if !writer_is_running.load(Ordering::SeqCst)
+                                    || !writer_connection_alive.load(Ordering::SeqCst)
+                                {
                                     break;
                                 }
 
@@ -4688,6 +4686,7 @@ impl LighterConnector {
 
                         // Create ping/heartbeat task with priority channel access
                         let ping_is_running = is_running.clone();
+                        let ping_connection_alive = connection_alive.clone();
                         let ping_last_rx = last_rx.clone();
                         let ping_last_tx = last_tx.clone();
                         let ping_last_app_ping = last_app_ping.clone();
@@ -4698,7 +4697,7 @@ impl LighterConnector {
                         let ping_tx_ctrl = tx_ctrl.clone();
                         let ping_conn_label = conn_label.clone();
 
-                        let _ping_task = tokio::spawn(async move {
+                        let ping_task = tokio::spawn(async move {
                             let mut heartbeat_interval = tokio::time::interval(
                                 std::time::Duration::from_secs(HEARTBEAT_CHECK_SECS),
                             );
@@ -4709,7 +4708,9 @@ impl LighterConnector {
                                 tokio::select! {
                                     // Handle heartbeat check interval
                                     _ = heartbeat_interval.tick() => {
-                                        if !ping_is_running.load(Ordering::SeqCst) {
+                                        if !ping_is_running.load(Ordering::SeqCst)
+                                            || !ping_connection_alive.load(Ordering::SeqCst)
+                                        {
                                             break;
                                         }
 
@@ -5203,6 +5204,12 @@ impl LighterConnector {
                             }
                         }
 
+                        connection_alive.store(false, Ordering::SeqCst);
+                        drop(tx_ctrl_for_reader);
+                        drop(tx_ctrl);
+                        writer_task.abort();
+                        ping_task.abort();
+
                         {
                             let mut ob_guard = order_book.write().await;
                             if ob_guard.is_some() {
@@ -5461,10 +5468,10 @@ impl LighterConnector {
         }
 
         let balance_source = data.get("account").unwrap_or(data);
-        let mut total_asset_value = balance_source
+        let total_asset_value = balance_source
             .get("total_asset_value")
             .and_then(Self::value_to_decimal);
-        let mut available_balance = balance_source
+        let available_balance = balance_source
             .get("available_balance")
             .and_then(Self::value_to_decimal);
 
