@@ -4656,7 +4656,9 @@ impl LighterConnector {
 
                         // Heartbeat strategy: application-layer ping-pong + control frame ping-pong
                         const IDLE_PING_SECS: u64 = 20; // Client ping interval
-                        const PONG_TIMEOUT_SECS: u64 = 8; // Pong timeout (reduced from 10s)
+                        const PONG_TIMEOUT_SECS: u64 = 20; // Pong timeout (tolerant to jitter)
+                        const MAX_IDLE_RX_SECS: u64 = 60; // Only reconnect if no inbound traffic for this long
+                        const MAX_CONN_AGE_SECS: u64 = 2700; // Proactive refresh before server lifetime timeout
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
 
                         fn get_pong_payload(ping_payload: &[u8]) -> Vec<u8> {
@@ -4683,6 +4685,7 @@ impl LighterConnector {
                         let pending_app_pong = std::sync::Arc::new(AtomicBool::new(false));
                         let last_client_ping_payload =
                             std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
+                        let conn_started_at = now_secs();
 
                         // Create ping/heartbeat task with priority channel access
                         let ping_is_running = is_running.clone();
@@ -4694,6 +4697,7 @@ impl LighterConnector {
                         let ping_pending_client_ping = pending_client_ping.clone();
                         let ping_pending_app_pong = pending_app_pong.clone();
                         let ping_last_client_ping_payload = last_client_ping_payload.clone();
+                        let ping_conn_started_at = conn_started_at;
                         let ping_tx_ctrl = tx_ctrl.clone();
                         let ping_conn_label = conn_label.clone();
 
@@ -4716,6 +4720,21 @@ impl LighterConnector {
 
                                         let now = now_secs();
                                         let idle_tx = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
+                                        let idle_rx = now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
+                                        let conn_age = now.saturating_sub(ping_conn_started_at);
+
+                                        if conn_age >= MAX_CONN_AGE_SECS {
+                                            log::info!(
+                                                "Proactive WebSocket refresh due to connection age {}s (conn={})",
+                                                conn_age,
+                                                ping_conn_label
+                                            );
+                                            let close_msg = OutboundMessage::Control(
+                                                tokio_tungstenite::tungstenite::Message::Close(None)
+                                            );
+                                            let _ = ping_tx_ctrl.send(close_msg).await;
+                                            break;
+                                        }
 
                                         // Send client ping regularly (every 20s) regardless of server ping activity
                                         // This ensures server's ~120s client ping requirement is always satisfied
@@ -4783,9 +4802,13 @@ impl LighterConnector {
                                         // Check for control frame pong timeout
                                         if ping_pending_client_ping.load(Ordering::SeqCst) {
                                             let waited = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
-                                            if waited >= PONG_TIMEOUT_SECS {
-                                                let idle_rx =
-                                                    now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
+                                            if idle_rx < IDLE_PING_SECS {
+                                                ping_pending_client_ping.store(false, Ordering::SeqCst);
+                                                log::debug!(
+                                                    "Cleared pending client ping due to inbound traffic (conn={})",
+                                                    ping_conn_label
+                                                );
+                                            } else if waited >= PONG_TIMEOUT_SECS && idle_rx >= MAX_IDLE_RX_SECS {
                                                 let last_server_ping_at =
                                                     ping_last_server_ping.load(Ordering::SeqCst);
                                                 let server_ping_age = if last_server_ping_at == 0 {
@@ -4815,9 +4838,13 @@ impl LighterConnector {
                                         // Check for application-layer pong timeout
                                         if ping_pending_app_pong.load(Ordering::SeqCst) {
                                             let waited = now.saturating_sub(ping_last_app_ping.load(Ordering::SeqCst));
-                                            if waited >= PONG_TIMEOUT_SECS {
-                                                let idle_rx =
-                                                    now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
+                                            if idle_rx < IDLE_PING_SECS {
+                                                ping_pending_app_pong.store(false, Ordering::SeqCst);
+                                                log::debug!(
+                                                    "Cleared pending application pong due to inbound traffic (conn={})",
+                                                    ping_conn_label
+                                                );
+                                            } else if waited >= PONG_TIMEOUT_SECS && idle_rx >= MAX_IDLE_RX_SECS {
                                                 let last_server_ping_at =
                                                     ping_last_server_ping.load(Ordering::SeqCst);
                                                 let server_ping_age = if last_server_ping_at == 0 {
@@ -4867,6 +4894,18 @@ impl LighterConnector {
                                         // Update last received timestamp for any text message
                                         let now = now_secs();
                                         last_rx.store(now, Ordering::SeqCst);
+                                        if pending_client_ping.swap(false, Ordering::SeqCst) {
+                                            log::debug!(
+                                                "Cleared pending client ping due to inbound message (conn={})",
+                                                conn_label
+                                            );
+                                        }
+                                        if pending_app_pong.swap(false, Ordering::SeqCst) {
+                                            log::debug!(
+                                                "Cleared pending application pong due to inbound message (conn={})",
+                                                conn_label
+                                            );
+                                        }
 
                                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
                                             let msg_type = parsed
@@ -4992,6 +5031,18 @@ impl LighterConnector {
                                         let now = now_secs();
                                         last_server_ping.store(now, Ordering::SeqCst);
                                         last_rx.store(now, Ordering::SeqCst);
+                                        if pending_client_ping.swap(false, Ordering::SeqCst) {
+                                            log::debug!(
+                                                "Cleared pending client ping due to server ping (conn={})",
+                                                conn_label
+                                            );
+                                        }
+                                        if pending_app_pong.swap(false, Ordering::SeqCst) {
+                                            log::debug!(
+                                                "Cleared pending application pong due to server ping (conn={})",
+                                                conn_label
+                                            );
+                                        }
 
                                         // Echo pong payload for server compliance
                                         let pong_payload = get_pong_payload(&payload);
@@ -5094,6 +5145,12 @@ impl LighterConnector {
                                         // Pong response - check if it matches our client ping
                                         let now = now_secs();
                                         last_rx.store(now, Ordering::SeqCst);
+                                        if pending_app_pong.swap(false, Ordering::SeqCst) {
+                                            log::debug!(
+                                                "Cleared pending application pong due to control pong (conn={})",
+                                                conn_label
+                                            );
+                                        }
 
                                         let expected_payload =
                                             last_client_ping_payload.lock().clone();
