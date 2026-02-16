@@ -3155,6 +3155,11 @@ impl DexConnector for LighterConnector {
             if let Some(entry) = ob_guard.get(symbol) {
                 (entry.order_book.clone(), entry.updated_at)
             } else {
+                log::debug!(
+                    "order book snapshot unavailable for {} (cached symbols={})",
+                    symbol,
+                    ob_guard.len()
+                );
                 return Err(DexError::Other(
                     "order book snapshot unavailable (no recent update)".to_string(),
                 ));
@@ -5310,6 +5315,12 @@ impl LighterConnector {
                                 return;
                             }
                         };
+                        log::debug!(
+                            "[WS_OB] channel='{}' market_id={:?} resolved_symbol={}",
+                            channel,
+                            market_id,
+                            symbol
+                        );
 
                         // Update current price from best bid/ask
                         if let (Some(best_bid), Some(best_ask)) = (ob.bids.first(), ob.asks.first())
@@ -5323,6 +5334,13 @@ impl LighterConnector {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
                                     .as_secs();
+                                log::debug!(
+                                    "[WS_OB] {} best_bid={} best_ask={} mid={}",
+                                    symbol,
+                                    bid_price,
+                                    ask_price,
+                                    mid_price
+                                );
                                 current_price
                                     .write()
                                     .await
@@ -5355,6 +5373,11 @@ impl LighterConnector {
                                 },
                             );
                         }
+                        log::debug!(
+                            "[WS_OB] cached order book for {} (channel='{}')",
+                            symbol,
+                            channel
+                        );
                     }
                 }
             }
