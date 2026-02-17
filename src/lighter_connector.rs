@@ -298,7 +298,7 @@ pub struct LighterConnector {
     // WebSocket data storage
     current_price: Arc<RwLock<HashMap<String, (Decimal, u64)>>>, // symbol -> (price, timestamp)
     current_volume: Arc<RwLock<Option<Decimal>>>,
-    order_book: Arc<RwLock<HashMap<String, LighterOrderBookCacheEntry>>>,
+    order_book: Arc<RwLock<HashMap<u32, LighterOrderBookCacheEntry>>>,
     maintenance: Arc<RwLock<MaintenanceInfo>>,
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
@@ -3150,14 +3150,16 @@ impl DexConnector for LighterConnector {
         symbol: &str,
         depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
+        let market_id = self.resolve_market_info(symbol).await?.market_id;
         let (ob, updated_at) = {
             let ob_guard = self.order_book.read().await;
-            if let Some(entry) = ob_guard.get(symbol) {
+            if let Some(entry) = ob_guard.get(&market_id) {
                 (entry.order_book.clone(), entry.updated_at)
             } else {
                 log::debug!(
-                    "order book snapshot unavailable for {} (cached symbols={})",
+                    "order book snapshot unavailable for {} (market_id={}, cached_entries={})",
                     symbol,
+                    market_id,
                     ob_guard.len()
                 );
                 return Err(DexError::Other(
@@ -3167,9 +3169,9 @@ impl DexConnector for LighterConnector {
         };
         if updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
             let mut ob_guard = self.order_book.write().await;
-            if let Some(entry) = ob_guard.get(symbol) {
+            if let Some(entry) = ob_guard.get(&market_id) {
                 if entry.updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
-                    ob_guard.remove(symbol);
+                    ob_guard.remove(&market_id);
                 }
             }
             return Err(DexError::Other(
@@ -5258,7 +5260,7 @@ impl LighterConnector {
         message: Value,
         current_price: &Arc<RwLock<HashMap<String, (Decimal, u64)>>>,
         current_volume: &Arc<RwLock<Option<Decimal>>>,
-        order_book: &Arc<RwLock<HashMap<String, LighterOrderBookCacheEntry>>>,
+        order_book: &Arc<RwLock<HashMap<u32, LighterOrderBookCacheEntry>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
@@ -5363,21 +5365,24 @@ impl LighterConnector {
                             .sum();
                         *current_volume.write().await = Some(total_volume);
 
-                        {
-                            let mut ob_guard = order_book.write().await;
-                            ob_guard.insert(
-                                symbol.clone(),
-                                LighterOrderBookCacheEntry {
-                                    order_book: ob,
-                                    updated_at: Instant::now(),
-                                },
+                        if let Some(market_id) = market_id {
+                            {
+                                let mut ob_guard = order_book.write().await;
+                                ob_guard.insert(
+                                    market_id,
+                                    LighterOrderBookCacheEntry {
+                                        order_book: ob,
+                                        updated_at: Instant::now(),
+                                    },
+                                );
+                            }
+                            log::debug!(
+                                "[WS_OB] cached order book for {} (market_id={}, channel='{}')",
+                                symbol,
+                                market_id,
+                                channel
                             );
                         }
-                        log::debug!(
-                            "[WS_OB] cached order book for {} (channel='{}')",
-                            symbol,
-                            channel
-                        );
                     }
                 }
             }
