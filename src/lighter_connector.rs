@@ -5368,10 +5368,30 @@ impl LighterConnector {
                         if let Some(market_id) = market_id {
                             {
                                 let mut ob_guard = order_book.write().await;
+                                // For delta updates, merge with existing cache:
+                                // keep the existing side if the new update has no entries for it
+                                let merged_ob = if let Some(existing) = ob_guard.get(&market_id) {
+                                    let merged_bids = if ob.bids.is_empty() {
+                                        existing.order_book.bids.clone()
+                                    } else {
+                                        ob.bids
+                                    };
+                                    let merged_asks = if ob.asks.is_empty() {
+                                        existing.order_book.asks.clone()
+                                    } else {
+                                        ob.asks
+                                    };
+                                    LighterOrderBook {
+                                        bids: merged_bids,
+                                        asks: merged_asks,
+                                    }
+                                } else {
+                                    ob
+                                };
                                 ob_guard.insert(
                                     market_id,
                                     LighterOrderBookCacheEntry {
-                                        order_book: ob,
+                                        order_book: merged_ob,
                                         updated_at: Instant::now(),
                                     },
                                 );
