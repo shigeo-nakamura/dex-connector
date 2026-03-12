@@ -2305,6 +2305,7 @@ impl DexConnector for ExtendedConnector {
         );
         Ok(CombinedBalanceResponse {
             usd_balance: balance.equity,
+            total_asset_value: balance.equity,
             token_balances,
         })
     }

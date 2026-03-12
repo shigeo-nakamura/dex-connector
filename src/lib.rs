@@ -122,6 +122,7 @@ pub struct PositionSnapshot {
 #[derive(Debug, Default)]
 pub struct CombinedBalanceResponse {
     pub usd_balance: Decimal,
+    pub total_asset_value: Decimal,
     pub token_balances: std::collections::HashMap<String, BalanceResponse>,
 }
 

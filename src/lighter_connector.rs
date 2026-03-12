@@ -3056,6 +3056,7 @@ impl DexConnector for LighterConnector {
             );
             return Ok(CombinedBalanceResponse {
                 usd_balance: balance.equity,
+                total_asset_value: balance.equity,
                 token_balances,
             });
         }
@@ -3095,8 +3096,9 @@ impl DexConnector for LighterConnector {
 
         let account = &account_response.accounts[0];
 
-        // Extract USD balance
+        // Extract USD balance and total asset value
         let usd_balance = string_to_decimal(Some(account.available_balance.clone()))?;
+        let total_asset_value = string_to_decimal(Some(account.total_asset_value.clone()))?;
 
         // Extract all token balances
         let mut token_balances = std::collections::HashMap::new();
@@ -3116,13 +3118,15 @@ impl DexConnector for LighterConnector {
         }
 
         log::debug!(
-            "Combined balance: USD={}, tokens={} positions",
+            "Combined balance: USD={}, total_asset_value={}, tokens={} positions",
             usd_balance,
+            total_asset_value,
             token_balances.len()
         );
 
         Ok(CombinedBalanceResponse {
             usd_balance,
+            total_asset_value,
             token_balances,
         })
     }
