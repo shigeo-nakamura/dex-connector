@@ -27,7 +27,7 @@ use crate::{
     dex_connector::{string_to_decimal, DexConnector},
     dex_request::{DexError, HttpMethod},
     dex_websocket::DexWebSocket,
-    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
+    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse, SpotAssetBalance,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
     OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
     TickerResponse, TpSl, TriggerOrderStyle,
@@ -362,6 +362,17 @@ struct LighterAccountInfo {
     collateral: String,
     total_asset_value: String,
     positions: Vec<LighterPosition>,
+    #[serde(default)]
+    assets: Vec<LighterAsset>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct LighterAsset {
+    symbol: String,
+    asset_id: u32,
+    balance: String,
+    locked_balance: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -3058,6 +3069,7 @@ impl DexConnector for LighterConnector {
                 usd_balance: balance.equity,
                 total_asset_value: balance.equity,
                 token_balances,
+                spot_assets: Vec::new(),
             });
         }
 
@@ -3117,17 +3129,31 @@ impl DexConnector for LighterConnector {
             );
         }
 
+        // Extract spot asset balances
+        let mut spot_assets = Vec::new();
+        for asset in &account.assets {
+            let balance = string_to_decimal(Some(asset.balance.clone())).unwrap_or_default();
+            let locked = string_to_decimal(Some(asset.locked_balance.clone())).unwrap_or_default();
+            spot_assets.push(SpotAssetBalance {
+                symbol: asset.symbol.clone(),
+                balance,
+                locked_balance: locked,
+            });
+        }
+
         log::debug!(
-            "Combined balance: USD={}, total_asset_value={}, tokens={} positions",
+            "Combined balance: USD={}, total_asset_value={}, tokens={} positions, {} spot assets",
             usd_balance,
             total_asset_value,
-            token_balances.len()
+            token_balances.len(),
+            spot_assets.len()
         );
 
         Ok(CombinedBalanceResponse {
             usd_balance,
             total_asset_value,
             token_balances,
+            spot_assets,
         })
     }
 

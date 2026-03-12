@@ -2307,6 +2307,7 @@ impl DexConnector for ExtendedConnector {
             usd_balance: balance.equity,
             total_asset_value: balance.equity,
             token_balances,
+            spot_assets: Vec::new(),
         })
     }
 

@@ -120,10 +120,19 @@ pub struct PositionSnapshot {
 }
 
 #[derive(Debug, Default)]
+pub struct SpotAssetBalance {
+    pub symbol: String,
+    pub balance: Decimal,
+    pub locked_balance: Decimal,
+}
+
+#[derive(Debug, Default)]
 pub struct CombinedBalanceResponse {
     pub usd_balance: Decimal,
     pub total_asset_value: Decimal,
     pub token_balances: std::collections::HashMap<String, BalanceResponse>,
+    /// Spot token balances (e.g. LIT, USDC) from the assets array
+    pub spot_assets: Vec<SpotAssetBalance>,
 }
 
 #[derive(Deserialize, Debug, Default)]
