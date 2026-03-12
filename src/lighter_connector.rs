@@ -451,6 +451,25 @@ struct LighterOrderBookDetail {
     supported_size_decimals: Option<u32>,
 }
 
+#[derive(Deserialize, Debug)]
+struct LighterOrderBooksResponse {
+    #[serde(rename = "order_books")]
+    order_books: Vec<LighterOrderBookMeta>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct LighterOrderBookMeta {
+    market_id: u32,
+    symbol: String,
+    #[serde(rename = "min_base_amount")]
+    min_base_amount: Option<String>,
+    #[serde(rename = "supported_price_decimals")]
+    supported_price_decimals: Option<u32>,
+    #[serde(rename = "supported_size_decimals")]
+    supported_size_decimals: Option<u32>,
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct LighterNonceResponse {
@@ -802,6 +821,44 @@ impl LighterConnector {
                     "Failed to fetch order book details for market cache: {}. Falling back to funding rates only",
                     err
                 );
+            }
+        }
+
+        // Also load spot markets from /api/v1/orderBooks (orderBookDetails only has perps)
+        match self.get_order_books_all().await {
+            Ok(books) => {
+                for book in books.order_books {
+                    let normalized = normalize_symbol(&book.symbol);
+                    if normalized.is_empty() || cache.by_symbol.contains_key(&normalized) {
+                        continue;
+                    }
+                    let price_decimals = book.supported_price_decimals
+                        .unwrap_or(DEFAULT_PRICE_DECIMALS)
+                        .min(MAX_DECIMAL_PRECISION);
+                    let size_decimals = book.supported_size_decimals
+                        .unwrap_or(DEFAULT_SIZE_DECIMALS)
+                        .min(MAX_DECIMAL_PRECISION);
+                    let min_order = book.min_base_amount
+                        .as_deref()
+                        .and_then(|v| Decimal::from_str(v).ok());
+                    let info = MarketInfo {
+                        canonical_symbol: normalized.clone(),
+                        market_id: book.market_id,
+                        price_decimals,
+                        size_decimals,
+                        min_order,
+                    };
+                    log::info!(
+                        "[MARKET_INFO] Loaded market {} (spot): price_decimals={}, size_decimals={}, min_order={:?}",
+                        normalized, price_decimals, size_decimals, min_order
+                    );
+                    detail_decimals.insert(book.market_id, (price_decimals, size_decimals));
+                    cache.by_symbol.insert(normalized.clone(), info.clone());
+                    cache.by_id.insert(book.market_id, info);
+                }
+            }
+            Err(err) => {
+                log::warn!("Failed to fetch orderBooks for spot markets: {}", err);
             }
         }
 
@@ -4273,6 +4330,33 @@ impl LighterConnector {
 
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse order book details: {}", e)))
+    }
+
+    async fn get_order_books_all(&self) -> Result<LighterOrderBooksResponse, DexError> {
+        let url = format!("{}/api/v1/orderBooks?filter=all", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("Failed to get orderBooks: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            DexError::Other(format!("Failed to read orderBooks response: {}", e))
+        })?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "orderBooks HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Other(format!("Failed to parse orderBooks: {}", e)))
     }
 
     async fn get_funding_rates(&self) -> Result<LighterFundingRates, DexError> {
