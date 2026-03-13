@@ -5451,6 +5451,41 @@ impl LighterConnector {
                                 string_to_decimal(Some(best_ask.price.clone())),
                             ) {
                                 let mid_price = (bid_price + ask_price) / Decimal::from(2);
+
+                                // Cross-symbol contamination guard: if we already have a
+                                // known price for this symbol, reject OB updates where
+                                // bid/ask deviates more than 50% from it.
+                                let is_contaminated = {
+                                    let prices = current_price.read().await;
+                                    if let Some(&(known_price, _)) = prices.get(&symbol) {
+                                        if known_price > Decimal::ZERO {
+                                            let ratio = if mid_price > known_price {
+                                                mid_price / known_price
+                                            } else {
+                                                known_price / mid_price
+                                            };
+                                            ratio > Decimal::new(15, 1) // 1.5x = 50% deviation
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                if is_contaminated {
+                                    log::warn!(
+                                        "[WS_OB] REJECTED contaminated OB for {} (market_id={:?}): \
+                                         bid={} ask={} mid={} deviates >50% from known price",
+                                        symbol,
+                                        market_id,
+                                        bid_price,
+                                        ask_price,
+                                        mid_price
+                                    );
+                                    return;
+                                }
+
                                 let timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
