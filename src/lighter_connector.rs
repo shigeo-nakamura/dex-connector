@@ -21,7 +21,23 @@ const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
 const LIGHTER_ANNOUNCEMENT_ENDPOINT: &str = "/api/v1/announcement";
 const MAINTENANCE_CACHE_TTL_MINS: i64 = 10;
-const ORDERBOOK_STALE_AFTER: Duration = Duration::from_secs(5);
+const DEFAULT_ORDERBOOK_STALE_SECS: u64 = 15;
+
+/// Configuration for creating a LighterConnector.
+#[derive(Debug, Clone)]
+pub struct LighterConnectorConfig {
+    pub api_key_public: String,
+    pub api_key_index: u32,
+    pub api_private_key_hex: String,
+    pub evm_wallet_private_key: Option<String>,
+    pub account_index: u64,
+    pub base_url: String,
+    pub websocket_url: String,
+    pub tracked_symbols: Vec<String>,
+    /// Seconds before a cached order book snapshot is considered stale.
+    /// Default: 15 seconds.
+    pub ob_stale_secs: Option<u64>,
+}
 
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
@@ -320,6 +336,7 @@ pub struct LighterConnector {
     tracked_symbols: Vec<String>,
     nonce_cache: Arc<tokio::sync::Mutex<Option<NonceCache>>>,
     nonce_cache_ttl: Duration,
+    ob_stale_after: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -1303,43 +1320,34 @@ impl LighterConnector {
     }
 
     #[cfg(feature = "lighter-sdk")]
-    pub fn new(
-        api_key_public: String,
-        api_key_index: u32,
-        api_private_key_hex: String,
-        evm_wallet_private_key: Option<String>,
-        account_index: u64,
-        base_url: String,
-        websocket_url: String,
-        tracked_symbols: Vec<String>,
-    ) -> Result<Self, DexError> {
-        // For backward compatibility, derive L1 address for logging if possible
-        let l1_address = "N/A".to_string(); // We don't need wallet address anymore
+    pub fn new(config: LighterConnectorConfig) -> Result<Self, DexError> {
+        let l1_address = "N/A".to_string();
+        let ob_stale_secs = config.ob_stale_secs.unwrap_or(DEFAULT_ORDERBOOK_STALE_SECS);
 
         log::debug!(
-            "Creating LighterConnector with API key index: {}, account: {}",
-            api_key_index,
-            account_index
+            "Creating LighterConnector with API key index: {}, account: {}, ob_stale={}s",
+            config.api_key_index,
+            config.account_index,
+            ob_stale_secs
         );
 
         Ok(Self {
-            api_key_public,
-            api_key_index,
-            api_private_key_hex,
-            evm_wallet_private_key,
-            account_index,
-            base_url: base_url.clone(),
-            websocket_url: websocket_url.clone(),
+            api_key_public: config.api_key_public,
+            api_key_index: config.api_key_index,
+            api_private_key_hex: config.api_private_key_hex,
+            evm_wallet_private_key: config.evm_wallet_private_key,
+            account_index: config.account_index,
+            base_url: config.base_url.clone(),
+            websocket_url: config.websocket_url.clone(),
             _l1_address: l1_address,
             client: Client::new(),
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
-            // Auto-cleanup management
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
-            _ws: Some(DexWebSocket::new(websocket_url)),
+            _ws: Some(DexWebSocket::new(config.websocket_url)),
             current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(HashMap::new())),
@@ -1347,7 +1355,6 @@ impl LighterConnector {
                 next_start: None,
                 last_checked: None,
             })),
-            // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_positions: Arc::new(RwLock::new(Vec::new())),
             positions_ready: Arc::new(AtomicBool::new(false)),
@@ -1356,49 +1363,41 @@ impl LighterConnector {
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
             market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
-            tracked_symbols,
+            tracked_symbols: config.tracked_symbols,
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
+            ob_stale_after: Duration::from_secs(ob_stale_secs),
         })
     }
 
     #[cfg(not(feature = "lighter-sdk"))]
-    pub fn new(
-        api_key_public: String,
-        api_key_index: u32,
-        api_private_key_hex: String,
-        _evm_wallet_private_key: Option<String>,
-        account_index: u64,
-        base_url: String,
-        websocket_url: String,
-        tracked_symbols: Vec<String>,
-    ) -> Result<Self, DexError> {
-        // For backward compatibility, derive L1 address for logging if possible
-        let l1_address = "N/A".to_string(); // We don't need wallet address anymore
+    pub fn new(config: LighterConnectorConfig) -> Result<Self, DexError> {
+        let l1_address = "N/A".to_string();
+        let ob_stale_secs = config.ob_stale_secs.unwrap_or(DEFAULT_ORDERBOOK_STALE_SECS);
 
         log::debug!(
-            "Creating LighterConnector with API key index: {}, account: {}",
-            api_key_index,
-            account_index
+            "Creating LighterConnector with API key index: {}, account: {}, ob_stale={}s",
+            config.api_key_index,
+            config.account_index,
+            ob_stale_secs
         );
 
         Ok(Self {
-            api_key_public,
-            api_key_index,
-            api_private_key_hex,
-            account_index,
-            base_url: base_url.clone(),
-            websocket_url: websocket_url.clone(),
+            api_key_public: config.api_key_public,
+            api_key_index: config.api_key_index,
+            api_private_key_hex: config.api_private_key_hex,
+            account_index: config.account_index,
+            base_url: config.base_url.clone(),
+            websocket_url: config.websocket_url.clone(),
             _l1_address: l1_address,
             client: Client::new(),
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
-            // Auto-cleanup management
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
-            _ws: Some(DexWebSocket::new(websocket_url)),
+            _ws: Some(DexWebSocket::new(config.websocket_url)),
             current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(HashMap::new())),
@@ -1406,18 +1405,17 @@ impl LighterConnector {
                 next_start: None,
                 last_checked: None,
             })),
-            // WebSocket-based order tracking (no API calls)
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_positions: Arc::new(RwLock::new(Vec::new())),
             positions_ready: Arc::new(AtomicBool::new(false)),
             balance_cache: Arc::new(RwLock::new(None)),
-            // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::new(RwLock::new(MarketCache::default())),
             market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
-            tracked_symbols,
+            tracked_symbols: config.tracked_symbols,
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
+            ob_stale_after: Duration::from_secs(ob_stale_secs),
         })
     }
 
@@ -3259,10 +3257,10 @@ impl DexConnector for LighterConnector {
                 ));
             }
         };
-        if updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
+        if updated_at.elapsed() > self.ob_stale_after {
             let mut ob_guard = self.order_book.write().await;
             if let Some(entry) = ob_guard.get(&market_id) {
-                if entry.updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
+                if entry.updated_at.elapsed() > self.ob_stale_after {
                     ob_guard.remove(&market_id);
                 }
             }
@@ -6040,25 +6038,9 @@ impl LighterConnector {
 }
 
 pub fn create_lighter_connector(
-    api_key_public: String,
-    api_key_index: u32,
-    api_private_key_hex: String,
-    evm_wallet_private_key: Option<String>,
-    account_index: u64,
-    base_url: String,
-    websocket_url: String,
-    tracked_symbols: Vec<String>,
+    config: LighterConnectorConfig,
 ) -> Result<Box<dyn DexConnector>, DexError> {
-    let connector = LighterConnector::new(
-        api_key_public,
-        api_key_index,
-        api_private_key_hex,
-        evm_wallet_private_key,
-        account_index,
-        base_url,
-        websocket_url,
-        tracked_symbols,
-    )?;
+    let connector = LighterConnector::new(config)?;
     Ok(Box::new(connector))
 }
 
@@ -6111,16 +6093,17 @@ mod tests {
             .unwrap_or(0);
 
         // Create connector using the proper constructor
-        let connector = match LighterConnector::new(
+        let connector = match LighterConnector::new(LighterConnectorConfig {
             api_key_public,
-            0, // api_key_index
-            "dummy_private_key".to_string(),
-            None, // evm_wallet_private_key
+            api_key_index: 0,
+            api_private_key_hex: "dummy_private_key".to_string(),
+            evm_wallet_private_key: None,
             account_index,
             base_url,
-            "dummy_websocket_url".to_string(),
-            Vec::new(),
-        ) {
+            websocket_url: "dummy_websocket_url".to_string(),
+            tracked_symbols: Vec::new(),
+            ob_stale_secs: None,
+        }) {
             Ok(c) => c,
             Err(e) => {
                 println!("Failed to create connector: {}", e);
