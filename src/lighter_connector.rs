@@ -3845,7 +3845,7 @@ impl DexConnector for LighterConnector {
         }
     }
 
-    async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
+    async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
         // Get current account info to check positions
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
 
@@ -3883,9 +3883,13 @@ impl DexConnector for LighterConnector {
         // Check if there are any open positions (position != "0.00000")
         let mut has_positions = false;
         for position in &account.positions {
+            if let Some(ref sym) = symbol {
+                if position.symbol != *sym {
+                    continue;
+                }
+            }
             if let Ok(pos_size) = position.position.parse::<f64>() {
                 if pos_size.abs() > 0.0 {
-                    // Close any position greater than 0
                     has_positions = true;
                     log::info!(
                         "Found open position: market_id={}, symbol={}, size={}",
@@ -3913,6 +3917,11 @@ impl DexConnector for LighterConnector {
 
         // Close each open position by placing market orders in opposite direction
         for position in &account.positions {
+            if let Some(ref sym) = symbol {
+                if position.symbol != *sym {
+                    continue;
+                }
+            }
             if let Ok(pos_size) = position.position.parse::<f64>() {
                 if pos_size.abs() > 0.0 {
                     log::info!(
