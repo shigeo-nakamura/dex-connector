@@ -2938,6 +2938,13 @@ impl DexConnector for LighterConnector {
             }
         }
 
+        // If WebSocket is running, don't fall back to REST — wait for WS data
+        if self.is_running.load(Ordering::SeqCst) {
+            return Err(DexError::Other(
+                "balance unavailable: waiting for websocket data".to_string(),
+            ));
+        }
+
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
 
         // First, get the raw response text for debugging
@@ -4149,7 +4156,9 @@ impl DexConnector for LighterConnector {
             }
             Err(err) => {
                 log::warn!("Failed to refresh Lighter maintenance schedule: {:?}", err);
-                let info = self.maintenance.read().await;
+                // Update last_checked even on error to avoid retrying every tick
+                let mut info = self.maintenance.write().await;
+                info.last_checked = Some(now);
                 let res =
                     Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
                 log::debug!(
