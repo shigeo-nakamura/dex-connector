@@ -337,6 +337,9 @@ pub struct LighterConnector {
     nonce_cache: Arc<tokio::sync::Mutex<Option<NonceCache>>>,
     nonce_cache_ttl: Duration,
     ob_stale_after: Duration,
+    // Cached exchange stats / funding rates to reduce REST API calls
+    cached_exchange_stats: Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
+    cached_funding_rates: Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -431,7 +434,18 @@ struct LighterExchangeStats {
     daily_trades_count: u32,
 }
 
-#[derive(Deserialize, Debug)]
+impl Clone for LighterExchangeStats {
+    fn clone(&self) -> Self {
+        Self {
+            code: self.code,
+            order_book_stats: self.order_book_stats.clone(),
+            daily_usd_volume: self.daily_usd_volume,
+            daily_trades_count: self.daily_trades_count,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
 #[allow(dead_code)]
 struct LighterOrderBookStats {
     symbol: String,
@@ -442,14 +456,14 @@ struct LighterOrderBookStats {
     daily_price_change: f64,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[allow(dead_code)]
 struct LighterFundingRates {
     code: i32,
     funding_rates: Vec<LighterFundingRate>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[allow(dead_code)]
 struct LighterFundingRate {
     market_id: u32,
@@ -1367,6 +1381,8 @@ impl LighterConnector {
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
+            cached_exchange_stats: Arc::new(RwLock::new(None)),
+            cached_funding_rates: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1416,6 +1432,8 @@ impl LighterConnector {
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
+            cached_exchange_stats: Arc::new(RwLock::new(None)),
+            cached_funding_rates: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -2672,9 +2690,9 @@ impl DexConnector for LighterConnector {
         let canonical_symbol = market_info.canonical_symbol.clone();
         let min_order = market_info.min_order.clone();
 
-        // Get statistics data from API
-        let stats_data = self.get_exchange_stats().await.ok();
-        let funding_data = self.get_funding_rates().await.ok();
+        // Get statistics data from cache (REST fetched at most once per 60s)
+        let stats_data = self.get_exchange_stats_cached().await.ok();
+        let funding_data = self.get_funding_rates_cached().await.ok();
 
         // Try to get price from WebSocket first, but check if it's recent
         if let Some((ws_price, price_timestamp)) = self
@@ -4311,6 +4329,43 @@ impl LighterConnector {
 }
 
 impl LighterConnector {
+    /// TTL for cached exchange stats / funding rates (60 seconds)
+    const STATS_CACHE_TTL_SECS: u64 = 60;
+
+    async fn get_exchange_stats_cached(&self) -> Result<LighterExchangeStats, DexError> {
+        {
+            let cache = self.cached_exchange_stats.read().await;
+            if let Some((stats, ts)) = &*cache {
+                if ts.elapsed() < Duration::from_secs(Self::STATS_CACHE_TTL_SECS) {
+                    return Ok(stats.clone());
+                }
+            }
+        }
+        let stats = self.get_exchange_stats().await?;
+        {
+            let mut cache = self.cached_exchange_stats.write().await;
+            *cache = Some((stats.clone(), Instant::now()));
+        }
+        Ok(stats)
+    }
+
+    async fn get_funding_rates_cached(&self) -> Result<LighterFundingRates, DexError> {
+        {
+            let cache = self.cached_funding_rates.read().await;
+            if let Some((rates, ts)) = &*cache {
+                if ts.elapsed() < Duration::from_secs(Self::STATS_CACHE_TTL_SECS) {
+                    return Ok(rates.clone());
+                }
+            }
+        }
+        let rates = self.get_funding_rates().await?;
+        {
+            let mut cache = self.cached_funding_rates.write().await;
+            *cache = Some((rates.clone(), Instant::now()));
+        }
+        Ok(rates)
+    }
+
     async fn get_exchange_stats(&self) -> Result<LighterExchangeStats, DexError> {
         let url = format!("{}/api/v1/exchangeStats", self.base_url);
 
