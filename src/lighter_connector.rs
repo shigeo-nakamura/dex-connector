@@ -2938,13 +2938,6 @@ impl DexConnector for LighterConnector {
             }
         }
 
-        // If WebSocket is running, don't fall back to REST — wait for WS data
-        if self.is_running.load(Ordering::SeqCst) {
-            return Err(DexError::Other(
-                "balance unavailable: waiting for websocket data".to_string(),
-            ));
-        }
-
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
 
         // First, get the raw response text for debugging
