@@ -187,3 +187,13 @@ pub enum TpSl {
     /// Stop‐Loss
     Sl,
 }
+
+/// Real-time price update from WebSocket order book changes.
+#[derive(Debug, Clone)]
+pub struct PriceUpdate {
+    pub symbol: String,
+    pub mid_price: Decimal,
+    pub best_bid: Decimal,
+    pub best_ask: Decimal,
+    pub timestamp: u64,
+}

@@ -1,7 +1,8 @@
 use crate::{
     dex_request::DexError, BalanceResponse, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
-    OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
+    OrderBookSnapshot, OrderSide, PositionSnapshot, PriceUpdate, TickerResponse, TpSl,
+    TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use debot_utils::parse_to_decimal;
@@ -115,4 +116,15 @@ pub trait DexConnector: Send + Sync {
     async fn sign_evm_65b(&self, message: &str) -> Result<String, DexError>;
 
     async fn sign_evm_65b_with_eip191(&self, message: &str) -> Result<String, DexError>;
+
+    /// Subscribe to real-time price updates from WebSocket order book changes.
+    /// Returns a broadcast receiver that yields PriceUpdate on each OB update.
+    /// Default implementation returns an error (unsupported).
+    fn subscribe_price_updates(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<PriceUpdate>, DexError> {
+        Err(DexError::Other(
+            "subscribe_price_updates not supported by this connector".to_string(),
+        ))
+    }
 }

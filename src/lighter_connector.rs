@@ -340,6 +340,8 @@ pub struct LighterConnector {
     // Cached exchange stats / funding rates to reduce REST API calls
     cached_exchange_stats: Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
     cached_funding_rates: Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
+    // Broadcast sender for real-time price updates from WS OB changes
+    price_update_tx: tokio::sync::broadcast::Sender<crate::PriceUpdate>,
 }
 
 #[derive(Clone, Debug)]
@@ -1385,6 +1387,7 @@ impl LighterConnector {
             ob_stale_after: Duration::from_secs(ob_stale_secs),
             cached_exchange_stats: Arc::new(RwLock::new(None)),
             cached_funding_rates: Arc::new(RwLock::new(None)),
+            price_update_tx: tokio::sync::broadcast::channel(128).0,
         })
     }
 
@@ -1436,6 +1439,7 @@ impl LighterConnector {
             ob_stale_after: Duration::from_secs(ob_stale_secs),
             cached_exchange_stats: Arc::new(RwLock::new(None)),
             cached_funding_rates: Arc::new(RwLock::new(None)),
+            price_update_tx: tokio::sync::broadcast::channel(128).0,
         })
     }
 
@@ -4275,6 +4279,12 @@ impl DexConnector for LighterConnector {
         let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
         self.sign_evm_65b(&prefixed).await
     }
+
+    fn subscribe_price_updates(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<crate::PriceUpdate>, DexError> {
+        Ok(self.price_update_tx.subscribe())
+    }
 }
 
 impl LighterConnector {
@@ -4608,6 +4618,7 @@ impl LighterConnector {
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
+        let price_update_tx = self.price_update_tx.clone();
         let market_cache = Arc::clone(&self.market_cache);
         let mut orderbook_market_ids: Vec<u32> = Vec::new();
         for sym in &self.tracked_symbols {
@@ -5103,6 +5114,7 @@ impl LighterConnector {
                                                 account_index,
                                                 &market_cache,
                                                 default_symbol.as_str(),
+                                                &price_update_tx,
                                             )
                                             .await;
 
@@ -5392,6 +5404,7 @@ impl LighterConnector {
         account_index: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
+        price_update_tx: &tokio::sync::broadcast::Sender<crate::PriceUpdate>,
     ) {
         let msg_type = message.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -5504,6 +5517,14 @@ impl LighterConnector {
                                     .write()
                                     .await
                                     .insert(symbol.clone(), (mid_price, timestamp));
+                                // Broadcast real-time price update to subscribers
+                                let _ = price_update_tx.send(crate::PriceUpdate {
+                                    symbol: symbol.clone(),
+                                    mid_price,
+                                    best_bid: bid_price,
+                                    best_ask: ask_price,
+                                    timestamp,
+                                });
                                 log::trace!(
                                     "Updated price from WebSocket: {} at {} ({})",
                                     mid_price,
