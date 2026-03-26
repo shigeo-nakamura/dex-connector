@@ -4929,9 +4929,11 @@ impl LighterConnector {
                             log::debug!("WebSocket writer task terminated");
                         });
 
-                        // Heartbeat strategy: application-layer ping-pong + control frame ping-pong
+                        // Heartbeat strategy: WebSocket control frame ping-pong only
+                        // Server requires at least one frame every 2 minutes to keep connection alive.
+                        // We send a control Ping every 20s which is well within that limit.
                         const IDLE_PING_SECS: u64 = 20; // Client ping interval
-                        const PONG_TIMEOUT_SECS: u64 = 8; // Pong timeout (reduced from 10s)
+                        const PONG_TIMEOUT_SECS: u64 = 8; // Pong timeout
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
 
                         fn get_pong_payload(ping_payload: &[u8]) -> Vec<u8> {
@@ -4952,22 +4954,15 @@ impl LighterConnector {
 
                         let last_rx = std::sync::Arc::new(AtomicU64::new(now_secs()));
                         let last_tx = std::sync::Arc::new(AtomicU64::new(now_secs()));
-                        let last_app_ping = std::sync::Arc::new(AtomicU64::new(now_secs()));
-                        let last_server_ping = std::sync::Arc::new(AtomicU64::new(0));
                         let pending_client_ping = std::sync::Arc::new(AtomicBool::new(false));
-                        let pending_app_pong = std::sync::Arc::new(AtomicBool::new(false));
                         let last_client_ping_payload =
                             std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
 
                         // Create ping/heartbeat task with priority channel access
                         let ping_is_running = is_running.clone();
                         let ping_connection_alive = connection_alive.clone();
-                        let ping_last_rx = last_rx.clone();
                         let ping_last_tx = last_tx.clone();
-                        let ping_last_app_ping = last_app_ping.clone();
-                        let ping_last_server_ping = last_server_ping.clone();
                         let ping_pending_client_ping = pending_client_ping.clone();
-                        let ping_pending_app_pong = pending_app_pong.clone();
                         let ping_last_client_ping_payload = last_client_ping_payload.clone();
                         let ping_tx_ctrl = tx_ctrl.clone();
                         let ping_conn_label = conn_label.clone();
@@ -4992,12 +4987,11 @@ impl LighterConnector {
                                         let now = now_secs();
                                         let idle_tx = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
 
-                                        // Send client ping regularly (every 20s) regardless of server ping activity
-                                        // This ensures server's ~120s client ping requirement is always satisfied
+                                        // Send WebSocket control Ping regularly (every 20s)
+                                        // Server requires at least one frame every 2 minutes
                                         if !ping_pending_client_ping.load(Ordering::SeqCst)
                                             && idle_tx >= IDLE_PING_SECS
                                         {
-                                            // Send ping with timestamp payload for echo verification
                                             let payload: [u8; 8] = (now as u64).to_be_bytes();
                                             *ping_last_client_ping_payload.lock() = payload.to_vec();
 
@@ -5022,96 +5016,15 @@ impl LighterConnector {
                                             );
                                         }
 
-
-                                        // Send application-layer ping (every 20s) for servers that require JSON ping-pong
-                                        let idle_app_ping = now.saturating_sub(ping_last_app_ping.load(Ordering::SeqCst));
-                                        if !ping_pending_app_pong.load(Ordering::SeqCst)
-                                            && idle_app_ping >= IDLE_PING_SECS
-                                        {
-                                            // Send application-layer ping with timestamp
-                                            let app_ping = serde_json::json!({
-                                                "type": "ping",
-                                                "ts": now
-                                            });
-
-                                            let ping_msg = OutboundMessage::Control(
-                                                tokio_tungstenite::tungstenite::Message::Text(app_ping.to_string())
-                                            );
-                                            if let Err(e) = ping_tx_ctrl.send(ping_msg).await {
-                                                log::warn!(
-                                                    "Failed to send application-layer ping: {:?} (conn={})",
-                                                    e,
-                                                    ping_conn_label
-                                                );
-                                                break;
-                                            }
-
-                                            ping_pending_app_pong.store(true, Ordering::SeqCst);
-                                            ping_last_app_ping.store(now, Ordering::SeqCst);
-                                            log::debug!(
-                                                "Sent application-layer ping (conn={}, ts={})",
-                                                ping_conn_label,
-                                                now
-                                            );
-                                        }
-
                                         // Check for control frame pong timeout
                                         if ping_pending_client_ping.load(Ordering::SeqCst) {
                                             let waited = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
                                             if waited >= PONG_TIMEOUT_SECS {
-                                                let idle_rx =
-                                                    now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
-                                                let last_server_ping_at =
-                                                    ping_last_server_ping.load(Ordering::SeqCst);
-                                                let server_ping_age = if last_server_ping_at == 0 {
-                                                    "n/a".to_string()
-                                                } else {
-                                                    format!(
-                                                        "{}s",
-                                                        now.saturating_sub(last_server_ping_at)
-                                                    )
-                                                };
                                                 log::warn!(
-                                                    "Control pong timeout ({}s), reconnecting (conn={}, idle_rx={}s, idle_tx={}s, last_server_ping_age={})",
+                                                    "Pong timeout ({}s), reconnecting (conn={}, idle_tx={}s)",
                                                     waited,
                                                     ping_conn_label,
-                                                    idle_rx,
                                                     waited,
-                                                    server_ping_age
-                                                );
-                                                let close_msg = OutboundMessage::Control(
-                                                    tokio_tungstenite::tungstenite::Message::Close(None)
-                                                );
-                                                let _ = ping_tx_ctrl.send(close_msg).await;
-                                                break;
-                                            }
-                                        }
-
-                                        // Check for application-layer pong timeout
-                                        if ping_pending_app_pong.load(Ordering::SeqCst) {
-                                            let waited = now.saturating_sub(ping_last_app_ping.load(Ordering::SeqCst));
-                                            if waited >= PONG_TIMEOUT_SECS {
-                                                let idle_rx =
-                                                    now.saturating_sub(ping_last_rx.load(Ordering::SeqCst));
-                                                let last_server_ping_at =
-                                                    ping_last_server_ping.load(Ordering::SeqCst);
-                                                let server_ping_age = if last_server_ping_at == 0 {
-                                                    "n/a".to_string()
-                                                } else {
-                                                    format!(
-                                                        "{}s",
-                                                        now.saturating_sub(last_server_ping_at)
-                                                    )
-                                                };
-                                                log::warn!(
-                                                    "Application pong timeout ({}s), reconnecting (conn={}, idle_rx={}s, idle_tx={}s, last_server_ping_age={})",
-                                                    waited,
-                                                    ping_conn_label,
-                                                    idle_rx,
-                                                    now.saturating_sub(
-                                                        ping_last_tx.load(Ordering::SeqCst)
-                                                    ),
-                                                    server_ping_age
                                                 );
                                                 let close_msg = OutboundMessage::Control(
                                                     tokio_tungstenite::tungstenite::Message::Close(None)
@@ -5162,62 +5075,16 @@ impl LighterConnector {
                                                 channel,
                                                 offset
                                             );
-                                            // Check for application-layer ping/pong FIRST (before business logic)
+                                            // Skip application-layer ping/pong messages (server no longer sends them)
                                             if let Some(msg_type) =
                                                 parsed.get("type").and_then(|t| t.as_str())
                                             {
-                                                if msg_type == "ping" {
+                                                if msg_type == "ping" || msg_type == "pong" {
                                                     log::debug!(
-                                                        "Received application-layer ping (conn={})",
+                                                        "Ignoring application-layer {} (conn={})",
+                                                        msg_type,
                                                         conn_label
                                                     );
-                                                    // Immediate application-layer pong response
-                                                    let mut pong =
-                                                        serde_json::json!({"type": "pong"});
-
-                                                    // Echo any timestamp/id fields as required by server
-                                                    if let Some(ts) = parsed.get("ts") {
-                                                        pong["ts"] = ts.clone();
-                                                    }
-                                                    if let Some(id) = parsed.get("id") {
-                                                        pong["id"] = id.clone();
-                                                    }
-                                                    if let Some(nonce) = parsed.get("nonce") {
-                                                        pong["nonce"] = nonce.clone();
-                                                    }
-
-                                                    // Send application-layer pong via control channel to avoid writer lock contention
-                                                    let pong_msg = OutboundMessage::Control(
-                                                        tokio_tungstenite::tungstenite::Message::Text(
-                                                            pong.to_string(),
-                                                        ),
-                                                    );
-                                                    if let Err(e) =
-                                                        tx_ctrl_for_reader.send(pong_msg).await
-                                                    {
-                                                        log::warn!(
-                                                            "Failed to enqueue application-layer pong: {:?} (conn={})",
-                                                            e,
-                                                            conn_label
-                                                        );
-                                                    } else {
-                                                        log::debug!(
-                                                            "Enqueued application-layer pong (conn={})",
-                                                            conn_label
-                                                        );
-                                                    }
-
-                                                    // Continue to next message (don't process ping as business data)
-                                                    continue;
-                                                } else if msg_type == "pong" {
-                                                    // Application-layer pong received - clear pending state
-                                                    pending_app_pong.store(false, Ordering::SeqCst);
-                                                    log::debug!(
-                                                        "Received application-layer pong (conn={})",
-                                                        conn_label
-                                                    );
-
-                                                    // Continue to next message (don't process pong as business data)
                                                     continue;
                                                 }
                                             }
@@ -5265,7 +5132,6 @@ impl LighterConnector {
                                             conn_label
                                         );
                                         let now = now_secs();
-                                        last_server_ping.store(now, Ordering::SeqCst);
                                         last_rx.store(now, Ordering::SeqCst);
 
                                         // Echo pong payload for server compliance
@@ -5403,13 +5269,12 @@ impl LighterConnector {
                                         let idle_tx =
                                             now.saturating_sub(last_tx.load(Ordering::SeqCst));
                                         log::warn!(
-                                            "WebSocket close frame received: {:?} (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}, pending_app_pong={})",
+                                            "WebSocket close frame received: {:?} (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={})",
                                             frame,
                                             conn_label,
                                             idle_rx,
                                             idle_tx,
                                             pending_client_ping.load(Ordering::SeqCst),
-                                            pending_app_pong.load(Ordering::SeqCst)
                                         );
                                         break;
                                     }
@@ -5427,25 +5292,14 @@ impl LighterConnector {
                                     let now = now_secs();
                                     let last_rx_at = last_rx.load(Ordering::SeqCst);
                                     let last_tx_at = last_tx.load(Ordering::SeqCst);
-                                    let last_app_ping_at = last_app_ping.load(Ordering::SeqCst);
-                                    let last_server_ping_at =
-                                        last_server_ping.load(Ordering::SeqCst);
-                                    let server_ping_age = if last_server_ping_at == 0 {
-                                        "n/a".to_string()
-                                    } else {
-                                        format!("{}s", now.saturating_sub(last_server_ping_at))
-                                    };
                                     log::error!(
-                                        "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, last_app_ping_age={}s, last_server_ping_age={}, pending_client_ping={}, pending_app_pong={}). Will attempt reconnection.",
+                                        "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}). Will attempt reconnection.",
                                         e,
                                         std::any::type_name_of_val(&e),
                                         conn_label,
                                         now.saturating_sub(last_rx_at),
                                         now.saturating_sub(last_tx_at),
-                                        now.saturating_sub(last_app_ping_at),
-                                        server_ping_age,
                                         pending_client_ping.load(Ordering::SeqCst),
-                                        pending_app_pong.load(Ordering::SeqCst)
                                     );
                                     match &e {
                                         tokio_tungstenite::tungstenite::Error::Protocol(
