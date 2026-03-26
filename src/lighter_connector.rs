@@ -2089,7 +2089,7 @@ impl LighterConnector {
 
         // Fetch all accounts for this wallet address
         let accounts_url = format!(
-            "{}/api/v1/accounts?l1_address={}",
+            "{}/api/v1/account?by=l1_address&value={}",
             self.base_url, wallet_address
         );
 
