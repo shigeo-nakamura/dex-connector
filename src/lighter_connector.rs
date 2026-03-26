@@ -378,6 +378,8 @@ struct LighterAccountResponse {
 #[allow(dead_code)]
 struct LighterAccountInfo {
     account_index: i64,
+    #[serde(default)]
+    l1_address: String,
     available_balance: String,
     collateral: String,
     total_asset_value: String,
@@ -2075,11 +2077,94 @@ impl LighterConnector {
         *cache = None;
     }
 
-    #[allow(dead_code)]
-    async fn discover_account_index(&self) -> Result<u64, DexError> {
-        // For now, just return the configured account_index
-        // In production, this could query the API to find the correct index
-        Ok(self.account_index)
+    /// Discover account_index by querying the API with wallet_address and api_key_index.
+    /// Fetches all accounts for the wallet's l1_address, then probes each account's
+    /// `/api/v1/apikeys` endpoint to find the one matching our `api_key_index`.
+    pub async fn discover_account_index(&self, wallet_address: &str) -> Result<u64, DexError> {
+        log::info!(
+            "Discovering account_index for api_key_index={} wallet={}...",
+            self.api_key_index,
+            wallet_address
+        );
+
+        // Fetch all accounts for this wallet address
+        let accounts_url = format!(
+            "{}/api/v1/accounts?l1_address={}",
+            self.base_url, wallet_address
+        );
+
+        let response = self
+            .client
+            .get(&accounts_url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| {
+                DexError::Other(format!("Failed to query accounts for discovery: {}", e))
+            })?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| {
+            DexError::Other(format!("Failed to read accounts response: {}", e))
+        })?;
+
+        if !status.is_success() {
+            return Err(DexError::Other(format!(
+                "Accounts API returned HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let account_resp: LighterAccountResponse =
+            serde_json::from_str(&body).map_err(|e| {
+                DexError::Other(format!("Failed to parse accounts response: {}", e))
+            })?;
+
+        if account_resp.accounts.is_empty() {
+            return Err(DexError::Other(format!(
+                "No accounts found for wallet {}",
+                wallet_address
+            )));
+        }
+
+        // Probe each account's apikeys to find the one with our api_key_index
+        for account in &account_resp.accounts {
+            let acct_idx = account.account_index as u64;
+            let probe_url = format!(
+                "{}/api/v1/apikeys?account_index={}&api_key_index={}",
+                self.base_url, acct_idx, self.api_key_index
+            );
+
+            let probe_resp = self
+                .client
+                .get(&probe_url)
+                .header("X-API-KEY", &self.api_key_public)
+                .send()
+                .await;
+
+            if let Ok(resp) = probe_resp {
+                if let Ok(text) = resp.text().await {
+                    if let Ok(apikey_resp) = serde_json::from_str::<ApiKeyResponse>(&text) {
+                        if apikey_resp.code == 200 && !apikey_resp.api_keys.is_empty() {
+                            log::info!(
+                                "Discovered account_index={} for api_key_index={}",
+                                acct_idx,
+                                self.api_key_index
+                            );
+                            return Ok(acct_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(DexError::Other(format!(
+            "Could not find account for api_key_index={} in {} accounts for wallet {}. \
+             Set LIGHTER_ACCOUNT_INDEX manually.",
+            self.api_key_index,
+            account_resp.accounts.len(),
+            wallet_address
+        )))
     }
 
     async fn get_server_public_key(&self) -> Result<String, DexError> {
