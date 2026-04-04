@@ -3365,12 +3365,9 @@ impl DexConnector for LighterConnector {
             }
         };
         if updated_at.elapsed() > self.ob_stale_after {
-            let mut ob_guard = self.order_book.write().await;
-            if let Some(entry) = ob_guard.get(&market_id) {
-                if entry.updated_at.elapsed() > self.ob_stale_after {
-                    ob_guard.remove(&market_id);
-                }
-            }
+            // Don't remove stale entry from cache — it may be needed as a
+            // baseline for delta merges after WS reconnection. The entry will
+            // be replaced once a fresh update arrives. See: dex-connector#2
             return Err(DexError::Other(
                 "order book snapshot unavailable (no recent update)".to_string(),
             ));
@@ -5351,16 +5348,17 @@ impl LighterConnector {
                         writer_task.abort();
                         ping_task.abort();
 
-                        {
-                            let mut ob_guard = order_book.write().await;
-                            if !ob_guard.is_empty() {
-                                ob_guard.clear();
-                                log::debug!(
-                                    "Cleared order book cache after websocket disconnect (conn={})",
-                                    conn_label
-                                );
-                            }
-                        }
+                        // NOTE: Do NOT clear order book cache here.
+                        // Clearing causes "order book snapshot unavailable" errors
+                        // during the gap between reconnection and the first OB update.
+                        // The staleness check (ob_stale_after) will naturally expire
+                        // stale entries, and the reconnected WS will replace them
+                        // with fresh data once the first update arrives.
+                        // See: dex-connector#2
+                        log::info!(
+                            "WebSocket disconnected (conn={}), keeping OB cache (will expire via staleness check)",
+                            conn_label
+                        );
 
                         reconnect_attempt += 1;
                     }
