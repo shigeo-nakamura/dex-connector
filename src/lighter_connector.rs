@@ -4205,8 +4205,17 @@ impl DexConnector for LighterConnector {
             let info = self.maintenance.read().await;
             let needs_refresh = match info.last_checked {
                 Some(ts) => now - ts >= cache_ttl,
-                None => true,
+                // First check: defer by jitter to avoid all bots hitting API on startup
+                None => {
+                    drop(info);
+                    let mut info = self.maintenance.write().await;
+                    if info.last_checked.is_none() {
+                        info.last_checked = Some(now);
+                    }
+                    false
+                }
             };
+            let info = self.maintenance.read().await;
             (needs_refresh, info.next_start.clone())
         };
 
