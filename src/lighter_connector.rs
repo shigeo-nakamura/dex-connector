@@ -4196,7 +4196,10 @@ impl DexConnector for LighterConnector {
 
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
         let now = Utc::now();
-        let cache_ttl = ChronoDuration::minutes(MAINTENANCE_CACHE_TTL_MINS);
+        // Add random jitter (0-3 min) to avoid multiple bots hitting the API simultaneously
+        let jitter_secs = rand::random::<u64>() % 180;
+        let cache_ttl =
+            ChronoDuration::minutes(MAINTENANCE_CACHE_TTL_MINS) + ChronoDuration::seconds(jitter_secs as i64);
 
         let (needs_refresh, cached_start) = {
             let info = self.maintenance.read().await;
