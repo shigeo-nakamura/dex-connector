@@ -20,7 +20,12 @@ const DEFAULT_PRICE_DECIMALS: u32 = 1;
 const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
 const LIGHTER_ANNOUNCEMENT_ENDPOINT: &str = "/api/v1/announcement";
-const MAINTENANCE_CACHE_TTL_MINS: i64 = 60;
+/// Default cache TTL for the maintenance check. Override at runtime via the
+/// `LIGHTER_MAINTENANCE_TTL_MINS` env var. Lighter's announcements endpoint
+/// has aggressive per-IP rate limiting that does not match the documented
+/// REST limits, so the operator may need to tune this much higher than the
+/// default depending on observed 429 rates.
+const DEFAULT_MAINTENANCE_CACHE_TTL_MINS: i64 = 60;
 /// Backoff after a 429 response. Lighter rate-limits this endpoint
 /// aggressively when many bots share a host; back off for an hour to give
 /// the limit time to release. See bot-strategy#15.
@@ -34,6 +39,21 @@ const MAINTENANCE_BACKOFF_OTHER_MINS: i64 = 15;
 /// restart (e.g. after a CI deploy).
 const MAINTENANCE_STARTUP_STAGGER_MINS: i64 = 60;
 const DEFAULT_ORDERBOOK_STALE_SECS: u64 = 15;
+
+/// Read the maintenance check TTL from `LIGHTER_MAINTENANCE_TTL_MINS`.
+/// Falls back to `DEFAULT_MAINTENANCE_CACHE_TTL_MINS` if the env var is
+/// missing, empty, or unparseable. Negative or zero values are treated as
+/// invalid and the default is used (a zero TTL would cause every call to
+/// hit the network).
+fn maintenance_ttl_mins() -> i64 {
+    match std::env::var("LIGHTER_MAINTENANCE_TTL_MINS") {
+        Ok(s) => match s.trim().parse::<i64>() {
+            Ok(v) if v > 0 => v,
+            _ => DEFAULT_MAINTENANCE_CACHE_TTL_MINS,
+        },
+        Err(_) => DEFAULT_MAINTENANCE_CACHE_TTL_MINS,
+    }
+}
 
 /// Configuration for creating a LighterConnector.
 #[derive(Debug, Clone)]
@@ -4207,13 +4227,18 @@ impl DexConnector for LighterConnector {
     }
 
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
+        // The actual TTL is read fresh on every call so the operator can
+        // change `LIGHTER_MAINTENANCE_TTL_MINS` and have it take effect on
+        // the next cycle without restarting the process. The cost of one
+        // env::var read per (~hourly) call is negligible.
         let now = Utc::now();
+        let ttl_mins = maintenance_ttl_mins();
         // Add random jitter (0-10 min) to avoid multiple bots hitting the API
-        // simultaneously. With TTL=30min and jitter=0-10min, refreshes from N
-        // co-located processes spread over a 10min window every 30-40min.
+        // simultaneously. With base TTL and jitter=0-10min, refreshes from N
+        // co-located processes spread over a 10min window every TTL+jitter.
         let jitter_secs = rand::random::<u64>() % 600;
         let cache_ttl =
-            ChronoDuration::minutes(MAINTENANCE_CACHE_TTL_MINS) + ChronoDuration::seconds(jitter_secs as i64);
+            ChronoDuration::minutes(ttl_mins) + ChronoDuration::seconds(jitter_secs as i64);
 
         let (needs_refresh, cached_start) = {
             let info = self.maintenance.read().await;
@@ -4284,7 +4309,7 @@ impl DexConnector for LighterConnector {
                 let mut info = self.maintenance.write().await;
                 info.last_checked = Some(
                     now + ChronoDuration::minutes(backoff_mins)
-                        - ChronoDuration::minutes(MAINTENANCE_CACHE_TTL_MINS),
+                        - ChronoDuration::minutes(ttl_mins),
                 );
                 let res =
                     Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
