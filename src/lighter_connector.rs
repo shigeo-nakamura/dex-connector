@@ -4293,8 +4293,14 @@ impl DexConnector for LighterConnector {
             }
             Err(err) => {
                 let err_str = format!("{:?}", err);
+                // On 429, back off for at least the configured TTL: retrying
+                // more often than the normal refresh cadence is pointless and
+                // wastes REST budget against an endpoint that is already
+                // rejecting us. Honors LIGHTER_MAINTENANCE_TTL_MINS so the
+                // operator env var actually takes effect under 429 (see
+                // bot-strategy#15).
                 let backoff_mins = if err_str.contains("429") {
-                    MAINTENANCE_BACKOFF_429_MINS
+                    ttl_mins.max(MAINTENANCE_BACKOFF_429_MINS)
                 } else {
                     MAINTENANCE_BACKOFF_OTHER_MINS
                 };
