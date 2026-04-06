@@ -20,7 +20,14 @@ const DEFAULT_PRICE_DECIMALS: u32 = 1;
 const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
 const LIGHTER_ANNOUNCEMENT_ENDPOINT: &str = "/api/v1/announcement";
-const MAINTENANCE_CACHE_TTL_MINS: i64 = 10;
+const MAINTENANCE_CACHE_TTL_MINS: i64 = 30;
+/// Backoff after a 429 response. Lighter rate-limits this endpoint
+/// aggressively when many bots share a host; back off for an hour to give
+/// the limit time to release. See bot-strategy#15.
+const MAINTENANCE_BACKOFF_429_MINS: i64 = 60;
+/// Backoff after a non-429 fetch error (network, parse, etc.). Shorter than
+/// the 429 backoff because the cause is more likely transient.
+const MAINTENANCE_BACKOFF_OTHER_MINS: i64 = 15;
 const DEFAULT_ORDERBOOK_STALE_SECS: u64 = 15;
 
 /// Configuration for creating a LighterConnector.
@@ -4196,8 +4203,10 @@ impl DexConnector for LighterConnector {
 
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
         let now = Utc::now();
-        // Add random jitter (0-3 min) to avoid multiple bots hitting the API simultaneously
-        let jitter_secs = rand::random::<u64>() % 180;
+        // Add random jitter (0-10 min) to avoid multiple bots hitting the API
+        // simultaneously. With TTL=30min and jitter=0-10min, refreshes from N
+        // co-located processes spread over a 10min window every 30-40min.
+        let jitter_secs = rand::random::<u64>() % 600;
         let cache_ttl =
             ChronoDuration::minutes(MAINTENANCE_CACHE_TTL_MINS) + ChronoDuration::seconds(jitter_secs as i64);
 
@@ -4246,10 +4255,25 @@ impl DexConnector for LighterConnector {
                 res
             }
             Err(err) => {
-                log::warn!("Failed to refresh Lighter maintenance schedule: {:?}", err);
-                // Update last_checked even on error to avoid retrying every tick
+                let err_str = format!("{:?}", err);
+                let backoff_mins = if err_str.contains("429") {
+                    MAINTENANCE_BACKOFF_429_MINS
+                } else {
+                    MAINTENANCE_BACKOFF_OTHER_MINS
+                };
+                log::warn!(
+                    "Failed to refresh Lighter maintenance schedule (backing off {}min): {:?}",
+                    backoff_mins,
+                    err
+                );
+                // Push last_checked into the future so the next refresh waits
+                // for the backoff window. Subtracting the base TTL is correct
+                // because the refresh trigger is `now - last_checked >= ttl`.
                 let mut info = self.maintenance.write().await;
-                info.last_checked = Some(now);
+                info.last_checked = Some(
+                    now + ChronoDuration::minutes(backoff_mins)
+                        - ChronoDuration::minutes(MAINTENANCE_CACHE_TTL_MINS),
+                );
                 let res =
                     Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
                 log::debug!(
