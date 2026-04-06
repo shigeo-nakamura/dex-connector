@@ -20,7 +20,7 @@ const DEFAULT_PRICE_DECIMALS: u32 = 1;
 const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
 const LIGHTER_ANNOUNCEMENT_ENDPOINT: &str = "/api/v1/announcement";
-const MAINTENANCE_CACHE_TTL_MINS: i64 = 30;
+const MAINTENANCE_CACHE_TTL_MINS: i64 = 60;
 /// Backoff after a 429 response. Lighter rate-limits this endpoint
 /// aggressively when many bots share a host; back off for an hour to give
 /// the limit time to release. See bot-strategy#15.
@@ -28,6 +28,11 @@ const MAINTENANCE_BACKOFF_429_MINS: i64 = 60;
 /// Backoff after a non-429 fetch error (network, parse, etc.). Shorter than
 /// the 429 backoff because the cause is more likely transient.
 const MAINTENANCE_BACKOFF_OTHER_MINS: i64 = 15;
+/// Maximum stagger applied to the first fetch after process start.
+/// Combined with the per-cycle jitter and TTL, this ensures co-located bots
+/// do not all hit the announcements endpoint simultaneously after a fleet
+/// restart (e.g. after a CI deploy).
+const MAINTENANCE_STARTUP_STAGGER_MINS: i64 = 60;
 const DEFAULT_ORDERBOOK_STALE_SECS: u64 = 15;
 
 /// Configuration for creating a LighterConnector.
@@ -4214,12 +4219,19 @@ impl DexConnector for LighterConnector {
             let info = self.maintenance.read().await;
             let needs_refresh = match info.last_checked {
                 Some(ts) => now - ts >= cache_ttl,
-                // First check: defer by jitter to avoid all bots hitting API on startup
+                // First check: stagger the first fetch by 0..STARTUP_STAGGER_MINS
+                // *into the future* so that bots restarted together (e.g. after a
+                // CI deploy) do not all fetch at the same time when the cache TTL
+                // expires. Effective first-fetch time is
+                //   now + stagger + cache_ttl  (= up to 60 + 60-70 minutes)
                 None => {
                     drop(info);
                     let mut info = self.maintenance.write().await;
                     if info.last_checked.is_none() {
-                        info.last_checked = Some(now);
+                        let stagger_secs =
+                            rand::random::<u64>() % (MAINTENANCE_STARTUP_STAGGER_MINS as u64 * 60);
+                        info.last_checked =
+                            Some(now + ChronoDuration::seconds(stagger_secs as i64));
                     }
                     false
                 }
