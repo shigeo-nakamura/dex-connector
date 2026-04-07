@@ -57,6 +57,12 @@ pub struct TickerResponse {
     pub open_interest: Option<Decimal>,
     pub funding_rate: Option<Decimal>,
     pub oracle_price: Option<Decimal>,
+    /// Exchange-side timestamp (Unix seconds) of the most recent price update.
+    /// When `Some`, this is the event time as reported by the exchange (e.g.
+    /// the WS order_book message's `last_updated_at`). Multiple processes
+    /// observing the same feed will see identical values for the same update,
+    /// which is required for multi-bot A/B fairness (see pairtrade#4).
+    pub exchange_ts: Option<u64>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]

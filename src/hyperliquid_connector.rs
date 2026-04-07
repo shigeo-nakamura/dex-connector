@@ -1378,6 +1378,7 @@ impl DexConnector for HyperliquidConnector {
             funding_rate,
             open_interest,
             oracle_price,
+            exchange_ts: None,
         })
     }
 

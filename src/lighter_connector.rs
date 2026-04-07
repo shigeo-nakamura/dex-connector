@@ -2804,6 +2804,7 @@ impl DexConnector for LighterConnector {
                 open_interest: None,
                 funding_rate: None,
                 oracle_price: None,
+                exchange_ts: None,
             });
         }
 
@@ -2888,6 +2889,7 @@ impl DexConnector for LighterConnector {
                     open_interest: None,
                     funding_rate,
                     oracle_price: None,
+                    exchange_ts: Some(price_timestamp),
                 });
             }
         }
@@ -3001,6 +3003,9 @@ impl DexConnector for LighterConnector {
             open_interest: None,
             funding_rate,
             oracle_price: None,
+            // REST fallback path: no exchange ts available, leave as None so
+            // callers know to fall back to local clock for bucketing.
+            exchange_ts: None,
         })
     }
 
@@ -5579,16 +5584,28 @@ impl LighterConnector {
                                     return;
                                 }
 
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
+                                // Prefer the exchange-side `last_updated_at` (microseconds since
+                                // epoch) so that all bots observing the same WS feed share an
+                                // identical timestamp for the same update. Required for the
+                                // multi-bot bar-alignment fix (pairtrade#4).
+                                let exchange_ts_secs = message
+                                    .get("last_updated_at")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|us| us / 1_000_000);
+                                let timestamp = exchange_ts_secs.unwrap_or_else(|| {
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs()
+                                });
                                 log::debug!(
-                                    "[WS_OB] {} best_bid={} best_ask={} mid={}",
+                                    "[WS_OB] {} best_bid={} best_ask={} mid={} ts={}{}",
                                     symbol,
                                     bid_price,
                                     ask_price,
-                                    mid_price
+                                    mid_price,
+                                    timestamp,
+                                    if exchange_ts_secs.is_some() { " (exchange)" } else { " (local)" }
                                 );
                                 current_price
                                     .write()
