@@ -28,21 +28,15 @@ const MAX_DECIMAL_PRECISION: u32 = 9;
 const LIGHTER_STATUS_FEED_URL: &str = "https://status.lighter.xyz/feed.rss";
 /// Default cache TTL for the maintenance check. Override at runtime via the
 /// `LIGHTER_MAINTENANCE_TTL_MINS` env var. The status page CDN tolerates
-/// frequent polling, but we keep the default conservative because there is
-/// no operational reason to refresh more often.
-const DEFAULT_MAINTENANCE_CACHE_TTL_MINS: i64 = 60;
-/// Backoff after a 429 response. Lighter rate-limits this endpoint
-/// aggressively when many bots share a host; back off for an hour to give
-/// the limit time to release. See bot-strategy#15.
-const MAINTENANCE_BACKOFF_429_MINS: i64 = 60;
-/// Backoff after a non-429 fetch error (network, parse, etc.). Shorter than
-/// the 429 backoff because the cause is more likely transient.
-const MAINTENANCE_BACKOFF_OTHER_MINS: i64 = 15;
-/// Maximum stagger applied to the first fetch after process start.
-/// Combined with the per-cycle jitter and TTL, this ensures co-located bots
-/// do not all hit the announcements endpoint simultaneously after a fleet
-/// restart (e.g. after a CI deploy).
-const MAINTENANCE_STARTUP_STAGGER_MINS: i64 = 60;
+/// frequent polling, so we refresh aggressively to minimize detection
+/// latency for newly announced maintenance windows.
+const DEFAULT_MAINTENANCE_CACHE_TTL_MINS: i64 = 5;
+/// Backoff after a 429 response. The status page CDN should not rate-limit
+/// us in practice, but if it does, back off conservatively.
+const MAINTENANCE_BACKOFF_429_MINS: i64 = 15;
+/// Backoff after a non-429 fetch error (network, parse, etc.). Short
+/// because transient network errors are expected to clear quickly.
+const MAINTENANCE_BACKOFF_OTHER_MINS: i64 = 5;
 const DEFAULT_ORDERBOOK_STALE_SECS: u64 = 15;
 
 /// Read the maintenance check TTL from `LIGHTER_MAINTENANCE_TTL_MINS`.
@@ -4295,10 +4289,10 @@ impl DexConnector for LighterConnector {
         // env::var read per (~hourly) call is negligible.
         let now = Utc::now();
         let ttl_mins = maintenance_ttl_mins();
-        // Add random jitter (0-10 min) to avoid multiple bots hitting the API
-        // simultaneously. With base TTL and jitter=0-10min, refreshes from N
-        // co-located processes spread over a 10min window every TTL+jitter.
-        let jitter_secs = rand::random::<u64>() % 600;
+        // Small jitter (0-60s) to avoid co-located bots hitting the status
+        // page CDN at the exact same instant. The CDN does not rate-limit
+        // us in practice, so we no longer need a multi-minute spread.
+        let jitter_secs = rand::random::<u64>() % 60;
         let cache_ttl =
             ChronoDuration::minutes(ttl_mins) + ChronoDuration::seconds(jitter_secs as i64);
 
@@ -4306,22 +4300,12 @@ impl DexConnector for LighterConnector {
             let info = self.maintenance.read().await;
             let needs_refresh = match info.last_checked {
                 Some(ts) => now - ts >= cache_ttl,
-                // First check: stagger the first fetch by 0..STARTUP_STAGGER_MINS
-                // *into the future* so that bots restarted together (e.g. after a
-                // CI deploy) do not all fetch at the same time when the cache TTL
-                // expires. Effective first-fetch time is
-                //   now + stagger + cache_ttl  (= up to 60 + 60-70 minutes)
-                None => {
-                    drop(info);
-                    let mut info = self.maintenance.write().await;
-                    if info.last_checked.is_none() {
-                        let stagger_secs =
-                            rand::random::<u64>() % (MAINTENANCE_STARTUP_STAGGER_MINS as u64 * 60);
-                        info.last_checked =
-                            Some(now + ChronoDuration::seconds(stagger_secs as i64));
-                    }
-                    false
-                }
+                // First check on a freshly started process: fetch
+                // immediately so the bot has maintenance information
+                // available from the moment it starts trading. The status
+                // page CDN can absorb a fleet restart of 7 processes
+                // hitting it within a few seconds.
+                None => true,
             };
             let info = self.maintenance.read().await;
             (needs_refresh, info.next_start.clone())
