@@ -610,7 +610,11 @@ impl LighterConnector {
             .any(|keyword| lower_title.contains(keyword) || lower_content.contains(keyword))
     }
 
-    fn parse_datetime_from_text(title: &str, content: &str) -> Option<DateTime<Utc>> {
+    fn parse_datetime_from_text(
+        title: &str,
+        content: &str,
+        pub_date_hint: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
         // Examples from announcements:
         // - "We're doing a network upgrade on Sunday November 30th at 12PM UTC."
         // - "November 23, 2025 at 12:00 PM UTC"
@@ -636,10 +640,17 @@ impl LighterConnector {
         let caps = DT_RE.captures(&haystack)?;
         let month_str = caps.get(1)?.as_str();
         let day: u32 = caps.get(2)?.as_str().parse().ok()?;
-        let year: i32 = if let Some(m) = caps.get(3) {
-            m.as_str().parse().ok()?
+        // When the announcement text omits the year, derive it from the
+        // RSS pub_date if available (the year of publication is almost
+        // always the year the event occurs in for Lighter status posts).
+        // Falling back to "current year" is dangerous because old RSS
+        // items get reinterpreted as future events. See bot-strategy#32.
+        let (year, year_was_inferred) = if let Some(m) = caps.get(3) {
+            (m.as_str().parse().ok()?, false)
+        } else if let Some(hint) = pub_date_hint {
+            (hint.year(), true)
         } else {
-            Utc::now().year()
+            (Utc::now().year(), true)
         };
         let hour_raw: u32 = caps.get(4)?.as_str().parse().ok()?;
         let minute: u32 = caps
@@ -686,8 +697,12 @@ impl LighterConnector {
         let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour_24, minute, 0)?;
         let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
 
-        // If year was inferred and the date is already past, try bumping to next year
-        if caps.get(3).is_none() && dt < Utc::now() {
+        // Year-rollover heuristic: only apply when the year was inferred
+        // *without* a pub_date hint (i.e. fall-back to current-year). With
+        // a pub_date hint we trust the publication year — bumping a past
+        // date to "next year" would falsely turn a stale RSS item into a
+        // future event, which is exactly the bug from bot-strategy#32.
+        if year_was_inferred && pub_date_hint.is_none() && dt < Utc::now() {
             let naive_next =
                 NaiveDate::from_ymd_opt(year + 1, month, day)?.and_hms_opt(hour_24, minute, 0)?;
             return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive_next, Utc));
@@ -805,7 +820,9 @@ impl LighterConnector {
             .into_iter()
             .filter(|item| Self::announcement_mentions_downtime(&item.title, &item.description))
             .filter_map(|item| {
-                if let Some(dt) = Self::parse_datetime_from_text(&item.title, &item.description) {
+                if let Some(dt) =
+                    Self::parse_datetime_from_text(&item.title, &item.description, item.pub_date)
+                {
                     if dt >= now {
                         return Some(dt);
                     }
