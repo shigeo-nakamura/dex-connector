@@ -19,12 +19,17 @@ const TIF_POST_ONLY: u32 = 2; // Post-Only (behaves like GTT but rejects immedia
 const DEFAULT_PRICE_DECIMALS: u32 = 1;
 const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
-const LIGHTER_ANNOUNCEMENT_ENDPOINT: &str = "/api/v1/announcement";
+/// Lighter operates an official Better Stack status page that exposes a
+/// public RSS feed of incidents and scheduled maintenance. We fetch this
+/// instead of the trading API's `/api/v1/announcement` endpoint, which is
+/// rate-limited and WAF-protected (see bot-strategy#15, #32). The RSS feed
+/// is on an independent CDN so it does not share rate limits with the
+/// trading endpoints.
+const LIGHTER_STATUS_FEED_URL: &str = "https://status.lighter.xyz/feed.rss";
 /// Default cache TTL for the maintenance check. Override at runtime via the
-/// `LIGHTER_MAINTENANCE_TTL_MINS` env var. Lighter's announcements endpoint
-/// has aggressive per-IP rate limiting that does not match the documented
-/// REST limits, so the operator may need to tune this much higher than the
-/// default depending on observed 429 rates.
+/// `LIGHTER_MAINTENANCE_TTL_MINS` env var. The status page CDN tolerates
+/// frequent polling, but we keep the default conservative because there is
+/// no operational reason to refresh more often.
 const DEFAULT_MAINTENANCE_CACHE_TTL_MINS: i64 = 60;
 /// Backoff after a 429 response. Lighter rate-limits this endpoint
 /// aggressively when many bots share a host; back off for an hour to give
@@ -117,17 +122,12 @@ struct MaintenanceInfo {
     last_checked: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LighterAnnouncementsResponse {
-    #[serde(default)]
-    announcements: Vec<LighterAnnouncement>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LighterAnnouncement {
+/// One `<item>` extracted from the Lighter status RSS feed.
+#[derive(Debug, Clone)]
+struct LighterRssItem {
     title: String,
-    content: String,
-    created_at: i64,
+    description: String,
+    pub_date: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -717,85 +717,131 @@ impl LighterConnector {
         false
     }
 
-    async fn fetch_next_maintenance_window(&self) -> Result<Option<DateTime<Utc>>, DexError> {
-        let base = self.base_url.trim_end_matches('/');
-        let url = format!("{}{}", base, LIGHTER_ANNOUNCEMENT_ENDPOINT);
+    /// Decode minimal HTML/XML entities that appear in Better Stack RSS
+    /// `<description>` text. We don't need a full HTML decoder — only the
+    /// five XML entities plus a couple of common numeric escapes.
+    fn decode_xml_entities(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
 
-        let response = self.client.get(&url).send().await.map_err(|e| {
-            DexError::Other(format!("Failed to fetch Lighter announcements: {}", e))
+    /// Parse a Better Stack RSS feed body into a list of items. We use
+    /// regex rather than a full XML parser because the feed schema is
+    /// trivial (flat `<item>` blocks with no nesting we care about) and
+    /// we already depend on `regex`. This avoids pulling in `quick-xml`.
+    fn parse_lighter_rss(body: &str) -> Vec<LighterRssItem> {
+        lazy_static! {
+            static ref ITEM_RE: Regex = Regex::new(r"(?s)<item>(.*?)</item>").unwrap();
+            static ref TITLE_RE: Regex = Regex::new(r"(?s)<title>(.*?)</title>").unwrap();
+            static ref DESC_RE: Regex = Regex::new(r"(?s)<description>(.*?)</description>").unwrap();
+            static ref DATE_RE: Regex = Regex::new(r"(?s)<pubDate>(.*?)</pubDate>").unwrap();
+        }
+
+        ITEM_RE
+            .captures_iter(body)
+            .filter_map(|item_caps| {
+                let inner = item_caps.get(1)?.as_str();
+                let title = TITLE_RE
+                    .captures(inner)
+                    .and_then(|c| c.get(1))
+                    .map(|m| Self::decode_xml_entities(m.as_str().trim()))
+                    .unwrap_or_default();
+                let description = DESC_RE
+                    .captures(inner)
+                    .and_then(|c| c.get(1))
+                    .map(|m| Self::decode_xml_entities(m.as_str().trim()))
+                    .unwrap_or_default();
+                let pub_date = DATE_RE
+                    .captures(inner)
+                    .and_then(|c| c.get(1))
+                    .and_then(|m| {
+                        DateTime::parse_from_rfc2822(m.as_str().trim())
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    });
+
+                if title.is_empty() && description.is_empty() {
+                    None
+                } else {
+                    Some(LighterRssItem {
+                        title,
+                        description,
+                        pub_date,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    async fn fetch_next_maintenance_window(&self) -> Result<Option<DateTime<Utc>>, DexError> {
+        let url = LIGHTER_STATUS_FEED_URL;
+
+        let response = self.client.get(url).send().await.map_err(|e| {
+            DexError::Other(format!("Failed to fetch Lighter status feed: {}", e))
         })?;
 
         if !response.status().is_success() {
             return Err(DexError::Other(format!(
-                "Lighter announcements endpoint returned HTTP {}",
+                "Lighter status feed returned HTTP {}",
                 response.status()
             )));
         }
 
-        let payload: LighterAnnouncementsResponse = response.json().await.map_err(|e| {
-            DexError::Other(format!("Failed to parse Lighter announcements: {}", e))
+        let body = response.text().await.map_err(|e| {
+            DexError::Other(format!("Failed to read Lighter status feed body: {}", e))
         })?;
 
+        let items = Self::parse_lighter_rss(&body);
         let now = Utc::now();
-        let announcement_titles: Vec<String> = payload
-            .announcements
-            .iter()
-            .map(|ann| ann.title.clone())
-            .collect();
 
         log::debug!(
-            "Lighter maintenance fetch: url={} count={} titles={:?}",
+            "Lighter maintenance fetch: url={} item_count={}",
             url,
-            payload.announcements.len(),
-            announcement_titles
+            items.len()
         );
 
-        let mut upcoming: Vec<DateTime<Utc>> = payload
-            .announcements
+        let mut upcoming: Vec<DateTime<Utc>> = items
             .into_iter()
-            .filter(|ann| Self::announcement_mentions_downtime(&ann.title, &ann.content))
-            .filter_map(|ann| {
-                if let Some(dt) = Self::parse_datetime_from_text(&ann.title, &ann.content) {
+            .filter(|item| Self::announcement_mentions_downtime(&item.title, &item.description))
+            .filter_map(|item| {
+                if let Some(dt) = Self::parse_datetime_from_text(&item.title, &item.description) {
                     if dt >= now {
                         return Some(dt);
                     }
                     log::debug!(
                         "Lighter maintenance parse: parsed datetime {} already past, skipping (title={})",
                         dt,
-                        ann.title
+                        item.title
                     );
                 }
 
-                match DateTime::<Utc>::from_timestamp(ann.created_at, 0) {
+                // Fall back to pubDate. RSS pubDate is *publication* time, not
+                // event time, so this only catches cases where the body text
+                // didn't parse — better to err on the side of warning the bot
+                // about a maintenance window than to silently drop it.
+                match item.pub_date {
                     Some(dt) if dt >= now => Some(dt),
                     Some(dt) => {
                         log::debug!(
-                            "Lighter maintenance skip past announcement: scheduled={} now={}",
+                            "Lighter maintenance skip past pub_date: pub_date={} now={} title={}",
                             dt,
-                            now
+                            now,
+                            item.title
                         );
                         None
                     }
                     None => {
                         log::debug!(
-                            "Lighter maintenance parse: failed to parse created_at={} title={}",
-                            ann.created_at,
-                            ann.title
+                            "Lighter maintenance parse: no pub_date and no parseable text, title={}",
+                            item.title
                         );
                         None
                     }
                 }
-            })
-            .filter(|scheduled| {
-                if *scheduled < now {
-                    log::debug!(
-                        "Lighter maintenance skip past announcement: scheduled={} now={}",
-                        scheduled,
-                        now
-                    );
-                    return false;
-                }
-                true
             })
             .collect();
 
