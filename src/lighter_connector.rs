@@ -4232,6 +4232,17 @@ impl DexConnector for LighterConnector {
     }
 
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
+        // Operator kill-switch. When `LIGHTER_MAINTENANCE_DISABLED=1` is set,
+        // skip the announcements fetch entirely and never report an upcoming
+        // maintenance window. Use this when Lighter's announcements endpoint
+        // is rejecting our requests (HTTP 405/429) and we want to fall back to
+        // out-of-band maintenance handling. See bot-strategy#32.
+        if matches!(
+            std::env::var("LIGHTER_MAINTENANCE_DISABLED").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) {
+            return false;
+        }
         // The actual TTL is read fresh on every call so the operator can
         // change `LIGHTER_MAINTENANCE_TTL_MINS` and have it take effect on
         // the next cycle without restarting the process. The cost of one
