@@ -703,7 +703,10 @@ impl LighterConnector {
     ) -> bool {
         if let Some(start) = next_start {
             let horizon = ChronoDuration::hours(hours_ahead.max(0));
-            let active_window = ChronoDuration::minutes(90);
+            // Lighter advertises typical downtimes of "under 15 minutes".
+            // 30min gives a 2x safety margin without locking the bot out
+            // of trading for an excessive period after a short upgrade.
+            let active_window = ChronoDuration::minutes(30);
             let upcoming = *now <= start && (start - *now) <= horizon;
             let active = *now >= start && (*now - start) <= active_window;
             return upcoming || active;
@@ -792,8 +795,8 @@ impl LighterConnector {
         let items = Self::parse_lighter_rss(&body);
         let now = Utc::now();
 
-        log::debug!(
-            "Lighter maintenance fetch: url={} item_count={}",
+        log::info!(
+            "Lighter maintenance fetch ok: url={} items={}",
             url,
             items.len()
         );
@@ -842,7 +845,7 @@ impl LighterConnector {
         upcoming.sort();
         let next = upcoming.into_iter().next();
 
-        log::debug!(
+        log::info!(
             "Lighter maintenance result: next_start={:?} now={}",
             next,
             now
