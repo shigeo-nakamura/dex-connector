@@ -2268,6 +2268,61 @@ impl LighterConnector {
         self.get_server_public_key_cached().await
     }
 
+    /// Direct REST GET helper that performs the same WAF cooldown gating as
+    /// `make_request()`, for the few call sites that bypass the generic helper
+    /// and want the raw response body. Returns `Err(DexError::RateLimited)` if
+    /// the host-shared cooldown is active or the response itself is a WAF
+    /// challenge. See bot-strategy#35.
+    async fn fetch_text_with_waf_guard(
+        &self,
+        url: &str,
+        err_label: &str,
+    ) -> Result<String, DexError> {
+        if let Some(remaining) = crate::lighter_waf_cooldown::cooldown_remaining() {
+            return Err(DexError::RateLimited {
+                until_unix: chrono::Utc::now().timestamp() + remaining.as_secs() as i64,
+            });
+        }
+
+        let response = self
+            .client
+            .get(url)
+            .header("X-API-KEY", &self.api_key_public)
+            .send()
+            .await
+            .map_err(|e| DexError::Other(format!("{}: {}", err_label, e)))?;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+
+        if crate::lighter_waf_cooldown::is_waf_captcha(status, &headers) {
+            let dur = crate::lighter_waf_cooldown::engage_cooldown();
+            return Err(DexError::RateLimited {
+                until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
+            });
+        }
+
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Other(format!("{} read body: {}", err_label, e)))?;
+
+        if !status.is_success() {
+            if crate::lighter_waf_cooldown::is_waf_captcha_body(status, &response_text) {
+                let dur = crate::lighter_waf_cooldown::engage_cooldown();
+                return Err(DexError::RateLimited {
+                    until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
+                });
+            }
+            return Err(DexError::Other(format!(
+                "{} HTTP {}: {}",
+                err_label, status, response_text
+            )));
+        }
+
+        Ok(response_text)
+    }
+
     async fn make_request<T>(
         &self,
         endpoint: &str,
@@ -2286,6 +2341,14 @@ impl LighterConnector {
             HttpMethod::Delete => "DELETE",
         };
         track_api_call(endpoint, method_str);
+
+        // Fail fast if a host-shared WAF cooldown is active. Sending the
+        // request would only refresh the WAF rolling window. See bot-strategy#35.
+        if let Some(remaining) = crate::lighter_waf_cooldown::cooldown_remaining() {
+            return Err(DexError::RateLimited {
+                until_unix: chrono::Utc::now().timestamp() + remaining.as_secs() as i64,
+            });
+        }
 
         let url = format!("{}{}", self.base_url, endpoint);
 
@@ -2311,11 +2374,29 @@ impl LighterConnector {
             .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
 
         let status = response.status();
+        let headers = response.headers().clone();
+
+        // Detect WAF CAPTCHA / 429 and engage the host-shared cooldown so all
+        // bots on this IP back off in lockstep.
+        if crate::lighter_waf_cooldown::is_waf_captcha(status, &headers) {
+            let dur = crate::lighter_waf_cooldown::engage_cooldown();
+            return Err(DexError::RateLimited {
+                until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
+            });
+        }
+
         if !status.is_success() {
             let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
+            // Defensive body-based detection (in case headers were stripped).
+            if crate::lighter_waf_cooldown::is_waf_captcha_body(status, &error_text) {
+                let dur = crate::lighter_waf_cooldown::engage_cooldown();
+                return Err(DexError::RateLimited {
+                    until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
+                });
+            }
             return Err(DexError::Other(format!("HTTP {}: {}", status, error_text)));
         }
 
@@ -3396,32 +3477,11 @@ impl DexConnector for LighterConnector {
         let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=10", market_id);
 
         let url = format!("{}{}", self.base_url, endpoint);
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+        let response_text = self
+            .fetch_text_with_waf_guard(&url, "recentTrades")
+            .await?;
 
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
-
-        log::debug!(
-            "Last trades API response (status: {}): {}",
-            status,
-            response_text
-        );
-
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "HTTP {}: {}",
-                status, response_text
-            )));
-        }
+        log::debug!("Last trades API response: {}", response_text);
 
         let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
@@ -4607,114 +4667,39 @@ impl LighterConnector {
 
     async fn get_exchange_stats(&self) -> Result<LighterExchangeStats, DexError> {
         let url = format!("{}/api/v1/exchangeStats", self.base_url);
-
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to get exchange stats: {}", e)))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| {
-            DexError::Other(format!("Failed to read exchange stats response: {}", e))
-        })?;
-
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "Exchange stats HTTP {}: {}",
-                status, response_text
-            )));
-        }
-
+        let response_text = self
+            .fetch_text_with_waf_guard(&url, "exchangeStats")
+            .await?;
         log::trace!("Exchange stats response: {}", response_text);
-
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse exchange stats: {}", e)))
     }
 
     async fn get_order_book_details(&self) -> Result<LighterOrderBookDetailsResponse, DexError> {
         let url = format!("{}/api/v1/orderBookDetails", self.base_url);
-
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to get order book details: {}", e)))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| {
-            DexError::Other(format!("Failed to read order book details response: {}", e))
-        })?;
-
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "OrderBookDetails HTTP {}: {}",
-                status, response_text
-            )));
-        }
-
+        let response_text = self
+            .fetch_text_with_waf_guard(&url, "orderBookDetails")
+            .await?;
         log::trace!("Order book details response: {}", response_text);
-
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse order book details: {}", e)))
     }
 
     async fn get_order_books_all(&self) -> Result<LighterOrderBooksResponse, DexError> {
         let url = format!("{}/api/v1/orderBooks?filter=all", self.base_url);
-
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to get orderBooks: {}", e)))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| {
-            DexError::Other(format!("Failed to read orderBooks response: {}", e))
-        })?;
-
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "orderBooks HTTP {}: {}",
-                status, response_text
-            )));
-        }
-
+        let response_text = self
+            .fetch_text_with_waf_guard(&url, "orderBooks")
+            .await?;
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse orderBooks: {}", e)))
     }
 
     async fn get_funding_rates(&self) -> Result<LighterFundingRates, DexError> {
         let url = format!("{}/api/v1/funding-rates", self.base_url);
-
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to get funding rates: {}", e)))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| {
-            DexError::Other(format!("Failed to read funding rates response: {}", e))
-        })?;
-
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "Funding rates HTTP {}: {}",
-                status, response_text
-            )));
-        }
-
+        let response_text = self
+            .fetch_text_with_waf_guard(&url, "funding-rates")
+            .await?;
         log::trace!("Funding rates response: {}", response_text);
-
         serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse funding rates: {}", e)))
     }

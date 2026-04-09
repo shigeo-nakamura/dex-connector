@@ -46,6 +46,12 @@ pub enum DexError {
     NoConnection,
     UpcomingMaintenance,
     ApiKeyRegistrationRequired,
+    /// Lighter WAF / per-IP rate-limit cooldown is currently active.
+    /// `until_unix` is the unix-epoch second at which the cooldown expires.
+    /// Callers must NOT retry while this error is being returned — every
+    /// additional Lighter REST call refreshes the WAF rolling window and
+    /// extends the block. See bot-strategy#35.
+    RateLimited { until_unix: i64 },
 }
 
 impl From<ParseDecimalError> for DexError {
@@ -65,6 +71,11 @@ impl Display for DexError {
             DexError::WebSocketError(ref e) => write!(f, "WebSocket error: {}", e),
             DexError::UpcomingMaintenance => write!(f, "Network upgrade scheduled in < 2h"),
             DexError::ApiKeyRegistrationRequired => write!(f, "API key registration is required"),
+            DexError::RateLimited { until_unix } => write!(
+                f,
+                "Lighter WAF cooldown active until unix={} (rate-limited)",
+                until_unix
+            ),
         }
     }
 }
@@ -80,6 +91,7 @@ impl StdError for DexError {
             DexError::WebSocketError(_) => None,
             DexError::UpcomingMaintenance => None,
             DexError::ApiKeyRegistrationRequired => None,
+            DexError::RateLimited { .. } => None,
         }
     }
 }
