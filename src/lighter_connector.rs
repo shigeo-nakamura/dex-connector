@@ -2889,6 +2889,24 @@ impl DexConnector for LighterConnector {
             }
         }
 
+        // Stagger startup across bot instances to reduce WAF pressure.
+        {
+            use rand::Rng;
+            let startup_jitter_secs: u64 = std::env::var("LIGHTER_STARTUP_JITTER_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            if startup_jitter_secs > 0 {
+                let jitter = rand::thread_rng().gen_range(0..=startup_jitter_secs);
+                log::info!(
+                    "Startup jitter: sleeping {}s (max {}s)",
+                    jitter,
+                    startup_jitter_secs
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
+            }
+        }
+
         // Preload market metadata once at startup to prevent repeated REST calls later.
         self.ensure_market_metadata_loaded().await?;
 
@@ -4815,8 +4833,34 @@ impl LighterConnector {
                     }
                 }
 
+                // Respect host-shared WAF cooldown before reconnecting.
+                if let Some(remaining) = crate::lighter_waf_cooldown::cooldown_remaining() {
+                    log::warn!(
+                        "WAF cooldown active ({:.0}s remaining), delaying WS reconnect",
+                        remaining.as_secs_f64()
+                    );
+                    tokio::time::sleep(remaining).await;
+                }
+
                 if reconnect_attempt > 0 {
                     reconnect_backoff(reconnect_attempt).await;
+                } else {
+                    // Stagger initial reconnects across bot instances.
+                    let reconnect_jitter_secs: u64 =
+                        std::env::var("LIGHTER_RECONNECT_JITTER_SECS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(15);
+                    if reconnect_jitter_secs > 0 {
+                        let jitter =
+                            rand::thread_rng().gen_range(0..=reconnect_jitter_secs);
+                        log::info!(
+                            "Reconnect jitter: sleeping {}s (max {}s)",
+                            jitter,
+                            reconnect_jitter_secs
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
+                    }
                 }
 
                 log::info!(
