@@ -1586,7 +1586,10 @@ impl LighterConnector {
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
-        let _client_id = client_order_id.unwrap_or_else(|| format!("rust-native-{}", timestamp));
+        let client_order_index = client_order_id
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or(timestamp);
         let nonce = self.get_nonce().await?;
 
         let (price_scale, size_scale, price_decimals, size_decimals) = {
@@ -1632,8 +1635,6 @@ impl LighterConnector {
             size_decimals
         );
 
-        // Use timestamp as unique client_order_index instead of hardcoded value
-        let client_order_index = timestamp; // Use unique timestamp for each order
         let order_type_param = order_type as u64; // Use passed order type
         let time_in_force = tif as u64; // Use passed time in force
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
@@ -1777,6 +1778,7 @@ impl LighterConnector {
                     .ok()
                     .map(|b| Decimal::new(b, size_decimals))
                     .unwrap_or_else(|| Decimal::ZERO),
+                client_order_id: Some(client_order_index.to_string()),
             })
         } else {
             self.invalidate_nonce_cache().await;
@@ -1801,7 +1803,10 @@ impl LighterConnector {
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
-        let _client_id = client_order_id.unwrap_or_else(|| format!("rust-trigger-{}", timestamp));
+        let client_order_index = client_order_id
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or(timestamp);
         let nonce = self.get_nonce().await?;
 
         let (price_scale, size_scale, price_decimals, size_decimals) = {
@@ -1852,7 +1857,6 @@ impl LighterConnector {
             approx_size
         );
 
-        let client_order_index = timestamp;
         let order_type_param = order_type as u64;
         let time_in_force = tif as u64;
         let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
@@ -1956,7 +1960,7 @@ impl LighterConnector {
         log::debug!("Trigger order response: HTTP {}, {}", status, response_text);
 
         if status.is_success() {
-            let order_id = format!("trigger-{}-{}", timestamp, market_id);
+            let order_id = client_order_index.to_string();
             log::info!(
                 "✅ [TRIGGER_ORDER] Successfully created trigger order: {} (type={}, trigger_price={})",
                 order_id,
@@ -1975,6 +1979,7 @@ impl LighterConnector {
                     .ok()
                     .map(|b| Decimal::new(b, size_decimals))
                     .unwrap_or_else(|| Decimal::ZERO),
+                client_order_id: Some(client_order_index.to_string()),
             })
         } else {
             self.invalidate_nonce_cache().await;
@@ -2087,6 +2092,7 @@ impl LighterConnector {
                     .ok()
                     .map(|b| Decimal::new(b, size_decimals))
                     .unwrap_or_else(|| Decimal::ZERO),
+                client_order_id: None,
             })
         } else if let Some(error) = response.get("error") {
             log::error!("SDK order failed: {}", error);
@@ -3751,6 +3757,7 @@ impl DexConnector for LighterConnector {
         };
 
         // Use native Rust implementation for Lighter signatures
+        let cid = chrono::Utc::now().timestamp_millis().to_string();
         let result = self
             .create_order_native_with_type(
                 market_id,
@@ -3758,7 +3765,7 @@ impl DexConnector for LighterConnector {
                 tif,
                 base_amount,
                 price_value,
-                None,
+                Some(cid),
                 order_type,
                 reduce_only,
                 expiry_secs,
@@ -3950,6 +3957,7 @@ impl DexConnector for LighterConnector {
             market_id, side_value, base_amount, execution_price_native, trigger_price_native, order_type
         );
 
+        let cid = chrono::Utc::now().timestamp_millis().to_string();
         let result = self
             .create_order_native_with_trigger(
                 market_id,
@@ -3958,7 +3966,7 @@ impl DexConnector for LighterConnector {
                 base_amount,
                 execution_price_native,
                 trigger_price_native,
-                None,
+                Some(cid),
                 order_type,
                 reduce_only,
                 expiry_secs,
@@ -6280,6 +6288,42 @@ mod tests {
         assert_eq!(
             LighterConnector::parse_cancel_order_index("unknown-id"),
             None
+        );
+    }
+
+    #[test]
+    fn client_order_id_parsed_as_client_order_index() {
+        // When a valid numeric string is provided as client_order_id,
+        // it should be used as client_order_index (not the timestamp).
+        let cid = Some("1234567890123".to_string());
+        let timestamp = 9999999999999u64;
+        let client_order_index = cid
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or(timestamp);
+        assert_eq!(client_order_index, 1234567890123u64);
+    }
+
+    #[test]
+    fn client_order_id_falls_back_to_timestamp() {
+        // When client_order_id is None, client_order_index should be the timestamp.
+        let cid: Option<String> = None;
+        let timestamp = 9999999999999u64;
+        let client_order_index = cid
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or(timestamp);
+        assert_eq!(client_order_index, timestamp);
+    }
+
+    #[test]
+    fn trigger_order_id_is_numeric_and_cancellable() {
+        // After CID change, trigger orders return numeric client_order_index
+        // instead of "trigger-{ts}-{market}". Verify cancel parsing still works.
+        let trigger_order_id = "1762471376097"; // numeric CID
+        assert_eq!(
+            LighterConnector::parse_cancel_order_index(trigger_order_id),
+            Some(1762471376097)
         );
     }
 

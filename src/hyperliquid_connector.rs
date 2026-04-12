@@ -1797,6 +1797,7 @@ impl DexConnector for HyperliquidConnector {
             exchange_order_id: None,
             ordered_price: rounded_price,
             ordered_size: rounded_size,
+            client_order_id: None,
         })
     }
 
@@ -1974,6 +1975,7 @@ impl DexConnector for HyperliquidConnector {
             exchange_order_id: None,
             ordered_price,
             ordered_size: rounded_size,
+            client_order_id: None,
         })
     }
 

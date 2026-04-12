@@ -147,6 +147,8 @@ pub struct CreateOrderResponse {
     pub exchange_order_id: Option<String>,
     pub ordered_price: Decimal,
     pub ordered_size: Decimal,
+    /// Client Order ID sent to the exchange, usable for fill matching and order grouping.
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
