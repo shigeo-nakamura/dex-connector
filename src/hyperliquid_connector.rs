@@ -3,8 +3,9 @@ use crate::{
     dex_request::{DexError, DexRequest, HttpMethod},
     dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
-    CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
-    OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
+    CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
+    OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
+    TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -18,6 +19,7 @@ use hyperliquid_rust_sdk_fork::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
     ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus,
 };
+use uuid::Uuid;
 use reqwest::Client;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -1200,6 +1202,38 @@ struct HyperliquidDefaultPayload {
     user: Option<String>,
 }
 
+#[derive(Serialize, Debug, Clone)]
+struct HyperliquidCoinPayload {
+    r#type: String,
+    coin: String,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct HyperliquidRecentTradesPayload {
+    r#type: String,
+    coin: String,
+    #[serde(rename = "nTrades")]
+    n_trades: usize,
+}
+
+#[derive(Deserialize, Debug)]
+struct HyperliquidTrade {
+    px: String,
+    sz: String,
+    side: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct HyperliquidL2Book {
+    levels: Vec<Vec<HyperliquidL2Level>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct HyperliquidL2Level {
+    px: String,
+    sz: String,
+}
+
 #[derive(Deserialize, Debug)]
 struct HyperliquidRetrieveUserStateResponse {
     #[serde(rename = "marginSummary")]
@@ -1217,6 +1251,12 @@ struct HyperliquidMarginSummary {
 struct HyperliquidRetriveUserOpenOrder {
     coin: String,
     oid: u64,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    sz: Option<String>,
+    #[serde(default, rename = "limitPx")]
+    limit_px: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1336,7 +1376,7 @@ impl DexConnector for HyperliquidConnector {
     async fn get_ticker(
         &self,
         symbol: &str,
-        _test_price: Option<Decimal>,
+        test_price: Option<Decimal>,
     ) -> Result<TickerResponse, DexError> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(DexError::NoConnection);
@@ -1346,9 +1386,13 @@ impl DexConnector for HyperliquidConnector {
         let dynamic_info = dynamic_info_guard
             .get(symbol)
             .ok_or_else(|| DexError::Other("No dynamic market info available".to_string()))?;
-        let price = dynamic_info
-            .market_price
-            .ok_or_else(|| DexError::Other("No price available".to_string()))?;
+        let price = if let Some(tp) = test_price {
+            tp
+        } else {
+            dynamic_info
+                .market_price
+                .ok_or_else(|| DexError::Other("No price available".to_string()))?
+        };
         let min_tick = dynamic_info.min_tick;
         let num_trades = dynamic_info.num_trades;
         let funding_rate = dynamic_info.funding_rate;
@@ -1432,13 +1476,30 @@ impl DexConnector for HyperliquidConnector {
         let filtered_orders: Vec<crate::OpenOrder> = all_orders
             .into_iter()
             .filter(|order| order.coin == target_coin || order.coin == symbol)
-            .map(|hyperliquid_order| crate::OpenOrder {
-                order_id: hyperliquid_order.oid.to_string(),
-                symbol: symbol.to_string(),
-                side: OrderSide::Long, // Default, we need more detailed API to get actual side
-                size: Decimal::ZERO,   // Default, we need more detailed API to get actual size
-                price: Decimal::ZERO,  // Default, we need more detailed API to get actual price
-                status: "open".to_string(),
+            .map(|o| {
+                let side = match o.side.as_deref() {
+                    Some("B") => OrderSide::Long,
+                    Some("A") => OrderSide::Short,
+                    _ => OrderSide::Long,
+                };
+                let size = o
+                    .sz
+                    .as_deref()
+                    .and_then(|s| s.parse::<Decimal>().ok())
+                    .unwrap_or(Decimal::ZERO);
+                let price = o
+                    .limit_px
+                    .as_deref()
+                    .and_then(|s| s.parse::<Decimal>().ok())
+                    .unwrap_or(Decimal::ZERO);
+                crate::OpenOrder {
+                    order_id: o.oid.to_string(),
+                    symbol: symbol.to_string(),
+                    side,
+                    size,
+                    price,
+                    status: "open".to_string(),
+                }
             })
             .collect();
 
@@ -1578,10 +1639,67 @@ impl DexConnector for HyperliquidConnector {
     }
 
     async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
-        // Hyperliquid connector: minimal implementation for compilation only
-        Err(DexError::Other(
-            "get_combined_balance not implemented for HyperLiquid".to_string(),
-        ))
+        let spot_action = HyperliquidDefaultPayload {
+            r#type: "spotClearinghouseState".into(),
+            user: Some(self.config.evm_wallet_address.clone()),
+        };
+        let spot_res: HyperliquidSpotBalanceResponse = self
+            .handle_request_with_action("/info".into(), &spot_action)
+            .await?;
+
+        let perp_action = HyperliquidDefaultPayload {
+            r#type: "clearinghouseState".into(),
+            user: Some(self.config.evm_wallet_address.clone()),
+        };
+        let perp_res = self
+            .handle_request_with_action::<HyperliquidRetrieveUserStateResponse, _>(
+                "/info".into(),
+                &perp_action,
+            )
+            .await?;
+
+        let mut usd_balance = Decimal::ZERO;
+        let mut total_asset_value = Decimal::ZERO;
+        let mut token_balances = std::collections::HashMap::new();
+
+        for b in &spot_res.balances {
+            let balance = parse_to_decimal(&b.total)?;
+            if b.coin == "USDC" {
+                usd_balance += balance;
+                total_asset_value += balance;
+            } else {
+                let symbol_key = format!("{}/USDC", b.coin);
+                let value = if let Ok(px) = self.get_market_price(&symbol_key).await {
+                    balance * px
+                } else {
+                    Decimal::ZERO
+                };
+                total_asset_value += value;
+                token_balances.insert(
+                    b.coin.clone(),
+                    BalanceResponse {
+                        equity: value,
+                        balance,
+                        position_entry_price: None,
+                        position_sign: None,
+                    },
+                );
+            }
+        }
+
+        if let Some(summary) = perp_res.margin_summary {
+            let perp_equity = parse_to_decimal(&summary.account_value)?;
+            let perp_balance = parse_to_decimal(&summary.total_rawusd)?;
+            usd_balance += perp_balance;
+            total_asset_value += perp_equity;
+        }
+
+        Ok(CombinedBalanceResponse {
+            usd_balance,
+            total_asset_value,
+            token_balances,
+            spot_assets: Vec::new(),
+        })
     }
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
@@ -1613,21 +1731,71 @@ impl DexConnector for HyperliquidConnector {
         Ok(out)
     }
 
-    async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradesResponse, DexError> {
-        // TODO: Implement HyperLiquid last trades functionality
-        Err(DexError::Other(
-            "get_last_trades not implemented for HyperLiquid".to_string(),
-        ))
+    async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
+        let coin = resolve_coin(symbol, &self.spot_index_map);
+        let action = HyperliquidRecentTradesPayload {
+            r#type: "recentTrades".to_owned(),
+            coin,
+            n_trades: 20,
+        };
+        let raw: Vec<HyperliquidTrade> = self
+            .handle_request_with_action::<Vec<HyperliquidTrade>, HyperliquidRecentTradesPayload>(
+                "/info".to_string(),
+                &action,
+            )
+            .await?;
+
+        let trades = raw
+            .into_iter()
+            .filter_map(|t| {
+                let price = t.px.parse::<Decimal>().ok()?;
+                let size = t.sz.parse::<Decimal>().ok()?;
+                let side = match t.side.as_str() {
+                    "B" => Some(OrderSide::Long),
+                    "A" => Some(OrderSide::Short),
+                    _ => None,
+                };
+                Some(LastTrade { price, size: Some(size), side })
+            })
+            .collect();
+
+        Ok(LastTradesResponse { trades })
     }
 
     async fn get_order_book(
         &self,
-        _symbol: &str,
-        _depth: usize,
+        symbol: &str,
+        depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
-        Err(DexError::Other(
-            "get_order_book not implemented for HyperLiquid".to_string(),
-        ))
+        let coin = resolve_coin(symbol, &self.spot_index_map);
+        let action = HyperliquidCoinPayload {
+            r#type: "l2Book".to_owned(),
+            coin,
+        };
+        let book: HyperliquidL2Book = self
+            .handle_request_with_action::<HyperliquidL2Book, HyperliquidCoinPayload>(
+                "/info".to_string(),
+                &action,
+            )
+            .await?;
+
+        let parse_levels = |levels: &[HyperliquidL2Level], max: usize| -> Vec<OrderBookLevel> {
+            levels
+                .iter()
+                .take(max)
+                .filter_map(|l| {
+                    Some(OrderBookLevel {
+                        price: l.px.parse::<Decimal>().ok()?,
+                        size: l.sz.parse::<Decimal>().ok()?,
+                    })
+                })
+                .collect()
+        };
+
+        let bids = book.levels.first().map(|l| parse_levels(l, depth)).unwrap_or_default();
+        let asks = book.levels.get(1).map(|l| parse_levels(l, depth)).unwrap_or_default();
+
+        Ok(OrderBookSnapshot { bids, asks })
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
@@ -1751,6 +1919,7 @@ impl DexConnector for HyperliquidConnector {
         );
         let asset = resolve_coin(symbol, &self.spot_index_map);
 
+        let cloid = Uuid::new_v4();
         let order = ClientOrderRequest {
             asset,
             is_buy: side == OrderSide::Long,
@@ -1761,7 +1930,7 @@ impl DexConnector for HyperliquidConnector {
             sz: rounded_size
                 .to_f64()
                 .ok_or_else(|| DexError::Other("Conversion to f64 failed".to_string()))?,
-            cloid: None,
+            cloid: Some(cloid),
             order_type: ClientOrder::Limit(ClientLimit {
                 tif: time_in_force.to_string(),
             }),
@@ -1797,7 +1966,7 @@ impl DexConnector for HyperliquidConnector {
             exchange_order_id: None,
             ordered_price: rounded_price,
             ordered_size: rounded_size,
-            client_order_id: None,
+            client_order_id: Some(cloid.to_string()),
         })
     }
 
@@ -1905,16 +2074,14 @@ impl DexConnector for HyperliquidConnector {
 
         let is_buy = is_buy_for_tpsl(side);
 
+        let cloid = Uuid::new_v4();
         let request = ClientOrderRequest {
             asset,
             is_buy,
-            reduce_only, // Use the passed reduce_only argument
-            // NOTE: is_market=true の場合、HL側で limit_px は無視される実装前提。
-            // もし将来のAPIで解釈されるなら 0.0 は危険なのでOption化を検討。
-            // Market order failures should be logged for debugging if 0.0 causes issues.
+            reduce_only,
             limit_px: final_limit_price_opt.unwrap_or(0.0),
             sz,
-            cloid: None,
+            cloid: Some(cloid),
             order_type: ClientOrder::Trigger(ClientTrigger {
                 is_market,
                 trigger_px: trigger_price,
@@ -1975,7 +2142,7 @@ impl DexConnector for HyperliquidConnector {
             exchange_order_id: None,
             ordered_price,
             ordered_size: rounded_size,
-            client_order_id: None,
+            client_order_id: Some(cloid.to_string()),
         })
     }
 
