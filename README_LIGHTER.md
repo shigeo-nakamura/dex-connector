@@ -88,6 +88,20 @@ impl LighterConnector {
 - `account_index`: アカウントインデックス（例: 65）
 - `base_url`: `https://mainnet.zklighter.elliot.ai`
 
+## Rate Limit / WAF 対策の環境変数
+
+同一ホストで複数botを起動する場合、REST APIバーストによるWAF CAPTCHA発動を防ぐためジッターを設定できます。
+
+| 環境変数 | デフォルト | 説明 |
+|----------|-----------|------|
+| `LIGHTER_STARTUP_JITTER_SECS` | `30` | `start()` 時のランダム遅延上限（秒）。各bot起動時のメタデータ取得を分散する |
+| `LIGHTER_RECONNECT_JITTER_SECS` | `15` | WS再接続時のランダム遅延上限（秒）。同時再接続によるRESTバーストを防ぐ |
+
+- `0` に設定するとジッター無効（テスト時など）
+- WAF cooldown（`/tmp/lighter_waf_cooldown`）が有効な場合、WS再接続はcooldown終了まで自動的に待機する
+
+参照: [bot-strategy#38](https://github.com/shigeo-nakamura/bot-strategy/issues/38)
+
 ## トラブルシューティング
 
 ### "cannot open shared object file: libsigner.so"
