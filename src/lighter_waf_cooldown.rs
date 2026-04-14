@@ -1,19 +1,40 @@
-//! Host-shared cooldown for Lighter WAF CAPTCHA / rate-limit (HTTP 429) responses.
+//! Host-shared cooldown for Lighter rate-limit responses (HTTP 429 / 405).
 //!
-//! Background: as of Lighter v4.0.53 (2026-04-07), per-IP rate-limit violations
-//! against `mainnet.zklighter.elliot.ai` no longer return `HTTP 429`. Instead they
-//! return `HTTP 405` with header `x-amzn-waf-action: captcha` and an AWS WAF
-//! challenge HTML body. The WAF window is per-IP and is reset on every additional
-//! violation, so a bot that retries during the cooldown will refresh the window
-//! and effectively never recover. See bot-strategy#35 for the full incident.
+//! Background: there are two distinct enforcement layers that surface as
+//! rate-limit responses on `mainnet.zklighter.elliot.ai`:
+//!
+//! 1. **AWS WAF CAPTCHA (per-IP rolling window)** — as of Lighter v4.0.53
+//!    (2026-04-07), per-IP violations return `HTTP 405` with header
+//!    `x-amzn-waf-action: captcha` and an AWS WAF challenge HTML body. The WAF
+//!    window is per-IP and is reset on every additional violation, so a bot
+//!    that retries during the cooldown refreshes the window and effectively
+//!    never recovers. Full incident: bot-strategy#35.
+//!
+//! 2. **API-server rate limit** — effective 2026-04-17 (see bot-strategy#52
+//!    and https://apidocs.lighter.xyz/docs/rate-limits#cooldown), the API
+//!    itself may return **either `HTTP 429` or a bare `HTTP 405`** (no WAF
+//!    header) when the weighted request budget is exhausted. Cooldown is 60s
+//!    static for the firewall layer or `weightOfEndpoint/(totalWeight/60)` for
+//!    the API-server layer.
+//!
+//! Because both layers can trip the same host simultaneously and the WAF window
+//! is the more fragile one, we apply a single jittered 90-120s cooldown for any
+//! of the above signals. That is over-cautious for an API-server 60s window
+//! but safely clears the WAF window if both were tripped.
+//!
+//! False-positive risk: a genuine `405 Method Not Allowed` from a code bug
+//! would also engage the cooldown. The resulting INFO log identifies the
+//! source as `ApiRateLimit` so the operator can diagnose. Acceptable trade-off
+//! vs. the previous behavior of retry-storming into a WAF lock-out.
 //!
 //! This module exposes:
-//!   * [`is_waf_captcha`] — pure detection helper for an HTTP response.
+//!   * [`classify_rate_limit`] — pure detection helper for an HTTP response;
+//!     returns the source if rate-limited.
 //!   * [`cooldown_remaining`] — non-blocking check used before sending any REST
 //!     call. Returns `Some(_)` if a cooldown is currently active.
-//!   * [`engage_cooldown`] — called when a 429 / WAF response is observed. Writes
-//!     a unix-epoch expiry to a shared file under `/tmp` so all bot processes on
-//!     the same host see the cooldown. Returns the duration that was set.
+//!   * [`engage_cooldown`] — called when a rate-limit response is observed.
+//!     Writes a unix-epoch expiry to a shared file under `/tmp` so all bot
+//!     processes on the same host see the cooldown. Returns the duration set.
 //!
 //! The shared state is a single file containing a unix epoch (seconds) of the
 //! cooldown deadline. Atomic writes use tmp-file-then-rename. Multiple writers
@@ -44,6 +65,27 @@ const COOLDOWN_MAX_SECS: u64 = 120;
 /// In-process memo of the last engaged deadline. Used purely to suppress
 /// duplicate WARN log lines while a cooldown is active in this process.
 static LAST_LOGGED_DEADLINE: AtomicI64 = AtomicI64::new(0);
+
+/// Identifies which Lighter rate-limit layer produced the response, so that
+/// the engagement log line points to the relevant runbook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitSource {
+    /// HTTP 405 with `x-amzn-waf-action: captcha` or the matching WAF body.
+    /// Per-IP rolling window that resets on each violation — handled per #35.
+    WafCaptcha,
+    /// HTTP 429, or HTTP 405 without a WAF signal. Weighted API-server budget
+    /// or firewall (60s static). Effective 2026-04-17 — handled per #52.
+    ApiRateLimit,
+}
+
+impl RateLimitSource {
+    fn label(&self) -> &'static str {
+        match self {
+            RateLimitSource::WafCaptcha => "WAF CAPTCHA (bot-strategy#35)",
+            RateLimitSource::ApiRateLimit => "API rate-limit (bot-strategy#52)",
+        }
+    }
+}
 
 fn cooldown_path() -> PathBuf {
     PathBuf::from(COOLDOWN_FILE)
@@ -99,9 +141,9 @@ fn jittered_cooldown_secs() -> u64 {
 
 /// Engage the cooldown. Idempotent: if a longer cooldown is already in effect,
 /// the existing deadline wins. Logs a single WARN per engagement event in this
-/// process. Returns the duration that is now in effect (which may be the
-/// pre-existing one).
-pub fn engage_cooldown() -> Duration {
+/// process, tagged with the observed [`RateLimitSource`]. Returns the duration
+/// that is now in effect (which may be the pre-existing one).
+pub fn engage_cooldown(source: RateLimitSource) -> Duration {
     let now = now_unix();
     let new_deadline = now + jittered_cooldown_secs() as i64;
 
@@ -121,9 +163,10 @@ pub fn engage_cooldown() -> Duration {
     if final_deadline > last_logged {
         LAST_LOGGED_DEADLINE.store(final_deadline, Ordering::Release);
         let secs = (final_deadline - now).max(0);
-        log::info!(
-            "[Lighter WAF] cooldown engaged for {}s (deadline unix={}, pid={}). All Lighter REST calls will fail-fast until then. See bot-strategy#35.",
+        log::warn!(
+            "[Lighter rate-limit] cooldown engaged for {}s (source={}, deadline unix={}, pid={}). All Lighter REST calls will fail-fast until then.",
             secs,
+            source.label(),
             final_deadline,
             std::process::id()
         );
@@ -132,44 +175,58 @@ pub fn engage_cooldown() -> Duration {
     Duration::from_secs((final_deadline - now).max(0) as u64)
 }
 
-/// Detect whether an HTTP response from Lighter indicates a WAF / rate-limit
-/// challenge that should engage the cooldown.
+/// Detect whether an HTTP response from Lighter indicates a rate-limit
+/// condition that should engage the cooldown, and classify which enforcement
+/// layer produced it.
 ///
-/// Matches:
-///   * Any `429 Too Many Requests`
-///   * `405` with `x-amzn-waf-action: captcha`
+/// Returns:
+///   * `Some(WafCaptcha)` — `405` with `x-amzn-waf-action: captcha`.
+///   * `Some(ApiRateLimit)` — `429`, or any other `405` from Lighter. Per
+///     https://apidocs.lighter.xyz/docs/rate-limits#cooldown and
+///     bot-strategy#52 (effective 2026-04-17), the API layer may return either
+///     status code for a rate-limit hit, with no distinguishing header.
+///   * `None` — not rate-limited.
 ///
-/// Use [`is_waf_captcha_body`] as a defensive fallback when only the body is
-/// available (no header access).
-pub fn is_waf_captcha(status: StatusCode, headers: &HeaderMap) -> bool {
+/// Use [`classify_rate_limit_body`] as a defensive fallback when only the body
+/// is available (no header access).
+pub fn classify_rate_limit(status: StatusCode, headers: &HeaderMap) -> Option<RateLimitSource> {
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return true;
+        return Some(RateLimitSource::ApiRateLimit);
     }
     if status == StatusCode::METHOD_NOT_ALLOWED {
         if let Some(v) = headers.get("x-amzn-waf-action") {
             if let Ok(s) = v.to_str() {
                 if s.eq_ignore_ascii_case("captcha") {
-                    return true;
+                    return Some(RateLimitSource::WafCaptcha);
                 }
             }
         }
+        // Bare 405 without the WAF header: classify as API-layer rate limit
+        // per #52. This may produce a false positive on a genuine "Method Not
+        // Allowed" from a code bug — preferred over under-backoff, and the
+        // source label in the engagement log makes it diagnosable.
+        return Some(RateLimitSource::ApiRateLimit);
     }
-    false
+    None
 }
 
 /// Defensive body-based detector. Some intermediaries strip headers but the
 /// AWS WAF challenge HTML is recognizable. Use only when header inspection is
 /// not possible (already consumed via `.text()`).
-pub fn is_waf_captcha_body(status: StatusCode, body: &str) -> bool {
+///
+/// Returns the same variants as [`classify_rate_limit`]. A bare 405 (no WAF
+/// markers in the body) is classified as `ApiRateLimit` per #52.
+pub fn classify_rate_limit_body(status: StatusCode, body: &str) -> Option<RateLimitSource> {
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return true;
+        return Some(RateLimitSource::ApiRateLimit);
     }
-    if status == StatusCode::METHOD_NOT_ALLOWED
-        && (body.contains("awsWafIntegration") || body.contains("Human Verification"))
-    {
-        return true;
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        if body.contains("awsWafIntegration") || body.contains("Human Verification") {
+            return Some(RateLimitSource::WafCaptcha);
+        }
+        return Some(RateLimitSource::ApiRateLimit);
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -188,45 +245,58 @@ mod tests {
     }
 
     #[test]
-    fn detects_429() {
+    fn detects_429_as_api_rate_limit() {
         let h = HeaderMap::new();
-        assert!(is_waf_captcha(StatusCode::TOO_MANY_REQUESTS, &h));
+        assert_eq!(
+            classify_rate_limit(StatusCode::TOO_MANY_REQUESTS, &h),
+            Some(RateLimitSource::ApiRateLimit)
+        );
     }
 
     #[test]
-    fn detects_405_with_waf_header() {
+    fn detects_405_with_waf_header_as_waf_captcha() {
         let mut h = HeaderMap::new();
         h.insert("x-amzn-waf-action", HeaderValue::from_static("captcha"));
-        assert!(is_waf_captcha(StatusCode::METHOD_NOT_ALLOWED, &h));
+        assert_eq!(
+            classify_rate_limit(StatusCode::METHOD_NOT_ALLOWED, &h),
+            Some(RateLimitSource::WafCaptcha)
+        );
     }
 
     #[test]
-    fn ignores_405_without_waf_header() {
+    fn detects_bare_405_as_api_rate_limit() {
+        // Effective 2026-04-17 the API server itself may return a bare 405 for
+        // rate limits (bot-strategy#52). Treat as rate-limit so we back off
+        // rather than retry-storm into a WAF lock-out.
         let h = HeaderMap::new();
-        assert!(!is_waf_captcha(StatusCode::METHOD_NOT_ALLOWED, &h));
+        assert_eq!(
+            classify_rate_limit(StatusCode::METHOD_NOT_ALLOWED, &h),
+            Some(RateLimitSource::ApiRateLimit)
+        );
     }
 
     #[test]
     fn ignores_200() {
         let mut h = HeaderMap::new();
         h.insert("x-amzn-waf-action", HeaderValue::from_static("captcha"));
-        assert!(!is_waf_captcha(StatusCode::OK, &h));
+        assert_eq!(classify_rate_limit(StatusCode::OK, &h), None);
     }
 
     #[test]
     fn body_fallback_recognizes_aws_waf_html() {
-        assert!(is_waf_captcha_body(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "<html>...awsWafIntegration..."
-        ));
-        assert!(is_waf_captcha_body(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "Human Verification page"
-        ));
-        assert!(!is_waf_captcha_body(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "ordinary 405 body"
-        ));
+        assert_eq!(
+            classify_rate_limit_body(StatusCode::METHOD_NOT_ALLOWED, "<html>...awsWafIntegration..."),
+            Some(RateLimitSource::WafCaptcha)
+        );
+        assert_eq!(
+            classify_rate_limit_body(StatusCode::METHOD_NOT_ALLOWED, "Human Verification page"),
+            Some(RateLimitSource::WafCaptcha)
+        );
+        // Bare 405 body → still classified as API rate-limit per #52.
+        assert_eq!(
+            classify_rate_limit_body(StatusCode::METHOD_NOT_ALLOWED, "ordinary 405 body"),
+            Some(RateLimitSource::ApiRateLimit)
+        );
     }
 
     #[test]
@@ -234,7 +304,7 @@ mod tests {
         let _g = FILE_LOCK.lock().unwrap();
         clear();
         assert!(cooldown_remaining().is_none());
-        let dur = engage_cooldown();
+        let dur = engage_cooldown(RateLimitSource::ApiRateLimit);
         assert!(dur.as_secs() >= COOLDOWN_MIN_SECS);
         assert!(dur.as_secs() <= COOLDOWN_MAX_SECS);
 
@@ -255,7 +325,7 @@ mod tests {
         // Plant a far-future deadline directly.
         let far = now_unix() + 600;
         write_deadline(far);
-        let _ = engage_cooldown();
+        let _ = engage_cooldown(RateLimitSource::WafCaptcha);
         let read_back = read_deadline().unwrap();
         assert_eq!(read_back, far, "engage must not shorten an existing cooldown");
         clear();

@@ -2301,8 +2301,8 @@ impl LighterConnector {
         let status = response.status();
         let headers = response.headers().clone();
 
-        if crate::lighter_waf_cooldown::is_waf_captcha(status, &headers) {
-            let dur = crate::lighter_waf_cooldown::engage_cooldown();
+        if let Some(src) = crate::lighter_waf_cooldown::classify_rate_limit(status, &headers) {
+            let dur = crate::lighter_waf_cooldown::engage_cooldown(src);
             return Err(DexError::RateLimited {
                 until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
             });
@@ -2314,8 +2314,10 @@ impl LighterConnector {
             .map_err(|e| DexError::Other(format!("{} read body: {}", err_label, e)))?;
 
         if !status.is_success() {
-            if crate::lighter_waf_cooldown::is_waf_captcha_body(status, &response_text) {
-                let dur = crate::lighter_waf_cooldown::engage_cooldown();
+            if let Some(src) =
+                crate::lighter_waf_cooldown::classify_rate_limit_body(status, &response_text)
+            {
+                let dur = crate::lighter_waf_cooldown::engage_cooldown(src);
                 return Err(DexError::RateLimited {
                     until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
                 });
@@ -2382,10 +2384,10 @@ impl LighterConnector {
         let status = response.status();
         let headers = response.headers().clone();
 
-        // Detect WAF CAPTCHA / 429 and engage the host-shared cooldown so all
-        // bots on this IP back off in lockstep.
-        if crate::lighter_waf_cooldown::is_waf_captcha(status, &headers) {
-            let dur = crate::lighter_waf_cooldown::engage_cooldown();
+        // Detect WAF CAPTCHA / 429 / bare-405 and engage the host-shared
+        // cooldown so all bots on this IP back off in lockstep.
+        if let Some(src) = crate::lighter_waf_cooldown::classify_rate_limit(status, &headers) {
+            let dur = crate::lighter_waf_cooldown::engage_cooldown(src);
             return Err(DexError::RateLimited {
                 until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
             });
@@ -2397,8 +2399,10 @@ impl LighterConnector {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             // Defensive body-based detection (in case headers were stripped).
-            if crate::lighter_waf_cooldown::is_waf_captcha_body(status, &error_text) {
-                let dur = crate::lighter_waf_cooldown::engage_cooldown();
+            if let Some(src) =
+                crate::lighter_waf_cooldown::classify_rate_limit_body(status, &error_text)
+            {
+                let dur = crate::lighter_waf_cooldown::engage_cooldown(src);
                 return Err(DexError::RateLimited {
                     until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
                 });
