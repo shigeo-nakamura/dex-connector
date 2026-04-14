@@ -121,7 +121,7 @@ pub fn engage_cooldown() -> Duration {
     if final_deadline > last_logged {
         LAST_LOGGED_DEADLINE.store(final_deadline, Ordering::Release);
         let secs = (final_deadline - now).max(0);
-        log::warn!(
+        log::info!(
             "[Lighter WAF] cooldown engaged for {}s (deadline unix={}, pid={}). All Lighter REST calls will fail-fast until then. See bot-strategy#35.",
             secs,
             final_deadline,

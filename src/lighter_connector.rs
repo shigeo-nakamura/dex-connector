@@ -313,7 +313,7 @@ fn track_api_call(endpoint: &str, method: &str) {
 
         // Warn if approaching rate limit
         if recent_calls > 45 {
-            log::warn!(
+            log::info!(
                 "[API_TRACKER] ⚠️  Approaching rate limit: {}/60 calls in last 60s",
                 recent_calls
             );
@@ -1220,7 +1220,7 @@ impl LighterConnector {
     /// Removes orders older than specified duration to prevent memory bloat
     pub fn start_auto_cleanup(&self, cleanup_interval_hours: u64) {
         if self.cleanup_started.swap(true, Ordering::SeqCst) {
-            log::warn!("[AUTO_CLEANUP] already started; ignoring.");
+            log::debug!("[AUTO_CLEANUP] already started; ignoring.");
             return;
         }
 
@@ -2947,7 +2947,7 @@ impl DexConnector for LighterConnector {
     }
 
     async fn set_leverage(&self, _symbol: &str, _leverage: u32) -> Result<(), DexError> {
-        log::warn!("Leverage setting not implemented for Lighter");
+        log::debug!("Leverage setting not implemented for Lighter");
         Ok(())
     }
 
@@ -4843,7 +4843,7 @@ impl LighterConnector {
 
                 // Respect host-shared WAF cooldown before reconnecting.
                 if let Some(remaining) = crate::lighter_waf_cooldown::cooldown_remaining() {
-                    log::warn!(
+                    log::info!(
                         "WAF cooldown active ({:.0}s remaining), delaying WS reconnect",
                         remaining.as_secs_f64()
                     );
@@ -4924,13 +4924,13 @@ impl LighterConnector {
 
                                 // Apply TCP optimizations for TLS connection
                                 if let Err(e) = tcp_stream.set_nodelay(true) {
-                                    log::warn!("Failed to set TCP_NODELAY on TLS: {}", e);
+                                    log::debug!("Failed to set TCP_NODELAY on TLS: {}", e);
                                 }
 
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
                                     (Ok(local), Ok(peer)) => (local, peer, "rustls"),
                                     _ => {
-                                        log::warn!(
+                                        log::debug!(
                                             "Failed to get TLS socket addresses for epoch {}",
                                             current_epoch
                                         );
@@ -4947,13 +4947,13 @@ impl LighterConnector {
 
                                 // Apply TCP optimizations for native TLS connection
                                 if let Err(e) = tcp_stream.set_nodelay(true) {
-                                    log::warn!("Failed to set TCP_NODELAY on native TLS: {}", e);
+                                    log::debug!("Failed to set TCP_NODELAY on native TLS: {}", e);
                                 }
 
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
                                     (Ok(local), Ok(peer)) => (local, peer, "native-tls"),
                                     _ => {
-                                        log::warn!(
+                                        log::debug!(
                                             "Failed to get native TLS socket addresses for epoch {}",
                                             current_epoch
                                         );
@@ -4967,12 +4967,12 @@ impl LighterConnector {
                             }
                             tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
                                 if let Err(e) = tcp_stream.set_nodelay(true) {
-                                    log::warn!("Failed to set TCP_NODELAY on plain WS: {}", e);
+                                    log::debug!("Failed to set TCP_NODELAY on plain WS: {}", e);
                                 }
                                 match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
                                     (Ok(local), Ok(peer)) => (local, peer, "plain"),
                                     _ => {
-                                        log::warn!(
+                                        log::debug!(
                                             "Failed to get plain socket addresses for epoch {}",
                                             current_epoch
                                         );
@@ -4985,7 +4985,7 @@ impl LighterConnector {
                                 }
                             }
                             other => {
-                                log::warn!(
+                                log::debug!(
                                     "Unsupported WebSocket stream type {:?} for epoch {}",
                                     other,
                                     current_epoch
@@ -5111,7 +5111,7 @@ impl LighterConnector {
                                 if is_pong {
                                     let latency_ms = send_duration.as_millis();
                                     if latency_ms > 100 {
-                                        log::warn!("High pong send latency: {}ms", latency_ms);
+                                        log::debug!("High pong send latency: {}ms", latency_ms);
                                     }
                                 }
                             }
@@ -5301,14 +5301,14 @@ impl LighterConnector {
 
                                             // Log slow messages only
                                             if total_duration.as_millis() > 10 {
-                                                log::warn!(
+                                                log::debug!(
                                                     "Slow message processing: {}ms (len={})",
                                                     total_duration.as_millis(),
                                                     text.len()
                                                 );
                                             }
                                         } else {
-                                            log::warn!(
+                                            log::debug!(
                                                 "Failed to parse WebSocket message as JSON (len={}): {}",
                                                 text.len(),
                                                 text
@@ -5941,7 +5941,7 @@ impl LighterConnector {
                     Self::remove_tracked_order(cached_open_orders, &default_symbol, &order_id)
                         .await;
                 } else {
-                    log::warn!("Failed to parse filled order: {:?}", fill);
+                    log::debug!("Failed to parse filled order: {:?}", fill);
                 }
             }
         }

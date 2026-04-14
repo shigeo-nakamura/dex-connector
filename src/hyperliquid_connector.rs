@@ -446,7 +446,7 @@ impl HyperliquidConnector {
                     token_name_map.get(&uni._tokens[1]).unwrap_or(&"?".into())
                 )
             } else {
-                log::warn!(
+                log::debug!(
                     "universe idx {} has unexpected token vec {:?}",
                     uni.index,
                     uni._tokens
@@ -580,7 +580,7 @@ impl HyperliquidConnector {
                     symbol,
                     oid
                 ),
-                Err(e) => log::warn!(
+                Err(e) => log::info!(
                     "🕐 [HYPERLIQUID_EXPIRY] auto-cancel failed for symbol={} oid={}: {} (order may already be filled/canceled)",
                     symbol,
                     oid,
@@ -595,7 +595,7 @@ impl HyperliquidConnector {
     /// `start_auto_cleanup` behavior.
     pub fn start_auto_cleanup(&self, cleanup_interval_hours: u64) {
         if self.cleanup_started.swap(true, Ordering::SeqCst) {
-            log::warn!("[AUTO_CLEANUP] already started; ignoring.");
+            log::debug!("[AUTO_CLEANUP] already started; ignoring.");
             return;
         }
 
@@ -1169,7 +1169,7 @@ impl HyperliquidConnector {
         for (raw_coin, mid_price_str) in &mids_data.mids {
             let coin = if let Some(stripped) = raw_coin.strip_prefix('@') {
                 let idx = stripped.parse::<usize>().unwrap_or_else(|_| {
-                    log::warn!("[resolve_coin] invalid @index: {}", stripped);
+                    log::debug!("[resolve_coin] invalid @index: {}", stripped);
                     0
                 });
 
@@ -2625,7 +2625,7 @@ impl HyperliquidConnector {
                 let map = self.dynamic_market_info.read().await;
                 for symbol in &self.config.symbol_list {
                     if let Some(info) = map.get(symbol) {
-                        log::warn!(
+                        log::debug!(
                             "[wait_for_market_ready] symbol = {}, best_bid = {:?}, best_ask = {:?}",
                             symbol,
                             info.best_bid,
@@ -2666,7 +2666,7 @@ fn resolve_coin(sym: &str, map: &HashMap<String, usize>) -> String {
         match map.get(sym) {
             Some(idx) => format!("@{}", idx),
             None => {
-                log::warn!("resolve_coin: {} is not in spot_index_map", sym);
+                log::debug!("resolve_coin: {} is not in spot_index_map", sym);
                 sym.to_string()
             }
         }
