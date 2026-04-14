@@ -5514,20 +5514,43 @@ impl LighterConnector {
                                     let now = now_secs();
                                     let last_rx_at = last_rx.load(Ordering::SeqCst);
                                     let last_tx_at = last_tx.load(Ordering::SeqCst);
-                                    log::error!(
-                                        "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}). Will attempt reconnection.",
-                                        e,
-                                        std::any::type_name_of_val(&e),
-                                        conn_label,
-                                        now.saturating_sub(last_rx_at),
-                                        now.saturating_sub(last_tx_at),
-                                        pending_client_ping.load(Ordering::SeqCst),
+                                    // Protocol errors (e.g. ResetWithoutClosingHandshake from the
+                                    // upstream Lighter/CloudFront edge) are bursty, correlated
+                                    // across services, and auto-recover via reconnection. Demote
+                                    // to INFO so they do not pollute error_summary and trigger
+                                    // false alerts in the error-watch workflow
+                                    // (shigeo-nakamura/bot-strategy#49). IO/TLS errors indicate
+                                    // genuinely unusual conditions and stay at ERROR.
+                                    let is_protocol = matches!(
+                                        &e,
+                                        tokio_tungstenite::tungstenite::Error::Protocol(_)
                                     );
+                                    if is_protocol {
+                                        log::info!(
+                                            "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}). Will attempt reconnection.",
+                                            e,
+                                            std::any::type_name_of_val(&e),
+                                            conn_label,
+                                            now.saturating_sub(last_rx_at),
+                                            now.saturating_sub(last_tx_at),
+                                            pending_client_ping.load(Ordering::SeqCst),
+                                        );
+                                    } else {
+                                        log::error!(
+                                            "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}). Will attempt reconnection.",
+                                            e,
+                                            std::any::type_name_of_val(&e),
+                                            conn_label,
+                                            now.saturating_sub(last_rx_at),
+                                            now.saturating_sub(last_tx_at),
+                                            pending_client_ping.load(Ordering::SeqCst),
+                                        );
+                                    }
                                     match &e {
                                         tokio_tungstenite::tungstenite::Error::Protocol(
                                             protocol_err,
                                         ) => {
-                                            log::error!(
+                                            log::info!(
                                                 "WebSocket protocol error detail: {:?} (conn={})",
                                                 protocol_err,
                                                 conn_label
