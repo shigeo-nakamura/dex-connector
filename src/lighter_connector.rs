@@ -5123,7 +5123,13 @@ impl LighterConnector {
                         // Server requires at least one frame every 2 minutes to keep connection alive.
                         // We send a control Ping every 20s which is well within that limit.
                         const IDLE_PING_SECS: u64 = 20; // Client ping interval
-                        const PONG_TIMEOUT_SECS: u64 = 8; // Pong timeout
+                        // Pong timeout: tolerate transient RTT spikes (cross-region WS to AWS
+                        // can briefly stall under congestion). Combined with the 5s check
+                        // granularity and the 2-strike rule below, a real dead connection is
+                        // still detected within ~40s, while one-shot packet loss no longer
+                        // forces a reconnect (bot-strategy#47).
+                        const PONG_TIMEOUT_SECS: u64 = 15;
+                        const PONG_MAX_MISSES: u32 = 2; // Require N consecutive misses before reconnect
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
 
                         fn get_pong_payload(ping_payload: &[u8]) -> Vec<u8> {
@@ -5132,7 +5138,7 @@ impl LighterConnector {
                         }
 
                         use parking_lot::Mutex;
-                        use std::sync::atomic::{AtomicBool, AtomicU64};
+                        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
                         use std::time::{SystemTime, UNIX_EPOCH};
 
                         fn now_secs() -> u64 {
@@ -5145,6 +5151,10 @@ impl LighterConnector {
                         let last_rx = std::sync::Arc::new(AtomicU64::new(now_secs()));
                         let last_tx = std::sync::Arc::new(AtomicU64::new(now_secs()));
                         let pending_client_ping = std::sync::Arc::new(AtomicBool::new(false));
+                        // Track ping send time independently of last_tx so concurrent
+                        // app-level outbound traffic can't reset the pong timeout window.
+                        let ping_sent_at = std::sync::Arc::new(AtomicU64::new(0));
+                        let pong_miss_count = std::sync::Arc::new(AtomicU32::new(0));
                         let last_client_ping_payload =
                             std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
 
@@ -5153,6 +5163,8 @@ impl LighterConnector {
                         let ping_connection_alive = connection_alive.clone();
                         let ping_last_tx = last_tx.clone();
                         let ping_pending_client_ping = pending_client_ping.clone();
+                        let ping_sent_at_clone = ping_sent_at.clone();
+                        let pong_miss_count_clone = pong_miss_count.clone();
                         let ping_last_client_ping_payload = last_client_ping_payload.clone();
                         let ping_tx_ctrl = tx_ctrl.clone();
                         let ping_conn_label = conn_label.clone();
@@ -5198,6 +5210,7 @@ impl LighterConnector {
                                             }
 
                                             ping_pending_client_ping.store(true, Ordering::SeqCst);
+                                            ping_sent_at_clone.store(now, Ordering::SeqCst);
                                             ping_last_tx.store(now, Ordering::SeqCst);
                                             log::debug!(
                                                 "Sent client ping (conn={}, payload={:?})",
@@ -5208,19 +5221,36 @@ impl LighterConnector {
 
                                         // Check for control frame pong timeout
                                         if ping_pending_client_ping.load(Ordering::SeqCst) {
-                                            let waited = now.saturating_sub(ping_last_tx.load(Ordering::SeqCst));
+                                            let sent_at = ping_sent_at_clone.load(Ordering::SeqCst);
+                                            let waited = now.saturating_sub(sent_at);
                                             if waited >= PONG_TIMEOUT_SECS {
-                                                log::warn!(
-                                                    "Pong timeout ({}s), reconnecting (conn={}, idle_tx={}s)",
-                                                    waited,
-                                                    ping_conn_label,
-                                                    waited,
-                                                );
-                                                let close_msg = OutboundMessage::Control(
-                                                    tokio_tungstenite::tungstenite::Message::Close(None)
-                                                );
-                                                let _ = ping_tx_ctrl.send(close_msg).await;
-                                                break;
+                                                let misses = pong_miss_count_clone
+                                                    .fetch_add(1, Ordering::SeqCst)
+                                                    + 1;
+                                                if misses < PONG_MAX_MISSES {
+                                                    log::info!(
+                                                        "Pong missed ({}s, {}/{} strikes), retrying (conn={})",
+                                                        waited,
+                                                        misses,
+                                                        PONG_MAX_MISSES,
+                                                        ping_conn_label,
+                                                    );
+                                                    // Allow a fresh ping next tick instead of reconnecting
+                                                    ping_pending_client_ping
+                                                        .store(false, Ordering::SeqCst);
+                                                } else {
+                                                    log::warn!(
+                                                        "Pong timeout ({}s, {} strikes), reconnecting (conn={})",
+                                                        waited,
+                                                        misses,
+                                                        ping_conn_label,
+                                                    );
+                                                    let close_msg = OutboundMessage::Control(
+                                                        tokio_tungstenite::tungstenite::Message::Close(None)
+                                                    );
+                                                    let _ = ping_tx_ctrl.send(close_msg).await;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -5433,6 +5463,7 @@ impl LighterConnector {
                                             && payload == expected_payload
                                         {
                                             pending_client_ping.store(false, Ordering::SeqCst);
+                                            pong_miss_count.store(0, Ordering::SeqCst);
                                             log::debug!(
                                                 "Received control pong (conn={}, payload={:?})",
                                                 conn_label,
