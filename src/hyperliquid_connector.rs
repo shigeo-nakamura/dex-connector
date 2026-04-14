@@ -186,9 +186,12 @@ pub struct HyperliquidConnector {
     static_market_info: HashMap<String, StaticMarketInfo>,
     spot_index_map: HashMap<String, usize>,
     spot_reverse_map: Arc<HashMap<usize, String>>,
-    exchange_client: ExchangeClient,
+    exchange_client: Arc<ExchangeClient>,
     maintenance: Arc<RwLock<MaintenanceInfo>>,
     last_volumes: Arc<Mutex<HashMap<String, Decimal>>>,
+    // Auto-cleanup management for trade_results / canceled_results
+    cleanup_started: Arc<AtomicBool>,
+    cleanup_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[derive(Debug)]
@@ -393,12 +396,14 @@ impl HyperliquidConnector {
             static_market_info: HashMap::new(),
             spot_index_map: HashMap::new(),
             spot_reverse_map: Arc::new(HashMap::new()),
-            exchange_client,
+            exchange_client: Arc::new(exchange_client),
             maintenance: Arc::new(RwLock::new(MaintenanceInfo {
                 next_start: None,
                 fetched_at: Utc::now() - ChronoDuration::hours(1),
             })),
             last_volumes: Arc::new(Mutex::new(HashMap::new())),
+            cleanup_started: Arc::new(AtomicBool::new(false)),
+            cleanup_handle: Arc::new(Mutex::new(None)),
         };
 
         instance.spawn_maintenance_watcher();
@@ -549,6 +554,141 @@ impl HyperliquidConnector {
                 }
                 sleep(Duration::from_secs(600)).await;
             }
+        });
+    }
+
+    /// Spawn a one-shot task that cancels the given order after `expiry_secs` seconds.
+    /// Used to implement `expiry_secs` for Hyperliquid, which the SDK does not support natively.
+    fn schedule_auto_cancel(&self, symbol: &str, asset: String, oid: u64, expiry_secs: u64) {
+        if expiry_secs == 0 {
+            return;
+        }
+        let exchange_client = Arc::clone(&self.exchange_client);
+        let symbol = symbol.to_string();
+        log::info!(
+            "🕐 [HYPERLIQUID_EXPIRY] scheduling auto-cancel for symbol={} oid={} in {}s",
+            symbol,
+            oid,
+            expiry_secs
+        );
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(expiry_secs)).await;
+            let cancel = ClientCancelRequest { asset, oid };
+            match exchange_client.cancel(cancel, None).await {
+                Ok(_) => log::info!(
+                    "🕐 [HYPERLIQUID_EXPIRY] auto-cancel sent for symbol={} oid={}",
+                    symbol,
+                    oid
+                ),
+                Err(e) => log::warn!(
+                    "🕐 [HYPERLIQUID_EXPIRY] auto-cancel failed for symbol={} oid={}: {} (order may already be filled/canceled)",
+                    symbol,
+                    oid,
+                    e
+                ),
+            }
+        });
+    }
+
+    /// Start background task that periodically prunes old entries from trade_results
+    /// and canceled_results to prevent unbounded memory growth. Mirrors Lighter's
+    /// `start_auto_cleanup` behavior.
+    pub fn start_auto_cleanup(&self, cleanup_interval_hours: u64) {
+        if self.cleanup_started.swap(true, Ordering::SeqCst) {
+            log::warn!("[AUTO_CLEANUP] already started; ignoring.");
+            return;
+        }
+
+        log::info!(
+            "[AUTO_CLEANUP] Starting background task (interval: {}h)",
+            cleanup_interval_hours
+        );
+
+        let trade_results = Arc::clone(&self.trade_results);
+        let canceled_results = Arc::clone(&self.canceled_results);
+        let running = Arc::clone(&self.running);
+        let cleanup_started = Arc::clone(&self.cleanup_started);
+        let cleanup_handle = Arc::clone(&self.cleanup_handle);
+
+        let handle = tokio::spawn(async move {
+            const KEEP_FILLED_PER_SYMBOL: usize = 50;
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(cleanup_interval_hours * 3600));
+            interval.tick().await; // skip immediate tick
+
+            while running.load(Ordering::Relaxed) {
+                interval.tick().await;
+
+                let mut filled_removed = 0usize;
+                let mut canceled_removed = 0usize;
+
+                {
+                    let mut trades = trade_results.write().await;
+                    for (symbol, orders) in trades.iter_mut() {
+                        if orders.len() > KEEP_FILLED_PER_SYMBOL {
+                            let remove_count = orders.len() - KEEP_FILLED_PER_SYMBOL;
+                            // HashMap has no insertion order; drop arbitrary entries beyond cap.
+                            let keys_to_remove: Vec<String> = orders
+                                .keys()
+                                .take(remove_count)
+                                .cloned()
+                                .collect();
+                            for key in keys_to_remove {
+                                orders.remove(&key);
+                            }
+                            filled_removed += remove_count;
+                            log::debug!(
+                                "🗑️ [AUTO_CLEANUP] Removed {} old filled orders for {} (kept {})",
+                                remove_count,
+                                symbol,
+                                KEEP_FILLED_PER_SYMBOL
+                            );
+                        }
+                    }
+                    trades.retain(|_, orders| !orders.is_empty());
+                }
+
+                {
+                    let mut canceled = canceled_results.write().await;
+                    let cutoff_secs =
+                        (Utc::now() - ChronoDuration::hours(24)).timestamp() as u64;
+                    for (symbol, orders) in canceled.iter_mut() {
+                        let initial_len = orders.len();
+                        orders.retain(|_, ev| ev.timestamp > cutoff_secs);
+                        let removed = initial_len.saturating_sub(orders.len());
+                        canceled_removed += removed;
+                        if removed > 0 {
+                            log::debug!(
+                                "🗑️ [AUTO_CLEANUP] Removed {} old canceled orders for {}",
+                                removed,
+                                symbol
+                            );
+                        }
+                    }
+                    canceled.retain(|_, orders| !orders.is_empty());
+                }
+
+                let total_removed = filled_removed + canceled_removed;
+                if total_removed > 0 {
+                    log::info!(
+                        "🗑️ [AUTO_CLEANUP] removed total={} (filled={}, canceled={})",
+                        total_removed,
+                        filled_removed,
+                        canceled_removed
+                    );
+                }
+            }
+
+            cleanup_started.store(false, Ordering::SeqCst);
+            let mut guard = cleanup_handle.lock().await;
+            *guard = None;
+            log::info!("🛑 [AUTO_CLEANUP] task exited, ready for restart");
+        });
+
+        let cleanup_handle_for_storage = Arc::clone(&self.cleanup_handle);
+        tokio::spawn(async move {
+            let mut guard = cleanup_handle_for_storage.lock().await;
+            *guard = Some(handle);
         });
     }
 
@@ -1304,6 +1444,7 @@ impl DexConnector for HyperliquidConnector {
         self.start_web_socket().await?;
         sleep(Duration::from_secs(5)).await;
         self.wait_for_market_ready(60).await?;
+        self.start_auto_cleanup(6);
         Ok(())
     }
 
@@ -1849,7 +1990,7 @@ impl DexConnector for HyperliquidConnector {
         price: Option<Decimal>,
         spread: Option<i64>,
         reduce_only: bool,
-        _expiry_secs: Option<u64>, // Ignored for Hyperliquid
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         let (price, time_in_force) = match price {
             Some(v) => {
@@ -1921,7 +2062,7 @@ impl DexConnector for HyperliquidConnector {
 
         let cloid = Uuid::new_v4();
         let order = ClientOrderRequest {
-            asset,
+            asset: asset.clone(),
             is_buy: side == OrderSide::Long,
             reduce_only,
             limit_px: rounded_price
@@ -1951,15 +2092,21 @@ impl DexConnector for HyperliquidConnector {
             ExchangeResponseStatus::Err(e) => return Err(DexError::ServerResponse(e.to_string())),
         };
         let status = res.data.unwrap().statuses[0].clone();
-        let order_id = match status {
-            ExchangeDataStatus::Filled(order) => order.oid,
-            ExchangeDataStatus::Resting(order) => order.oid,
+        let (order_id, is_resting) = match status {
+            ExchangeDataStatus::Filled(order) => (order.oid, false),
+            ExchangeDataStatus::Resting(order) => (order.oid, true),
             _ => {
                 return Err(DexError::ServerResponse(
                     "Unknown ExchangeDataStaus".to_owned(),
                 ))
             }
         };
+
+        if let Some(expiry) = expiry_secs {
+            if is_resting {
+                self.schedule_auto_cancel(symbol, asset, order_id, expiry);
+            }
+        }
 
         Ok(CreateOrderResponse {
             order_id: order_id.to_string(),
@@ -1983,14 +2130,6 @@ impl DexConnector for HyperliquidConnector {
         reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        // Log expiry_secs if provided
-        if let Some(expiry) = expiry_secs {
-            log::warn!(
-                "🕐 [HYPERLIQUID_EXPIRY] expiry_secs={} specified but not directly supported by Hyperliquid trigger orders. Consider implementing auto-cancel mechanism.",
-                expiry
-            );
-        }
-
         let asset = resolve_coin(symbol, &self.spot_index_map);
 
         // Round size to proper decimals for this symbol
@@ -2076,7 +2215,7 @@ impl DexConnector for HyperliquidConnector {
 
         let cloid = Uuid::new_v4();
         let request = ClientOrderRequest {
-            asset,
+            asset: asset.clone(),
             is_buy,
             reduce_only,
             limit_px: final_limit_price_opt.unwrap_or(0.0),
@@ -2110,9 +2249,9 @@ impl DexConnector for HyperliquidConnector {
             .next()
             .ok_or_else(|| DexError::Other("No order status returned".into()))?;
 
-        let oid = match status {
-            ExchangeDataStatus::Filled(o) => o.oid,
-            ExchangeDataStatus::Resting(o) => o.oid,
+        let (oid, is_resting) = match status {
+            ExchangeDataStatus::Filled(o) => (o.oid, false),
+            ExchangeDataStatus::Resting(o) => (o.oid, true),
             _ => {
                 return Err(DexError::ServerResponse(
                     "Unrecognized exchange status".into(),
@@ -2128,14 +2267,11 @@ impl DexConnector for HyperliquidConnector {
 
         let order_id = oid.to_string();
 
-        // TODO: Implement auto-cancel mechanism for expiry_secs
-        // if let Some(expiry) = expiry_secs {
-        //     tokio::spawn(async move {
-        //         tokio::time::sleep(tokio::time::Duration::from_secs(expiry)).await;
-        //         // Cancel order with order_id
-        //         log::info!("Auto-canceling order {} after {} seconds", order_id, expiry);
-        //     });
-        // }
+        if let Some(expiry) = expiry_secs {
+            if is_resting {
+                self.schedule_auto_cancel(symbol, asset, oid, expiry);
+            }
+        }
 
         Ok(CreateOrderResponse {
             order_id,
