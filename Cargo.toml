@@ -12,6 +12,7 @@ license = "MIT"
 [features]
 default = ["lighter-sdk"]
 lighter-sdk = ["dep:libc"]
+extended-sdk = ["dep:rust-crypto-lib-base", "dep:starknet"]
 
 [dependencies]
 chrono = { version = "0.4.26", default-features = false, features = ["clock", "serde"] }
@@ -59,6 +60,10 @@ num-traits = "0.2"
 poseidon-rs = "0.0.10"
 # Simple field arithmetic for Goldilocks
 # Using num-bigint for field operations
+
+# Extended Exchange (StarkNet SNIP-12) — behind `extended-sdk` feature
+rust-crypto-lib-base = { git = "https://github.com/x10xchange/rust-crypto-lib-base", optional = true }
+starknet = { version = "0.17", optional = true }
 
 [dev-dependencies]
 rusoto_core = "0.48"
