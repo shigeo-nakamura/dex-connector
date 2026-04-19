@@ -5728,7 +5728,7 @@ impl LighterConnector {
                                 };
 
                                 if is_contaminated {
-                                    log::warn!(
+                                    log::info!(
                                         "[WS_OB] REJECTED contaminated OB for {} (market_id={:?}): \
                                          bid={} ask={} mid={} deviates >50% from known price",
                                         symbol,
