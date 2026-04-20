@@ -1,0 +1,36 @@
+[Unit]
+Description=Lighter rate-limit sidecar (bot-strategy#79)
+Documentation=https://github.com/shigeo-nakamura/bot-strategy/issues/79
+After=network.target
+# Must be ready before any bot starts making Lighter REST calls.
+Before=slow-mm-btc.service slow-mm-eth.service debot-pair-btceth.service
+
+[Service]
+Type=simple
+ExecStart=/opt/lighter-ratelimit/bin/lighter-ratelimit
+# Socket path is created inside /run/lighter-ratelimit/ by systemd and auto-removed on stop.
+RuntimeDirectory=lighter-ratelimit
+RuntimeDirectoryMode=0755
+Environment=LIGHTER_RATELIMIT_SOCKET=/run/lighter-ratelimit/lighter-ratelimit.sock
+# Defaults match Lighter Standard tier. Override here if Lighter changes the cap.
+Environment=LIGHTER_RATELIMIT_CAPACITY=60000
+Environment=LIGHTER_RATELIMIT_REFILL_PER_SEC=1000
+Environment=RUST_LOG=info
+# Restart aggressively but not in a tight loop; pair with StartLimitBurst below.
+Restart=always
+RestartSec=2
+StartLimitBurst=5
+StartLimitIntervalSec=60
+StandardOutput=journal
+StandardError=journal
+# Hardening — daemon has no business touching anything else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/lighter-ratelimit
+# Run as a dedicated system user if provisioned; fall back to root if not.
+# User=lighter-ratelimit
+
+[Install]
+WantedBy=multi-user.target

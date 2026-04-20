@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "4.2.37"
+version = "4.2.38"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -50,6 +50,7 @@ base64 = "0.21"
 libc = { version = "0.2", optional = true }
 rand = "0.8"
 parking_lot = "0.12"
+env_logger = "0.10"
 
 # Cryptographic dependencies for Schnorr+Poseidon2
 curve25519-dalek = { version = "4.1", features = ["rand_core"] }
@@ -64,6 +65,11 @@ poseidon-rs = "0.0.10"
 # Extended Exchange (StarkNet SNIP-12) — behind `extended-sdk` feature
 rust-crypto-lib-base = { git = "https://github.com/x10xchange/rust-crypto-lib-base", optional = true }
 starknet = { version = "0.17", optional = true }
+
+[[bin]]
+name = "lighter-ratelimit"
+path = "src/bin/lighter-ratelimit.rs"
+required-features = ["lighter-sdk"]
 
 [dev-dependencies]
 rusoto_core = "0.48"

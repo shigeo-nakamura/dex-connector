@@ -368,6 +368,11 @@ pub struct LighterConnector {
     cached_funding_rates: Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
     // Broadcast sender for real-time price updates from WS OB changes
     price_update_tx: tokio::sync::broadcast::Sender<crate::PriceUpdate>,
+    // Host-shared weight-based rate limiter (bot-strategy#79). Routes every
+    // Lighter REST call through the sidecar daemon (or an in-process fallback
+    // bucket) so the per-IP 60k weight/min ceiling is respected even when
+    // multiple bots on the same host burst simultaneously after a WS reconnect.
+    rate_limiter: crate::lighter_ratelimit::RateLimitClient,
 }
 
 #[derive(Clone, Debug)]
@@ -1486,6 +1491,7 @@ impl LighterConnector {
             cached_exchange_stats: Arc::new(RwLock::new(None)),
             cached_funding_rates: Arc::new(RwLock::new(None)),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
+            rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
     }
 
@@ -1544,6 +1550,7 @@ impl LighterConnector {
             cached_exchange_stats: Arc::new(RwLock::new(None)),
             cached_funding_rates: Arc::new(RwLock::new(None)),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
+            rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
     }
 
@@ -1740,6 +1747,15 @@ impl LighterConnector {
         log::debug!("Form data: {}", form_data);
 
         track_api_call("POST /api/v1/sendTx", "POST");
+
+        // Order submission path — wait up to 5s for budget rather than drop
+        // the order. A small queued delay is vastly preferable to a missed
+        // trade. See bot-strategy#79.
+        self.acquire_rest_budget(
+            "/api/v1/sendTx",
+            crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 5_000 },
+        )
+        .await?;
 
         // Use form-urlencoded format same as Go SDK, without X-API-KEY header
         let response = self
@@ -1955,6 +1971,13 @@ impl LighterConnector {
         let client = &self.client;
         let url = format!("{}/api/v1/sendTx", self.base_url);
 
+        // Protective orders (SL/TP) must not be dropped — wait for budget.
+        self.acquire_rest_budget(
+            "/api/v1/sendTx",
+            crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 5_000 },
+        )
+        .await?;
+
         let response = client
             .post(&url)
             .header("Content-Type", "application/x-www-form-urlencoded")
@@ -2161,6 +2184,14 @@ impl LighterConnector {
         // Track API call
         track_api_call("/api/v1/nextNonce", "GET");
 
+        // Nonce feeds straight into sendTx, so we must not shed — wait up to
+        // 3s for budget rather than fail the signing path. See bot-strategy#79.
+        self.acquire_rest_budget(
+            "/api/v1/nextNonce",
+            crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 3_000 },
+        )
+        .await?;
+
         let response = self
             .client
             .get(&url)
@@ -2351,6 +2382,27 @@ impl LighterConnector {
         Ok(response_text)
     }
 
+    /// Acquire host-shared rate-limit budget for an upcoming REST call.
+    /// Returns `Err(DexError::RateLimited)` on shed so the caller can fall
+    /// back to cached data or skip the cycle. See bot-strategy#79.
+    async fn acquire_rest_budget(
+        &self,
+        endpoint: &str,
+        policy: crate::lighter_ratelimit::AcquirePolicy,
+    ) -> Result<(), DexError> {
+        let weight = crate::lighter_ratelimit::weights::weight_for(endpoint);
+        match self
+            .rate_limiter
+            .acquire(weight, policy, Some(endpoint))
+            .await
+        {
+            crate::lighter_ratelimit::AcquireOutcome::Granted { .. } => Ok(()),
+            crate::lighter_ratelimit::AcquireOutcome::Shed => Err(DexError::RateLimited {
+                until_unix: chrono::Utc::now().timestamp() + 2,
+            }),
+        }
+    }
+
     async fn make_request<T>(
         &self,
         endpoint: &str,
@@ -2377,6 +2429,12 @@ impl LighterConnector {
                 until_unix: chrono::Utc::now().timestamp() + remaining.as_secs() as i64,
             });
         }
+
+        // Proactive per-IP rate limit. Shed policy by default for generic
+        // reads: callers that need delivery guarantees (sendTx, nonce) go
+        // through dedicated code paths with Wait policy. See bot-strategy#79.
+        self.acquire_rest_budget(endpoint, crate::lighter_ratelimit::AcquirePolicy::Shed)
+            .await?;
 
         let url = format!("{}{}", self.base_url, endpoint);
 
@@ -4037,6 +4095,13 @@ impl DexConnector for LighterConnector {
         );
 
         track_api_call("POST /api/v1/sendTx (cancel_order)", "POST");
+
+        // Cancel is on the risk-reduction path — wait for budget.
+        self.acquire_rest_budget(
+            "/api/v1/sendTx",
+            crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 5_000 },
+        )
+        .await?;
 
         let response = self
             .client

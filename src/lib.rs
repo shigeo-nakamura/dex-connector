@@ -12,6 +12,8 @@ mod hyperliquid_connector;
 #[cfg(feature = "lighter-sdk")]
 pub mod lighter_connector;
 #[cfg(feature = "lighter-sdk")]
+pub mod lighter_ratelimit;
+#[cfg(feature = "lighter-sdk")]
 pub mod lighter_waf_cooldown;
 
 pub use dex_connector::DexConnector;
