@@ -2,8 +2,6 @@
 //! the same logic the daemon uses, connect real `RateLimitClient` instances
 //! over UDS, and verify the shared-bucket invariants that motivate #79.
 
-#![cfg(feature = "lighter-sdk")]
-
 use std::sync::Arc;
 use std::time::Duration;
 

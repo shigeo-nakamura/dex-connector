@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "4.2.38"
+version = "4.2.39"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -69,7 +69,6 @@ starknet = { version = "0.17", optional = true }
 [[bin]]
 name = "lighter-ratelimit"
 path = "src/bin/lighter-ratelimit.rs"
-required-features = ["lighter-sdk"]
 
 [dev-dependencies]
 rusoto_core = "0.48"
