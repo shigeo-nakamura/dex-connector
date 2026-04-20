@@ -1441,6 +1441,12 @@ impl LighterConnector {
             ob_stale_secs
         );
 
+        let client = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| DexError::Other(format!("Failed to build HTTP client: {}", e)))?;
+
         Ok(Self {
             api_key_public: config.api_key_public,
             api_key_index: config.api_key_index,
@@ -1450,7 +1456,7 @@ impl LighterConnector {
             base_url: config.base_url.clone(),
             websocket_url: config.websocket_url.clone(),
             _l1_address: l1_address,
-            client: Client::new(),
+            client,
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1495,6 +1501,12 @@ impl LighterConnector {
             ob_stale_secs
         );
 
+        let client = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| DexError::Other(format!("Failed to build HTTP client: {}", e)))?;
+
         Ok(Self {
             api_key_public: config.api_key_public,
             api_key_index: config.api_key_index,
@@ -1503,7 +1515,7 @@ impl LighterConnector {
             base_url: config.base_url.clone(),
             websocket_url: config.websocket_url.clone(),
             _l1_address: l1_address,
-            client: Client::new(),
+            client,
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2111,15 +2123,23 @@ impl LighterConnector {
 
     async fn get_nonce_with_key(&self, api_key: &str) -> Result<u64, DexError> {
         if api_key == self.api_key_public {
-            let mut cache = self.nonce_cache.lock().await;
-            if let Some(state) = cache.as_mut() {
-                if state.last_refresh.elapsed() <= self.nonce_cache_ttl {
-                    let nonce = state.next_nonce;
-                    state.next_nonce = state.next_nonce.saturating_add(1);
-                    return Ok(nonce);
+            // Cache-hit fast path: lock only for cache read/write, never across REST I/O.
+            // Holding the lock across `fetch_nonce().await` can deadlock the runtime if
+            // the REST call stalls under Lighter WAF/429 (see bot-strategy#85).
+            {
+                let mut cache = self.nonce_cache.lock().await;
+                if let Some(state) = cache.as_mut() {
+                    if state.last_refresh.elapsed() <= self.nonce_cache_ttl {
+                        let nonce = state.next_nonce;
+                        state.next_nonce = state.next_nonce.saturating_add(1);
+                        return Ok(nonce);
+                    }
                 }
             }
+
             let nonce = self.fetch_nonce(api_key).await?;
+
+            let mut cache = self.nonce_cache.lock().await;
             *cache = Some(NonceCache {
                 next_nonce: nonce.saturating_add(1),
                 last_refresh: Instant::now(),
