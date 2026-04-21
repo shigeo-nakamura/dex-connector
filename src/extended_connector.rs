@@ -1845,7 +1845,9 @@ impl ExtendedConnector {
         symbol: &str,
         depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
-        let path = format!("/info/markets/{}/orderbook", symbol);
+        // Same bare-symbol → market-name resolution as get_order_book below.
+        let market = self.get_market(symbol).await?;
+        let path = format!("/info/markets/{}/orderbook", market.name);
         let snapshot: OrderbookUpdateModel = self.api.get(path, true).await?;
         let bids = snapshot
             .bid
@@ -2458,7 +2460,12 @@ impl DexConnector for ExtendedConnector {
                     )
                 })
         } else {
-            let path = format!("/info/markets/{}/orderbook", symbol);
+            // Resolve through get_market so a bare symbol like "BTC" hits
+            // the real market name "BTC-USD" on the REST URL. Without this
+            // the /info/markets/BTC/orderbook endpoint returns empty and
+            // pairtrade's step loop spams `Extended API returned empty data`.
+            let market = self.get_market(symbol).await?;
+            let path = format!("/info/markets/{}/orderbook", market.name);
             let snapshot: OrderbookUpdateModel = self.api.get(path, true).await?;
             let bids = snapshot
                 .bid
