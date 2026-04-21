@@ -22,6 +22,24 @@ fn optional(var: &str) -> Option<String> {
     env::var(var).ok().filter(|v| !v.is_empty())
 }
 
+async fn wait_for<F, Fut>(
+    timeout: std::time::Duration,
+    mut probe: F,
+) -> Option<std::time::Duration>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<()>>,
+{
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if probe().await.is_some() {
+            return Some(start.elapsed());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    None
+}
+
 async fn decrypt_private_key() -> String {
     let encrypted = require("EXTENDED_PRIVATE_KEY");
     let data_key = require("ENCRYPTED_DATA_KEY").replace(' ', "");
@@ -145,11 +163,75 @@ async fn main() {
                 "      ok — order_id={} exch_id={:?} px={} sz={}",
                 order.order_id, order.exchange_order_id, order.ordered_price, order.ordered_size
             );
-            println!("      cancelling…");
+
+            // Phase 3a: WS account-stream regression. Cache should be populated
+            // via the /account WS push, not a REST call triggered by our read.
+            println!("\n[ws-check] polling get_open_orders for up to 5s…");
+            let appeared = wait_for(std::time::Duration::from_secs(5), || async {
+                let open = connector.get_open_orders(&symbol).await.ok()?;
+                open.orders
+                    .iter()
+                    .any(|o| o.order_id == order.order_id)
+                    .then_some(())
+            })
+            .await;
+            match appeared {
+                Some(elapsed) => println!(
+                    "      ✅ order appeared in open_orders cache after {:?}",
+                    elapsed
+                ),
+                None => println!(
+                    "      ⚠️  order NOT seen in open_orders cache within 5s (WS account \
+                     stream may be down or slow — REST fallback will still work)"
+                ),
+            }
+
+            println!("\n[ws-check] cancelling…");
             match connector.cancel_order(&symbol, &order.order_id).await {
-                Ok(_) => println!("      cancel ok"),
+                Ok(_) => println!("      cancel ack ok"),
                 Err(e) => eprintln!("      cancel FAILED: {:?}", e),
             }
+
+            println!("\n[ws-check] polling for cancel to propagate (up to 5s)…");
+            let gone = wait_for(std::time::Duration::from_secs(5), || async {
+                let open = connector.get_open_orders(&symbol).await.ok()?;
+                (!open.orders.iter().any(|o| o.order_id == order.order_id)).then_some(())
+            })
+            .await;
+            match gone {
+                Some(elapsed) => println!(
+                    "      ✅ order gone from open_orders cache after {:?}",
+                    elapsed
+                ),
+                None => println!("      ⚠️  order still in open_orders after 5s"),
+            }
+
+            // Surface final account-stream-driven views
+            let filled = connector
+                .get_filled_orders(&symbol)
+                .await
+                .map(|f| f.orders.len())
+                .unwrap_or(0);
+            let canceled = connector
+                .get_canceled_orders(&symbol)
+                .await
+                .map(|c| c.orders.len())
+                .unwrap_or(0);
+            let positions = connector
+                .get_positions()
+                .await
+                .map(|p| p.len())
+                .unwrap_or(0);
+            // Extended collateral is USD (market symbol like "BTC-USD" is not valid here)
+            let balance = connector
+                .get_balance(Some("USD"))
+                .await
+                .map(|b| format!("equity={} bal={}", b.equity, b.balance))
+                .unwrap_or_else(|e| format!("err: {:?}", e));
+            println!(
+                "\n[ws-check] account views — filled={} canceled={} positions={} balance=[{}]",
+                filled, canceled, positions, balance
+            );
         }
         Err(e) => {
             eprintln!("      place FAILED: {:?}", e);
