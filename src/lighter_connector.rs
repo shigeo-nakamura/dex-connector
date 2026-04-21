@@ -982,41 +982,49 @@ impl LighterConnector {
             }
         }
 
-        // Also load spot markets from /api/v1/orderBooks (orderBookDetails only has perps)
-        match self.get_order_books_all().await {
-            Ok(books) => {
-                for book in books.order_books {
-                    let normalized = normalize_symbol(&book.symbol);
-                    if normalized.is_empty() || cache.by_symbol.contains_key(&normalized) {
-                        continue;
+        // Also load spot markets from /api/v1/orderBooks (orderBookDetails only has perps).
+        // Perps-only bots (pairtrade, slow-mm) can set LIGHTER_SKIP_SPOT_MARKETS=1 to avoid
+        // this call — firing it right after the heavy orderBookDetails response was the
+        // single biggest trigger of startup 429 / WAF cooldown (bot-strategy#128 follow-up).
+        let skip_spot = std::env::var("LIGHTER_SKIP_SPOT_MARKETS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !skip_spot {
+            match self.get_order_books_all().await {
+                Ok(books) => {
+                    for book in books.order_books {
+                        let normalized = normalize_symbol(&book.symbol);
+                        if normalized.is_empty() || cache.by_symbol.contains_key(&normalized) {
+                            continue;
+                        }
+                        let price_decimals = book.supported_price_decimals
+                            .unwrap_or(DEFAULT_PRICE_DECIMALS)
+                            .min(MAX_DECIMAL_PRECISION);
+                        let size_decimals = book.supported_size_decimals
+                            .unwrap_or(DEFAULT_SIZE_DECIMALS)
+                            .min(MAX_DECIMAL_PRECISION);
+                        let min_order = book.min_base_amount
+                            .as_deref()
+                            .and_then(|v| Decimal::from_str(v).ok());
+                        let info = MarketInfo {
+                            canonical_symbol: normalized.clone(),
+                            market_id: book.market_id,
+                            price_decimals,
+                            size_decimals,
+                            min_order,
+                        };
+                        log::info!(
+                            "[MARKET_INFO] Loaded market {} (spot): price_decimals={}, size_decimals={}, min_order={:?}",
+                            normalized, price_decimals, size_decimals, min_order
+                        );
+                        detail_decimals.insert(book.market_id, (price_decimals, size_decimals));
+                        cache.by_symbol.insert(normalized.clone(), info.clone());
+                        cache.by_id.insert(book.market_id, info);
                     }
-                    let price_decimals = book.supported_price_decimals
-                        .unwrap_or(DEFAULT_PRICE_DECIMALS)
-                        .min(MAX_DECIMAL_PRECISION);
-                    let size_decimals = book.supported_size_decimals
-                        .unwrap_or(DEFAULT_SIZE_DECIMALS)
-                        .min(MAX_DECIMAL_PRECISION);
-                    let min_order = book.min_base_amount
-                        .as_deref()
-                        .and_then(|v| Decimal::from_str(v).ok());
-                    let info = MarketInfo {
-                        canonical_symbol: normalized.clone(),
-                        market_id: book.market_id,
-                        price_decimals,
-                        size_decimals,
-                        min_order,
-                    };
-                    log::info!(
-                        "[MARKET_INFO] Loaded market {} (spot): price_decimals={}, size_decimals={}, min_order={:?}",
-                        normalized, price_decimals, size_decimals, min_order
-                    );
-                    detail_decimals.insert(book.market_id, (price_decimals, size_decimals));
-                    cache.by_symbol.insert(normalized.clone(), info.clone());
-                    cache.by_id.insert(book.market_id, info);
                 }
-            }
-            Err(err) => {
-                log::warn!("Failed to fetch orderBooks for spot markets: {}", err);
+                Err(err) => {
+                    log::warn!("Failed to fetch orderBooks for spot markets: {}", err);
+                }
             }
         }
 
