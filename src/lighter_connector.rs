@@ -4984,12 +4984,19 @@ impl LighterConnector {
                 if reconnect_attempt > 0 {
                     reconnect_backoff(reconnect_attempt).await;
                 } else {
-                    // Stagger initial reconnects across bot instances.
+                    // Stagger initial reconnects across bot instances. Default
+                    // widened from 15s to 30s (bot-strategy#121): during the
+                    // 2026-04-20 cascade (#78) the 15s window was still tight
+                    // enough that 4 bots reconnected within ~5s and bursted the
+                    // REST refetch past Lighter's per-IP ceiling. 30s spreads
+                    // the same traffic over a window twice as wide, halving
+                    // peak weight/s while staying well inside Lighter's 60s
+                    // rolling window.
                     let reconnect_jitter_secs: u64 =
                         std::env::var("LIGHTER_RECONNECT_JITTER_SECS")
                             .ok()
                             .and_then(|v| v.parse().ok())
-                            .unwrap_or(15);
+                            .unwrap_or(30);
                     if reconnect_jitter_secs > 0 {
                         let jitter =
                             rand::thread_rng().gen_range(0..=reconnect_jitter_secs);
