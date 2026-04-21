@@ -74,6 +74,11 @@ poseidon-rs = "0.0.10"
 rust-crypto-lib-base = { git = "https://github.com/x10xchange/rust-crypto-lib-base", optional = true }
 starknet = { version = "0.17", optional = true }
 
+[[bin]]
+name = "extended-spike"
+path = "src/bin/extended-spike.rs"
+required-features = ["extended-sdk"]
+
 [dev-dependencies]
 rusoto_core = "0.48"
 rusoto_kms = "0.48"
