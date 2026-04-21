@@ -2189,23 +2189,26 @@ impl DexConnector for ExtendedConnector {
     ) -> Result<TickerResponse, DexError> {
         let market = self.get_market(symbol).await?;
         let price = if self.websocket_url.is_some() {
-            let trades = self.last_trades.read().await;
-            if let Some(items) = trades.get(symbol).and_then(|v| v.last()) {
-                items.price
+            // Prefer the orderbook midpoint (fresh within ORDERBOOK_STALE_AFTER)
+            // over the public-trade cache. Thin Extended markets can go minutes
+            // between trades, which would otherwise freeze `price` even while
+            // the book keeps moving — see bot-strategy#134.
+            let book_mid = self.get_cached_order_book(symbol, 1).await.and_then(|s| {
+                let bid = s.bids.first().map(|v| v.price);
+                let ask = s.asks.first().map(|v| v.price);
+                match (bid, ask) {
+                    (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::new(2, 0)),
+                    (Some(bid), None) => Some(bid),
+                    (None, Some(ask)) => Some(ask),
+                    _ => None,
+                }
+            });
+            if let Some(mid) = book_mid {
+                mid
             } else {
-                if let Some(snapshot) = self.get_cached_order_book(symbol, 1).await {
-                    let bid = snapshot.bids.first().map(|v| v.price);
-                    let ask = snapshot.asks.first().map(|v| v.price);
-                    match (bid, ask) {
-                        (Some(bid), Some(ask)) => (bid + ask) / Decimal::new(2, 0),
-                        (Some(bid), None) => bid,
-                        (None, Some(ask)) => ask,
-                        _ => {
-                            return Err(DexError::Other(
-                                "ticker unavailable: waiting for websocket data".to_string(),
-                            ))
-                        }
-                    }
+                let trades = self.last_trades.read().await;
+                if let Some(items) = trades.get(symbol).and_then(|v| v.last()) {
+                    items.price
                 } else {
                     return Err(DexError::Other(
                         "ticker unavailable: waiting for websocket data".to_string(),
