@@ -4,6 +4,10 @@ Documentation=https://github.com/shigeo-nakamura/bot-strategy/issues/79
 After=network.target
 # Must be ready before any bot starts making Lighter REST calls.
 Before=slow-mm-btc.service slow-mm-eth.service debot-pair-btceth.service
+# Burst limits belong in [Unit], not [Service] — systemd silently ignores them
+# when misplaced, so they stayed inert until this was fixed.
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -16,11 +20,9 @@ Environment=LIGHTER_RATELIMIT_SOCKET=/run/lighter-ratelimit/lighter-ratelimit.so
 Environment=LIGHTER_RATELIMIT_CAPACITY=60000
 Environment=LIGHTER_RATELIMIT_REFILL_PER_SEC=1000
 Environment=RUST_LOG=info
-# Restart aggressively but not in a tight loop; pair with StartLimitBurst below.
+# Restart aggressively; StartLimit* in [Unit] bounds the burst.
 Restart=always
 RestartSec=2
-StartLimitBurst=5
-StartLimitIntervalSec=60
 StandardOutput=journal
 StandardError=journal
 # Hardening — daemon has no business touching anything else.
