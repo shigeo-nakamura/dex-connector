@@ -2415,6 +2415,13 @@ impl LighterConnector {
         url: &str,
         err_label: &str,
     ) -> Result<String, DexError> {
+        // Log the call through API_TRACKER so `/recentTrades`, `/funding-rates`,
+        // `/orderBookDetails`, etc. show up in the 60s rolling window alongside
+        // `/account`. Without this they fire silently and any 429 they trigger
+        // appears in journalctl as a cooldown engagement with no visible
+        // preceding request.
+        track_api_call(err_label, "GET");
+
         if let Some(remaining) = crate::lighter_waf_cooldown::cooldown_remaining() {
             return Err(DexError::RateLimited {
                 until_unix: chrono::Utc::now().timestamp() + remaining.as_secs() as i64,
