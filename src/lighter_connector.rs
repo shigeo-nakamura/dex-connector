@@ -887,6 +887,21 @@ impl LighterConnector {
     }
 
     async fn refresh_market_cache(&self) -> Result<(), DexError> {
+        // If a WAF cooldown is already engaged, short-circuit before issuing
+        // any of the 3 REST calls below. Each of those calls would otherwise
+        // fail-fast and emit its own WARN, turning one cooldown into ~3
+        // WARN lines per attempt. See bot-strategy#128.
+        if let Some(remaining) = crate::lighter_waf_cooldown::cooldown_remaining() {
+            let deadline = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64 + remaining.as_secs() as i64)
+                .unwrap_or(0);
+            return Err(DexError::Other(format!(
+                "Lighter WAF cooldown active until unix={} (rate-limited)",
+                deadline
+            )));
+        }
+
         let mut cache = MarketCache::default();
         let mut detail_decimals: HashMap<u32, (u32, u32)> = HashMap::new();
 
@@ -1069,6 +1084,21 @@ impl LighterConnector {
         let mut backoff = Duration::from_secs(1);
 
         loop {
+            // If a WAF cooldown is already active, sleep until it expires
+            // (plus a small buffer) instead of burning exp-backoff retries
+            // that all fail fast and spam WARN lines. Each failed attempt
+            // otherwise produces ~3 WARN lines from refresh_market_cache's
+            // inner REST calls. See bot-strategy#128.
+            if let Some(remaining) = crate::lighter_waf_cooldown::cooldown_remaining() {
+                let wait = remaining + Duration::from_secs(1);
+                log::info!(
+                    "[MARKET_CACHE] Lighter WAF cooldown active, deferring market metadata fetch for {}s",
+                    wait.as_secs()
+                );
+                sleep(wait).await;
+                continue;
+            }
+
             attempt += 1;
             match self.refresh_market_cache().await {
                 Ok(_) => {
