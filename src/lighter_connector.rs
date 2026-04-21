@@ -1060,7 +1060,11 @@ impl LighterConnector {
             return Ok(());
         }
 
-        const MAX_ATTEMPTS: u32 = 5;
+        // 10 attempts with exp backoff capped at 60s gives ~8 minutes total
+        // wait window. A 5-attempt / 31s cap was shorter than Lighter WAF
+        // cooldowns (can exceed 60s), so startup panicked into a systemd
+        // crash loop. See bot-strategy#85 priority-2.
+        const MAX_ATTEMPTS: u32 = 10;
         let mut attempt: u32 = 0;
         let mut backoff = Duration::from_secs(1);
 
@@ -1199,6 +1203,18 @@ impl LighterConnector {
                     }
                 }
 
+                // Go SDK CheckClient translates *any* error from
+                // /api/v1/apikeys into "key not registered". Under WAF/429
+                // pressure the endpoint legitimately returns 429 → classify
+                // as transient RateLimited instead of permanent auth failure
+                // so callers do not drop into the re-registration path.
+                // See bot-strategy#85 priority-2.
+                if error_msg.contains("Too Many Requests")
+                    || error_msg.contains("\"code\":23000")
+                {
+                    let until = Utc::now().timestamp() + 30;
+                    return Err(DexError::RateLimited { until_unix: until });
+                }
                 // If we have the EVM wallet key, try to update the API key
                 #[cfg(feature = "lighter-sdk")]
                 if self.evm_wallet_private_key.is_some() {
