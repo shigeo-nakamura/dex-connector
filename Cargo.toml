@@ -14,7 +14,7 @@ members = [".", "crates/lighter-ratelimit"]
 
 [features]
 default = ["lighter-sdk"]
-lighter-sdk = ["dep:libc"]
+lighter-sdk = ["dep:libc", "dep:lighter-ratelimit"]
 extended-sdk = ["dep:rust-crypto-lib-base", "dep:starknet"]
 
 [dependencies]
@@ -55,10 +55,11 @@ rand = "0.8"
 parking_lot = "0.12"
 env_logger = "0.10"
 
-# Split-out sub-crate (bot-strategy#118). Keeps the old public
-# `dex_connector::lighter_ratelimit::*` path working via re-export while the
-# sidecar binary can be built standalone with a tiny dep graph.
-lighter-ratelimit = { path = "crates/lighter-ratelimit" }
+# Split-out sub-crate (bot-strategy#118). Used only from `lighter_connector`
+# so it can be optional and carried by the lighter-sdk feature — this drops
+# it entirely from extended-sdk-only builds (bot-strategy#123). The sidecar
+# binary keeps building standalone from the workspace member.
+lighter-ratelimit = { path = "crates/lighter-ratelimit", optional = true }
 
 # Cryptographic dependencies for Schnorr+Poseidon2
 curve25519-dalek = { version = "4.1", features = ["rand_core"] }

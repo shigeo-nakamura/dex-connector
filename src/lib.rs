@@ -14,7 +14,9 @@ pub mod lighter_connector;
 // The rate limiter was split into its own crate (bot-strategy#118) so the
 // sidecar daemon can build without dragging in ethers/reqwest/libsigner.
 // Re-export so consumers using `dex_connector::lighter_ratelimit::…` keep
-// compiling unchanged.
+// compiling unchanged. Gated behind lighter-sdk so extended-sdk-only builds
+// don't drag in the crate at all (bot-strategy#123).
+#[cfg(feature = "lighter-sdk")]
 pub mod lighter_ratelimit {
     pub use ::lighter_ratelimit::*;
 }
