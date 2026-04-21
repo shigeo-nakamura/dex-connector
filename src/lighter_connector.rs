@@ -2296,7 +2296,11 @@ impl LighterConnector {
             )));
         }
 
-        // Probe each account's apikeys to find the one with our api_key_index
+        // Probe each account's apikeys to find the one with our api_key_index.
+        // Track whether any probe returned a transient error (429 / code 23000)
+        // so we can distinguish \"key legitimately not here\" from \"Lighter was
+        // rate-limiting us and the answer is meaningless\". See bot-strategy#120.
+        let mut saw_transient = false;
         for account in &account_resp.accounts {
             let acct_idx = account.account_index as u64;
             let probe_url = format!(
@@ -2311,20 +2315,42 @@ impl LighterConnector {
                 .send()
                 .await;
 
-            if let Ok(resp) = probe_resp {
-                if let Ok(text) = resp.text().await {
-                    if let Ok(apikey_resp) = serde_json::from_str::<ApiKeyResponse>(&text) {
-                        if apikey_resp.code == 200 && !apikey_resp.api_keys.is_empty() {
-                            log::info!(
-                                "Discovered account_index={} for api_key_index={}",
-                                acct_idx,
-                                self.api_key_index
-                            );
-                            return Ok(acct_idx);
+            match probe_resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.as_u16() == 429 {
+                        saw_transient = true;
+                        continue;
+                    }
+                    if let Ok(text) = resp.text().await {
+                        if text.contains("\"code\":23000") || text.contains("Too Many Requests") {
+                            saw_transient = true;
+                            continue;
+                        }
+                        if let Ok(apikey_resp) = serde_json::from_str::<ApiKeyResponse>(&text) {
+                            if apikey_resp.code == 200 && !apikey_resp.api_keys.is_empty() {
+                                log::info!(
+                                    "Discovered account_index={} for api_key_index={}",
+                                    acct_idx,
+                                    self.api_key_index
+                                );
+                                return Ok(acct_idx);
+                            }
                         }
                     }
                 }
+                Err(_) => {
+                    // Network / connection errors during a WAF episode are
+                    // indistinguishable from a transient rate-limit from the
+                    // caller's point of view; fold them into the same bucket.
+                    saw_transient = true;
+                }
             }
+        }
+
+        if saw_transient {
+            let until = Utc::now().timestamp() + 30;
+            return Err(DexError::RateLimited { until_unix: until });
         }
 
         Err(DexError::Other(format!(
