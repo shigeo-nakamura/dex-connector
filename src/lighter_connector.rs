@@ -290,6 +290,16 @@ static API_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static API_CALL_TRACKER: std::sync::LazyLock<Mutex<Vec<(Instant, String)>>> =
     std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// Process-wide market metadata cache shared across all LighterConnector
+/// instances on the same host. Market metadata (`orderBookDetails`,
+/// `funding-rates`) is identical across credentials on the same base_url,
+/// so multi-instance pairtrade only needs to fetch it ONCE per process
+/// instead of N times (one per sub-account). See bot-strategy#135.
+static MARKET_CACHE: std::sync::LazyLock<Arc<RwLock<MarketCache>>> =
+    std::sync::LazyLock::new(|| Arc::new(RwLock::new(MarketCache::default())));
+static MARKET_CACHE_INIT_LOCK: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
 /// Track and log API calls for rate limit monitoring
 fn track_api_call(endpoint: &str, method: &str) {
     let call_count = API_CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1536,8 +1546,8 @@ impl LighterConnector {
             balance_cache: Arc::new(RwLock::new(None)),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
-            market_cache: Arc::new(RwLock::new(MarketCache::default())),
-            market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
+            market_cache: Arc::clone(&MARKET_CACHE),
+            market_cache_init_lock: Arc::clone(&MARKET_CACHE_INIT_LOCK),
             tracked_symbols: config.tracked_symbols,
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
@@ -1595,8 +1605,8 @@ impl LighterConnector {
             positions_ready: Arc::new(AtomicBool::new(false)),
             balance_cache: Arc::new(RwLock::new(None)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
-            market_cache: Arc::new(RwLock::new(MarketCache::default())),
-            market_cache_init_lock: Arc::new(tokio::sync::Mutex::new(())),
+            market_cache: Arc::clone(&MARKET_CACHE),
+            market_cache_init_lock: Arc::clone(&MARKET_CACHE_INIT_LOCK),
             tracked_symbols: config.tracked_symbols,
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
