@@ -708,39 +708,70 @@ impl ExtendedConnector {
     }
 
     async fn get_market(&self, symbol: &str) -> Result<MarketModel, DexError> {
+        // Callers across the project use bare token symbols (e.g. "BTC",
+        // "ETH") while Extended's market names carry the collateral suffix
+        // ("BTC-USD", "ETH-USD"). If the bare form misses, retry with
+        // "-USD" appended so pairtrade's universe_pairs keep working
+        // against Extended without a per-DEX translation layer.
+        let candidates: Vec<String> = if symbol.contains('-') {
+            vec![symbol.to_string()]
+        } else {
+            vec![symbol.to_string(), format!("{}-USD", symbol)]
+        };
+
         {
             let cache = self.market_cache.read().await;
-            if let Some(market) = cache.get(symbol) {
-                return Ok(market.clone());
+            for cand in &candidates {
+                if let Some(market) = cache.get(cand) {
+                    return Ok(market.clone());
+                }
             }
         }
 
-        let path = build_query(
-            "/info/markets",
-            vec![("market".to_string(), symbol.to_string())],
-        );
-        let markets: Vec<MarketModel> = self.api.get(path, true).await?;
-        let market = markets
-            .into_iter()
-            .find(|m| m.name == symbol)
-            .ok_or_else(|| DexError::Other(format!("Market not found: {}", symbol)))?;
-        {
-            let mut logged = self.market_logged.lock().await;
-            if logged.insert(symbol.to_string()) {
-                let tc = &market.trading_config;
-                log::info!(
-                    "[MARKET] {} tick={} floor={} cap={}",
-                    symbol,
-                    tc.min_price_change,
-                    tc.limit_price_floor,
-                    tc.limit_price_cap
-                );
+        let mut last_err: Option<DexError> = None;
+        for cand in &candidates {
+            let path = build_query(
+                "/info/markets",
+                vec![("market".to_string(), cand.clone())],
+            );
+            let markets: Result<Vec<MarketModel>, DexError> = self.api.get(path, true).await;
+            let markets = match markets {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let Some(market) = markets.into_iter().find(|m| m.name == *cand) else {
+                continue;
+            };
+            {
+                let mut logged = self.market_logged.lock().await;
+                if logged.insert(symbol.to_string()) {
+                    let tc = &market.trading_config;
+                    log::info!(
+                        "[MARKET] {} (resolved as {}) tick={} floor={} cap={}",
+                        symbol,
+                        cand,
+                        tc.min_price_change,
+                        tc.limit_price_floor,
+                        tc.limit_price_cap
+                    );
+                }
             }
+            let mut cache = self.market_cache.write().await;
+            // Cache under both the caller's symbol and the resolved market
+            // name so subsequent lookups with either form hit the cache.
+            cache.insert(symbol.to_string(), market.clone());
+            if cand != symbol {
+                cache.insert(cand.clone(), market.clone());
+            }
+            return Ok(market);
         }
 
-        let mut cache = self.market_cache.write().await;
-        cache.insert(symbol.to_string(), market.clone());
-        Ok(market)
+        Err(last_err.unwrap_or_else(|| {
+            DexError::Other(format!("Market not found: {}", symbol))
+        }))
     }
 
     #[allow(dead_code)]
