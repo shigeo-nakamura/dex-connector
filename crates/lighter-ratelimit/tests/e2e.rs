@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use dex_connector::lighter_ratelimit::{
+use lighter_ratelimit::{
     bucket::{BucketConfig, TokenBucket},
     client::RateLimitClient,
     protocol::{AcquirePolicy, AcquireRequest, AcquireResponse},

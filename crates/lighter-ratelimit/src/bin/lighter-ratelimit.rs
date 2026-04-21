@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use dex_connector::lighter_ratelimit::{
+use lighter_ratelimit::{
     bucket::{sleep_ms, BucketConfig, TokenBucket},
     client::DEFAULT_SOCKET_PATH,
     protocol::{AcquirePolicy, AcquireRequest, AcquireResponse},

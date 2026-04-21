@@ -1,0 +1,17 @@
+[package]
+name = "lighter-ratelimit"
+version = "0.1.0"
+edition = "2021"
+description = "Host-shared weight-based rate limiter for Lighter REST. Library + sidecar daemon."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+serde = { version = "1.0.175", features = ["derive"] }
+serde_json = "1.0.103"
+log = "0.4.19"
+env_logger = "0.10"
+
+[[bin]]
+name = "lighter-ratelimit"
+path = "src/bin/lighter-ratelimit.rs"

@@ -7,15 +7,15 @@
 //! detection, #52 429 cooldown) handle the aftermath but cannot prevent the
 //! initial burst.
 //!
-//! This module provides the two halves of the proactive fix:
+//! This crate provides:
 //!   - `bucket` — the token bucket algorithm (capacity, refill, try_acquire).
 //!   - `client` — UDS client with an in-process fallback.
 //!   - `protocol` — wire types between client and sidecar daemon.
 //!   - `weights` — Lighter endpoint weight table (#7).
 //!
-//! The sidecar daemon itself lives at `src/bin/lighter-ratelimit.rs` and
-//! consumes the same types from this module. Single source of truth for
-//! policy, capacity, and protocol versioning.
+//! The sidecar daemon is the `lighter-ratelimit` binary in this crate and
+//! consumes the same types. Single source of truth for policy, capacity, and
+//! protocol versioning.
 
 pub mod bucket;
 pub mod client;

@@ -78,7 +78,7 @@ jobs:
               fi; \
               export PATH=/workspace/.cache/cargo/bin:\$PATH; \
               rustc -V; cargo -V; \
-              cargo build --release --bin lighter-ratelimit --no-default-features; \
+              cargo build --release -p lighter-ratelimit --bin lighter-ratelimit; \
               chown -R \${HOST_UID}:\${HOST_GID} /workspace/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cache permissions

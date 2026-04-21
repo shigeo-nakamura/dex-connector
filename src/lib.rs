@@ -11,9 +11,13 @@ mod extended_connector;
 mod hyperliquid_connector;
 #[cfg(feature = "lighter-sdk")]
 pub mod lighter_connector;
-// The rate limiter has no dependency on libsigner/Go SDK and is also used by
-// the standalone daemon binary, so keep it available regardless of feature.
-pub mod lighter_ratelimit;
+// The rate limiter was split into its own crate (bot-strategy#118) so the
+// sidecar daemon can build without dragging in ethers/reqwest/libsigner.
+// Re-export so consumers using `dex_connector::lighter_ratelimit::…` keep
+// compiling unchanged.
+pub mod lighter_ratelimit {
+    pub use ::lighter_ratelimit::*;
+}
 #[cfg(feature = "lighter-sdk")]
 pub mod lighter_waf_cooldown;
 
