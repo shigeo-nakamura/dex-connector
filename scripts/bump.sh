@@ -64,11 +64,21 @@ require_clean() {
         fi
     done
 }
+require_clean "$DEX_DIR" Cargo.toml
 require_clean "$PAIR_DIR" .github/workflows/ci.yml Cargo.lock
 require_clean "$MM_DIR" .github/workflows/ci.yml Cargo.lock
 
-echo "== dex-connector: tagging $TAG on HEAD =="
+echo "== dex-connector: bumping Cargo.toml version + tagging $TAG =="
 cd "$DEX_DIR"
+# Strip leading 'v' for the Cargo.toml version string.
+VERSION="${TAG#v}"
+if ! grep -qE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml; then
+    echo "Could not find top-level version line in $DEX_DIR/Cargo.toml"
+    exit 1
+fi
+sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/s||version = \"$VERSION\"|" Cargo.toml
+git add Cargo.toml
+git commit -m "Bump dex-connector to $TAG"
 git tag "$TAG" -m "$TAG"
 
 bump_downstream() {
