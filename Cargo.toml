@@ -79,6 +79,11 @@ name = "extended-spike"
 path = "src/bin/extended-spike.rs"
 required-features = ["extended-sdk"]
 
+[[bin]]
+name = "extended-rtt"
+path = "src/bin/extended-rtt.rs"
+required-features = ["extended-sdk"]
+
 [dev-dependencies]
 rusoto_core = "0.48"
 rusoto_kms = "0.48"
