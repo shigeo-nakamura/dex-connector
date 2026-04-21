@@ -354,7 +354,10 @@ struct OpenOrderModel {
     side: String,
     status: String,
     status_reason: Option<String>,
-    price: Decimal,
+    // TPSL standalone orders have no main `price` field in the response
+    // (price=0 is sent on the wire but the server omits it). Accept either.
+    #[serde(default)]
+    price: Option<Decimal>,
     average_price: Option<Decimal>,
     qty: Decimal,
     filled_qty: Option<Decimal>,
@@ -425,6 +428,21 @@ struct StarkDebuggingOrderAmountsModel {
     synthetic_amount: Decimal,
 }
 
+/// Take-profit / stop-loss leg attached to a parent order (or standalone
+/// TPSL order when the parent has `type=TPSL` and `tpSlType=ORDER`).
+/// See x10xchange/python_sdk → CreateOrderTpslTriggerModel.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TpslLegModel {
+    trigger_price: Decimal,
+    trigger_price_type: String, // "LAST" | "MARK" | "INDEX"
+    price: Decimal,             // execution price; for market-with-slippage this is slippage-adjusted
+    price_type: String,         // "LIMIT" | "MARKET"
+    settlement: StarkSettlementModel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debugging_amounts: Option<StarkDebuggingOrderAmountsModel>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NewOrderModel {
@@ -444,13 +462,16 @@ struct NewOrderModel {
     nonce: Decimal,
     #[serde(skip_serializing_if = "Option::is_none")]
     cancel_id: Option<String>,
-    settlement: StarkSettlementModel,
+    // TPSL standalone orders omit the main settlement (the SL/TP leg carries
+    // its own signature). Limit/Market orders always include it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settlement: Option<StarkSettlementModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tp_sl_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    take_profit: Option<serde_json::Value>,
+    take_profit: Option<TpslLegModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    stop_loss: Option<serde_json::Value>,
+    stop_loss: Option<TpslLegModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debugging_amounts: Option<StarkDebuggingOrderAmountsModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1705,7 +1726,7 @@ async fn stream_account(
                             OrderSide::Short
                         },
                         size: order.qty,
-                        price: order.price,
+                        price: order.price.unwrap_or(Decimal::ZERO),
                         status: order.status.clone(),
                     });
                 }
@@ -2072,7 +2093,7 @@ impl ExtendedConnector {
             self_trade_protection_level: "ACCOUNT".to_string(),
             nonce: Decimal::from(nonce),
             cancel_id: None,
-            settlement: settlement.settlement,
+            settlement: Some(settlement.settlement),
             tp_sl_type: None,
             take_profit: None,
             stop_loss: None,
@@ -2243,7 +2264,7 @@ impl DexConnector for ExtendedConnector {
                         OrderSide::Short
                     },
                     size: order.qty,
-                    price: order.price,
+                    price: order.price.unwrap_or(Decimal::ZERO),
                     status: order.status,
                 })
                 .collect::<Vec<_>>()
@@ -2508,22 +2529,170 @@ impl DexConnector for ExtendedConnector {
         .await
     }
 
+    /// Standalone TPSL (currently only Stop-Loss × MarketWithSlippageControl).
+    ///
+    /// Extended models a standalone SL as `type=TPSL` / `tpSlType=ORDER` with
+    /// the main leg carrying `price=0` and **no settlement**; the SL leg
+    /// carries its own Stark signature computed over (same side, size,
+    /// slippage-adjusted price).
+    ///
+    /// `side` is the **execution side** of the SL trigger (i.e. the close
+    /// trade direction): `Short` = SELL to close a long position, `Long` =
+    /// BUY to close a short position. The slippage adjustment always moves
+    /// the execution price against the trader for guaranteed fill.
+    ///
+    /// TP, Limit and Market-without-slippage variants return an error for
+    /// now. They can be added incrementally when a caller needs them.
     async fn create_advanced_trigger_order(
         &self,
-        _symbol: &str,
-        _size: Decimal,
-        _side: OrderSide,
-        _trigger_px: Decimal,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        trigger_px: Decimal,
         _limit_px: Option<Decimal>,
-        _order_style: TriggerOrderStyle,
-        _slippage_bps: Option<u32>,
-        _tpsl: TpSl,
-        _reduce_only: bool,
-        _expiry_secs: Option<u64>,
+        order_style: TriggerOrderStyle,
+        slippage_bps: Option<u32>,
+        tpsl: TpSl,
+        reduce_only: bool,
+        expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        Err(DexError::Other(
-            "Advanced trigger orders not supported for Extended".to_string(),
-        ))
+        if !matches!(tpsl, TpSl::Sl) {
+            return Err(DexError::Other(
+                "Extended trigger: only TpSl::Sl is implemented (TP not supported yet)".into(),
+            ));
+        }
+        if !matches!(order_style, TriggerOrderStyle::MarketWithSlippageControl) {
+            return Err(DexError::Other(format!(
+                "Extended trigger: only MarketWithSlippageControl is implemented; got {:?}",
+                order_style
+            )));
+        }
+        let slippage_bps = slippage_bps.ok_or_else(|| {
+            DexError::Other(
+                "Extended trigger: slippage_bps required for MarketWithSlippageControl".into(),
+            )
+        })?;
+        if !reduce_only {
+            return Err(DexError::Other(
+                "Extended TPSL orders must be reduce_only=true (Python SDK parity)".into(),
+            ));
+        }
+
+        let market = self.get_market(symbol).await?;
+        let rounded_size = Self::round_size_for_market(size, &market)?;
+
+        // Execution price = trigger ± slippage, always worse for the close side.
+        let slippage_factor = Decimal::new(slippage_bps as i64, 4);
+        let raw_leg_price = match side {
+            OrderSide::Long => trigger_px * (Decimal::ONE + slippage_factor),
+            OrderSide::Short => trigger_px * (Decimal::ONE - slippage_factor),
+        };
+        // Tick-only rounding (no floor/cap clamp): trigger orders must be able
+        // to sit well outside the current index band. `round_price_for_market`
+        // would clamp an SL execution price back *into* the current band and
+        // the resulting StarkEx signature then covers a different price than
+        // the API receives, producing "Invalid StarkEx signature" (1101) on
+        // the server.
+        let tick = market.trading_config.min_price_change;
+        let leg_rounding = match side {
+            OrderSide::Long => RoundingStrategy::ToPositiveInfinity, // worse for buyer = higher
+            OrderSide::Short => RoundingStrategy::ToNegativeInfinity, // worse for seller = lower
+        };
+        let leg_price = Self::round_to_step(raw_leg_price, tick, leg_rounding);
+        let trigger_px_rounded =
+            Self::round_to_step(trigger_px, tick, RoundingStrategy::MidpointAwayFromZero);
+        if leg_price <= Decimal::ZERO || trigger_px_rounded <= Decimal::ZERO {
+            return Err(DexError::Other(format!(
+                "Non-positive rounded price (trigger={} leg={}) for {}",
+                trigger_px_rounded, leg_price, market.name
+            )));
+        }
+
+        // SL safety net usually outlives entry trades by minutes/hours at
+        // least. Default 28d matches slow-mm's convention.
+        let expire_time = match expiry_secs {
+            Some(secs) => Utc::now() + Duration::seconds(secs as i64),
+            None => Utc::now() + Duration::days(28),
+        };
+        let nonce = rand::random::<u32>() as u64;
+        let side_str = match side {
+            OrderSide::Long => "BUY",
+            OrderSide::Short => "SELL",
+        };
+
+        // Main order id is the Poseidon hash of (same side, size, price=0),
+        // following the Python SDK. Price is 0 because the main leg of a
+        // TPSL order is not an economic transaction — the leg is.
+        let main_settlement = self.compute_settlement(
+            &market,
+            side_str,
+            rounded_size,
+            Decimal::ZERO,
+            expire_time,
+            nonce,
+        )?;
+        let order_id = main_settlement.order_hash.to_string();
+
+        // SL leg settlement: signs the *execution* price. Python SDK reuses
+        // the same nonce and expire_time across main and leg via a shared
+        // SettlementDataCtx; do the same here to match server expectations.
+        let leg_settlement = self.compute_settlement(
+            &market,
+            side_str,
+            rounded_size,
+            leg_price,
+            expire_time,
+            nonce,
+        )?;
+
+        let stop_loss_leg = TpslLegModel {
+            trigger_price: trigger_px_rounded,
+            trigger_price_type: "LAST".to_string(),
+            price: leg_price,
+            price_type: "LIMIT".to_string(), // slippage-adjusted limit
+            settlement: leg_settlement.settlement,
+            debugging_amounts: Some(leg_settlement.debugging_amounts),
+        };
+
+        let order = NewOrderModel {
+            id: order_id.clone(),
+            market: market.name.clone(),
+            order_type: "TPSL".to_string(),
+            side: side_str.to_string(),
+            qty: rounded_size,
+            price: Decimal::ZERO,
+            reduce_only: true,
+            post_only: false,
+            time_in_force: "GTT".to_string(),
+            expiry_epoch_millis: Self::to_epoch_millis(expire_time),
+            fee: main_settlement.fee_rate,
+            self_trade_protection_level: "ACCOUNT".to_string(),
+            nonce: Decimal::from(nonce),
+            cancel_id: None,
+            settlement: None,
+            tp_sl_type: Some("ORDER".to_string()),
+            take_profit: None,
+            stop_loss: Some(stop_loss_leg),
+            debugging_amounts: None,
+            builder_fee: None,
+            builder_id: None,
+        };
+
+        log::info!(
+            "[trigger_order][extended] sym={} side={} trigger={} leg_price={} size={} slippage_bps={}",
+            market.name, side_str, trigger_px_rounded, leg_price, rounded_size, slippage_bps
+        );
+
+        let response: PlacedOrderModel =
+            self.api.post("/user/order".to_string(), order, true).await?;
+
+        Ok(CreateOrderResponse {
+            order_id: response.external_id,
+            exchange_order_id: Some(response.id.to_string()),
+            ordered_price: leg_price,
+            ordered_size: rounded_size,
+            client_order_id: None,
+        })
     }
 
     async fn cancel_order(&self, _symbol: &str, order_id: &str) -> Result<(), DexError> {
@@ -2692,7 +2861,7 @@ impl DexConnector for ExtendedConnector {
                 self_trade_protection_level: "ACCOUNT".to_string(),
                 nonce: Decimal::from(nonce),
                 cancel_id: None,
-                settlement: settlement.settlement,
+                settlement: Some(settlement.settlement),
                 tp_sl_type: None,
                 take_profit: None,
                 stop_loss: None,
