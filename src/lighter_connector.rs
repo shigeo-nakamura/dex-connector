@@ -3146,8 +3146,12 @@ impl DexConnector for LighterConnector {
         let canonical_symbol = market_info.canonical_symbol.clone();
         let min_order = market_info.min_order.clone();
 
-        // Get statistics data from cache (REST fetched at most once per 60s)
-        let stats_data = self.get_exchange_stats_cached().await.ok();
+        // exchangeStats is dead data — populates TickerResponse.volume /
+        // num_trades which no downstream consumer (pairtrade, slow-mm) reads.
+        // Skipping the REST removes one mainnet GET per get_ticker miss and
+        // cuts a chunk of the periodic 429 trigger. See bot-strategy#128
+        // follow-up.
+        let stats_data: Option<LighterExchangeStats> = None;
         let funding_data = self.get_funding_rates_cached().await.ok();
 
         // Try to get price from WebSocket first, but check if it's recent
@@ -4831,8 +4835,13 @@ impl LighterConnector {
 
 impl LighterConnector {
     /// TTL for cached exchange stats / funding rates (60 seconds)
-    const STATS_CACHE_TTL_SECS: u64 = 60;
+    // Funding rates are paid every 8h on Lighter and the entry gate uses a
+    // very loose threshold (-0.01/hour in prod), so 60s freshness is wasted
+    // REST pressure. 1h TTL keeps the data "fresh enough" while cutting the
+    // periodic /funding-rates fetch 60x. See bot-strategy#128 follow-up.
+    const STATS_CACHE_TTL_SECS: u64 = 3600;
 
+    #[allow(dead_code)]
     async fn get_exchange_stats_cached(&self) -> Result<LighterExchangeStats, DexError> {
         {
             let cache = self.cached_exchange_stats.read().await;
@@ -4867,6 +4876,7 @@ impl LighterConnector {
         Ok(rates)
     }
 
+    #[allow(dead_code)]
     async fn get_exchange_stats(&self) -> Result<LighterExchangeStats, DexError> {
         let url = format!("{}/api/v1/exchangeStats", self.base_url);
         let response_text = self
