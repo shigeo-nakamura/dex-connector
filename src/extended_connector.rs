@@ -2011,9 +2011,14 @@ impl ExtendedConnector {
         &self,
         symbol: &str,
     ) -> Result<Vec<FilledOrder>, DexError> {
+        // Extended REST rejects bare tokens ("BTC") with {"code":1001,
+        // "message":"Market not found"} — `?market=` expects the
+        // collateral-qualified market name ("BTC-USD"). Callers across
+        // pairtrade use bare tokens.
+        let market_name = self.get_market(symbol).await?.name;
         let path = build_query(
             "/user/trades",
-            vec![("market".to_string(), symbol.to_string())],
+            vec![("market".to_string(), market_name.clone())],
         );
         let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
         let mut needs_history = false;
@@ -2029,7 +2034,7 @@ impl ExtendedConnector {
         if needs_history {
             let history_path = build_query(
                 "/user/orders/history",
-                vec![("market".to_string(), symbol.to_string())],
+                vec![("market".to_string(), market_name.clone())],
             );
             let orders_history: Vec<OpenOrderModel> = self.api.get(history_path, true).await?;
             let mut map = self.order_id_map.write().await;
@@ -2257,8 +2262,9 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), DexError> {
+        let market_name = self.get_market(symbol).await?.name;
         let payload = json!({
-            "market": symbol,
+            "market": market_name,
             "leverage": leverage,
         });
         let _response: EmptyResponse = self
@@ -2328,9 +2334,10 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn get_canceled_orders(&self, symbol: &str) -> Result<CanceledOrdersResponse, DexError> {
+        let market_name = self.get_market(symbol).await?.name;
         let path = build_query(
             "/user/orders/history",
-            vec![("market".to_string(), symbol.to_string())],
+            vec![("market".to_string(), market_name)],
         );
         let orders_history: Vec<OpenOrderModel> = self.api.get(path, true).await?;
         let orders = orders_history
@@ -2352,9 +2359,10 @@ impl DexConnector for ExtendedConnector {
             let cache = self.open_orders_cache.read().await;
             cache.get(symbol).cloned().unwrap_or_else(|| Vec::new())
         } else {
+            let market_name = self.get_market(symbol).await?.name;
             let path = build_query(
                 "/user/orders",
-                vec![("market".to_string(), symbol.to_string())],
+                vec![("market".to_string(), market_name)],
             );
             let open_orders: Vec<OpenOrderModel> = self.api.get(path, true).await?;
             {
@@ -2497,9 +2505,10 @@ impl DexConnector for ExtendedConnector {
             })?;
             Ok(LastTradesResponse { trades })
         } else {
+            let market_name = self.get_market(symbol).await?.name;
             let path = build_query(
                 "/user/trades",
-                vec![("market".to_string(), symbol.to_string())],
+                vec![("market".to_string(), market_name)],
             );
             let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
             let last_trades = trades
