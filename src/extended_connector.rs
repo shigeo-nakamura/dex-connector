@@ -1538,6 +1538,27 @@ async fn stream_orderbooks(
     result
 }
 
+async fn fallback_price(
+    last_trades: &Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
+    symbol: &str,
+    market: &MarketModel,
+) -> Result<Decimal, DexError> {
+    // Last resort when we cannot read either a live WS book or a REST book:
+    // use the latest cached trade if we have one, else the startup-time
+    // `last_price` from /info/markets. Both are stale in different ways but
+    // beat failing the call outright — callers always expect a number.
+    let trades = last_trades.read().await;
+    if let Some(items) = trades.get(symbol).and_then(|v| v.last()) {
+        Ok(items.price)
+    } else if market.market_stats.last_price > Decimal::ZERO {
+        Ok(market.market_stats.last_price)
+    } else {
+        Err(DexError::Other(
+            "ticker unavailable: no orderbook, trade cache, or market stats".to_string(),
+        ))
+    }
+}
+
 async fn stream_trades(
     url: &str,
     symbol: &str,
@@ -2188,35 +2209,23 @@ impl DexConnector for ExtendedConnector {
         _test_price: Option<Decimal>,
     ) -> Result<TickerResponse, DexError> {
         let market = self.get_market(symbol).await?;
-        let price = if self.websocket_url.is_some() {
-            // Prefer the orderbook midpoint (fresh within ORDERBOOK_STALE_AFTER)
-            // over the public-trade cache. Thin Extended markets can go minutes
-            // between trades, which would otherwise freeze `price` even while
-            // the book keeps moving — see bot-strategy#134.
-            let book_mid = self.get_cached_order_book(symbol, 1).await.and_then(|s| {
-                let bid = s.bids.first().map(|v| v.price);
-                let ask = s.asks.first().map(|v| v.price);
+        // Prefer a fresh orderbook midpoint — the trade cache is sparse on
+        // thin Extended markets and `market.market_stats.last_price` is only
+        // populated once at startup (market_cache is never refreshed). See
+        // bot-strategy#134. We reach for `get_order_book` so both the
+        // WS-cache path and the REST fallback get exercised automatically.
+        let price = match self.get_order_book(symbol, 1).await {
+            Ok(snapshot) => {
+                let bid = snapshot.bids.first().map(|v| v.price);
+                let ask = snapshot.asks.first().map(|v| v.price);
                 match (bid, ask) {
-                    (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::new(2, 0)),
-                    (Some(bid), None) => Some(bid),
-                    (None, Some(ask)) => Some(ask),
-                    _ => None,
-                }
-            });
-            if let Some(mid) = book_mid {
-                mid
-            } else {
-                let trades = self.last_trades.read().await;
-                if let Some(items) = trades.get(symbol).and_then(|v| v.last()) {
-                    items.price
-                } else {
-                    return Err(DexError::Other(
-                        "ticker unavailable: waiting for websocket data".to_string(),
-                    ));
+                    (Some(b), Some(a)) => (b + a) / Decimal::new(2, 0),
+                    (Some(b), None) => b,
+                    (None, Some(a)) => a,
+                    _ => fallback_price(&self.last_trades, symbol, &market).await?,
                 }
             }
-        } else {
-            market.market_stats.last_price
+            Err(_) => fallback_price(&self.last_trades, symbol, &market).await?,
         };
         Ok(TickerResponse {
             symbol: market.name.clone(),
