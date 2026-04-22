@@ -300,6 +300,19 @@ static MARKET_CACHE: std::sync::LazyLock<Arc<RwLock<MarketCache>>> =
 static MARKET_CACHE_INIT_LOCK: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
+/// Process-wide caches for the get_ticker helper endpoints. Same reasoning
+/// as MARKET_CACHE: the data is a global exchange state (not per-account),
+/// so all LighterConnector instances in the process should share one copy.
+/// Without this, each instance's first get_ticker call misses its own
+/// cache and fires a REST, producing an N-way burst at startup. See
+/// bot-strategy#135 follow-up.
+static CACHED_EXCHANGE_STATS: std::sync::LazyLock<
+    Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
+> = std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
+static CACHED_FUNDING_RATES: std::sync::LazyLock<
+    Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
+> = std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
+
 /// Track and log API calls for rate limit monitoring
 fn track_api_call(endpoint: &str, method: &str) {
     let call_count = API_CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1552,8 +1565,8 @@ impl LighterConnector {
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
-            cached_exchange_stats: Arc::new(RwLock::new(None)),
-            cached_funding_rates: Arc::new(RwLock::new(None)),
+            cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
+            cached_funding_rates: Arc::clone(&CACHED_FUNDING_RATES),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
@@ -1611,8 +1624,8 @@ impl LighterConnector {
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
-            cached_exchange_stats: Arc::new(RwLock::new(None)),
-            cached_funding_rates: Arc::new(RwLock::new(None)),
+            cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
+            cached_funding_rates: Arc::clone(&CACHED_FUNDING_RATES),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
