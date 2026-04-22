@@ -376,6 +376,10 @@ pub struct LighterConnector {
     // Auto-cleanup management
     cleanup_started: Arc<AtomicBool>,
     cleanup_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    // Background refresher for the Lighter status-page maintenance feed
+    // (see bot-strategy#160). One spawn per connector instance; the loop
+    // exits when `is_running` flips false.
+    maintenance_refresher_started: Arc<AtomicBool>,
     _ws: Option<DexWebSocket>, // Reserved for future WebSocket implementation
     // WebSocket data storage
     current_price: Arc<RwLock<HashMap<String, (Decimal, u64)>>>, // symbol -> (price, timestamp)
@@ -833,10 +837,12 @@ impl LighterConnector {
             .collect()
     }
 
-    async fn fetch_next_maintenance_window(&self) -> Result<Option<DateTime<Utc>>, DexError> {
+    async fn fetch_next_maintenance_window_with(
+        client: &Client,
+    ) -> Result<Option<DateTime<Utc>>, DexError> {
         let url = LIGHTER_STATUS_FEED_URL;
 
-        let response = self.client.get(url).send().await.map_err(|e| {
+        let response = client.get(url).send().await.map_err(|e| {
             DexError::Other(format!("Failed to fetch Lighter status feed: {}", e))
         })?;
 
@@ -1446,6 +1452,109 @@ impl LighterConnector {
         });
     }
 
+    /// Start the background refresher for the Lighter status-page maintenance
+    /// feed. The previous design awaited `fetch_next_maintenance_window`
+    /// inline from `is_upcoming_maintenance` (which is on the strategy's hot
+    /// `step()` path), so a slow status.lighter.xyz response — that endpoint
+    /// is a single-IP backend with no Anycast/CDN failover — could blow the
+    /// 7.5s STEP_OVERRUN budget or, with default `connect_timeout(5s)`, leak
+    /// a WARN line. Move the fetch off the hot path entirely. See
+    /// bot-strategy#160.
+    pub fn start_maintenance_refresher(&self) {
+        // Operator kill-switch: if maintenance handling is disabled, never
+        // spawn the task. `is_upcoming_maintenance` returns false when the
+        // cache is empty, which matches the disabled semantics.
+        if matches!(
+            std::env::var("LIGHTER_MAINTENANCE_DISABLED").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) {
+            log::info!(
+                "[MAINTENANCE] LIGHTER_MAINTENANCE_DISABLED set, skipping refresher spawn"
+            );
+            return;
+        }
+
+        if self.maintenance_refresher_started.swap(true, Ordering::SeqCst) {
+            log::debug!("[MAINTENANCE] refresher already started; ignoring.");
+            return;
+        }
+
+        // Dedicated client with tight timeouts. status.lighter.xyz is a
+        // third-party CDN we don't control, so cap the worst-case stall at
+        // a few seconds rather than the trading-client's 15s budget. Connect
+        // timeout is the long pole — `error trying to connect: operation
+        // timed out` was the failure mode observed on 2026-04-22 17:23.
+        let client = match Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "[MAINTENANCE] failed to build refresher HTTP client: {} — refresher disabled",
+                    e
+                );
+                self.maintenance_refresher_started
+                    .store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        let maintenance = Arc::clone(&self.maintenance);
+        let is_running = Arc::clone(&self.is_running);
+
+        tokio::spawn(async move {
+            log::info!("[MAINTENANCE] background refresher started");
+            // Small jitter (0-30s) on first iteration so co-located bots
+            // don't all hit the status page CDN at the exact same instant
+            // post-restart. Per-iteration sleep handles the steady-state
+            // staggering implicitly via wall-clock drift.
+            let initial_jitter = Duration::from_secs(rand::random::<u64>() % 31);
+            tokio::time::sleep(initial_jitter).await;
+
+            while is_running.load(Ordering::Relaxed) {
+                let ttl_mins = maintenance_ttl_mins();
+                let backoff_mins = match Self::fetch_next_maintenance_window_with(&client).await {
+                    Ok(next_start) => {
+                        let now = Utc::now();
+                        let mut info = maintenance.write().await;
+                        info.next_start = next_start;
+                        info.last_checked = Some(now);
+                        ttl_mins
+                    }
+                    Err(err) => {
+                        let err_str = format!("{:?}", err);
+                        let backoff = if err_str.contains("429") {
+                            ttl_mins.max(MAINTENANCE_BACKOFF_429_MINS)
+                        } else {
+                            MAINTENANCE_BACKOFF_OTHER_MINS
+                        };
+                        log::warn!(
+                            "[MAINTENANCE] refresh failed (backing off {}min): {:?}",
+                            backoff,
+                            err
+                        );
+                        backoff
+                    }
+                };
+
+                let sleep_secs =
+                    (backoff_mins.max(1) as u64).saturating_mul(60);
+                let mut remaining = sleep_secs;
+                // Wake every 5s so a stop() flipping `is_running` doesn't
+                // wait the full TTL before the task exits.
+                while remaining > 0 && is_running.load(Ordering::Relaxed) {
+                    let chunk = remaining.min(5);
+                    tokio::time::sleep(Duration::from_secs(chunk)).await;
+                    remaining = remaining.saturating_sub(chunk);
+                }
+            }
+
+            log::info!("[MAINTENANCE] background refresher exited");
+        });
+    }
+
     /// Initialize Go client (disabled when lighter-sdk feature is not enabled)
     #[cfg(not(feature = "lighter-sdk"))]
     async fn create_go_client(&self) -> Result<(), DexError> {
@@ -1590,6 +1699,7 @@ impl LighterConnector {
             is_running: Arc::new(AtomicBool::new(false)),
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            maintenance_refresher_started: Arc::new(AtomicBool::new(false)),
             _ws: Some(DexWebSocket::new(config.websocket_url)),
             current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
@@ -1652,6 +1762,7 @@ impl LighterConnector {
             is_running: Arc::new(AtomicBool::new(false)),
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            maintenance_refresher_started: Arc::new(AtomicBool::new(false)),
             _ws: Some(DexWebSocket::new(config.websocket_url)),
             current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
@@ -3173,6 +3284,11 @@ impl DexConnector for LighterConnector {
         self.start_auto_cleanup(6);
         log::info!("🗑️ [AUTO_CLEANUP] Started background cleanup task (every 6 hours)");
 
+        // Start the maintenance feed refresher off the strategy hot path
+        // so a slow status.lighter.xyz response can never blow STEP_OVERRUN
+        // (bot-strategy#160).
+        self.start_maintenance_refresher();
+
         Ok(())
     }
 
@@ -4664,107 +4780,36 @@ impl DexConnector for LighterConnector {
 
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
         // Operator kill-switch. When `LIGHTER_MAINTENANCE_DISABLED=1` is set,
-        // skip the announcements fetch entirely and never report an upcoming
-        // maintenance window. Use this when Lighter's announcements endpoint
-        // is rejecting our requests (HTTP 405/429) and we want to fall back to
-        // out-of-band maintenance handling. See bot-strategy#32.
+        // never report an upcoming maintenance window. The background
+        // refresher (see `start_maintenance_refresher`) honors the same env
+        // var and skips spawning, so the cache stays empty and this branch
+        // is the only thing producing a result. See bot-strategy#32.
         if matches!(
             std::env::var("LIGHTER_MAINTENANCE_DISABLED").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
         ) {
             return false;
         }
-        // The actual TTL is read fresh on every call so the operator can
-        // change `LIGHTER_MAINTENANCE_TTL_MINS` and have it take effect on
-        // the next cycle without restarting the process. The cost of one
-        // env::var read per (~hourly) call is negligible.
+
+        // Pure cache read. The actual REST fetch happens off the hot path
+        // in the background refresher task spawned at start(). If the cache
+        // is empty (refresher hasn't completed its first iteration yet, or
+        // every fetch since startup has failed) we treat that as "no
+        // upcoming maintenance" — the same default behavior the previous
+        // inline-fetch design returned on first call. See bot-strategy#160.
         let now = Utc::now();
-        let ttl_mins = maintenance_ttl_mins();
-        // Small jitter (0-60s) to avoid co-located bots hitting the status
-        // page CDN at the exact same instant. The CDN does not rate-limit
-        // us in practice, so we no longer need a multi-minute spread.
-        let jitter_secs = rand::random::<u64>() % 60;
-        let cache_ttl =
-            ChronoDuration::minutes(ttl_mins) + ChronoDuration::seconds(jitter_secs as i64);
-
-        let (needs_refresh, cached_start) = {
+        let cached_start = {
             let info = self.maintenance.read().await;
-            let needs_refresh = match info.last_checked {
-                Some(ts) => now - ts >= cache_ttl,
-                // First check on a freshly started process: fetch
-                // immediately so the bot has maintenance information
-                // available from the moment it starts trading. The status
-                // page CDN can absorb a fleet restart of 7 processes
-                // hitting it within a few seconds.
-                None => true,
-            };
-            let info = self.maintenance.read().await;
-            (needs_refresh, info.next_start.clone())
+            info.next_start.clone()
         };
-
-        if !needs_refresh {
-            let res = Self::maintenance_within_window(cached_start, &now, hours_ahead);
-            log::debug!(
-                "Lighter maintenance check (cached): start={:?} now={} result={}",
-                cached_start,
-                now,
-                res
-            );
-            return res;
-        }
-
-        match self.fetch_next_maintenance_window().await {
-            Ok(next_start) => {
-                let mut info = self.maintenance.write().await;
-                info.next_start = next_start;
-                info.last_checked = Some(now);
-                let res =
-                    Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
-                log::debug!(
-                    "Lighter maintenance check (refreshed): start={:?} now={} result={}",
-                    info.next_start,
-                    now,
-                    res
-                );
-                res
-            }
-            Err(err) => {
-                let err_str = format!("{:?}", err);
-                // On 429, back off for at least the configured TTL: retrying
-                // more often than the normal refresh cadence is pointless and
-                // wastes REST budget against an endpoint that is already
-                // rejecting us. Honors LIGHTER_MAINTENANCE_TTL_MINS so the
-                // operator env var actually takes effect under 429 (see
-                // bot-strategy#15).
-                let backoff_mins = if err_str.contains("429") {
-                    ttl_mins.max(MAINTENANCE_BACKOFF_429_MINS)
-                } else {
-                    MAINTENANCE_BACKOFF_OTHER_MINS
-                };
-                log::warn!(
-                    "Failed to refresh Lighter maintenance schedule (backing off {}min): {:?}",
-                    backoff_mins,
-                    err
-                );
-                // Push last_checked into the future so the next refresh waits
-                // for the backoff window. Subtracting the base TTL is correct
-                // because the refresh trigger is `now - last_checked >= ttl`.
-                let mut info = self.maintenance.write().await;
-                info.last_checked = Some(
-                    now + ChronoDuration::minutes(backoff_mins)
-                        - ChronoDuration::minutes(ttl_mins),
-                );
-                let res =
-                    Self::maintenance_within_window(info.next_start.clone(), &now, hours_ahead);
-                log::debug!(
-                    "Lighter maintenance check (stale cache): start={:?} now={} result={}",
-                    info.next_start,
-                    now,
-                    res
-                );
-                res
-            }
-        }
+        let res = Self::maintenance_within_window(cached_start.clone(), &now, hours_ahead);
+        log::debug!(
+            "Lighter maintenance check (cached): start={:?} now={} result={}",
+            cached_start,
+            now,
+            res
+        );
+        res
     }
 
     async fn sign_evm_65b(&self, message: &str) -> Result<String, DexError> {
@@ -4939,12 +4984,18 @@ impl LighterConnector {
 }
 
 impl LighterConnector {
-    /// TTL for cached exchange stats / funding rates (60 seconds)
+    /// TTL for cached exchange stats / funding rates.
     // Funding rates are paid every 8h on Lighter and the entry gate uses a
-    // very loose threshold (-0.01/hour in prod), so 60s freshness is wasted
-    // REST pressure. 1h TTL keeps the data "fresh enough" while cutting the
-    // periodic /funding-rates fetch 60x. See bot-strategy#128 follow-up.
-    const STATS_CACHE_TTL_SECS: u64 = 3600;
+    // very loose threshold (-0.01/hour in prod, with funding_entry_z_scale=0
+    // so the value never modulates entry threshold). The data is effectively
+    // a soft signal where 6h staleness is indistinguishable from 1h. The
+    // hourly fetch was the periodic trigger of the host-shared Lighter rate
+    // limit cooldown observed 2026-04-22 18:33 UTC: a single isolated GET to
+    // /funding-rates returned 429 and engaged the global cooldown for 103s,
+    // pausing all REST including order placement. Drop the call cadence 6x
+    // by raising TTL from 1h to 6h. See bot-strategy#128 follow-up and
+    // bot-strategy#161.
+    const STATS_CACHE_TTL_SECS: u64 = 21_600;
 
     /// TTL for the cached `/account` equity snapshot.
     ///
