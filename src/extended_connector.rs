@@ -1487,8 +1487,11 @@ async fn stream_orderbooks(
     let mut ws = match connect_ws(url, None).await {
         Ok(ws) => ws,
         Err(err) => {
-            let mut cache = order_book_cache.write().await;
-            cache.remove(symbol);
+            // Don't wipe the cache on connect failure — the existing entry
+            // (if any) will age out of `get_cached_order_book` via the 5 s
+            // `ORDERBOOK_STALE_AFTER` gate. Wiping eagerly just forces
+            // callers to see "unavailable" during the reconnect window
+            // even though the spawn loop is back up within ~2 s.
             return Err(DexError::Other(format!(
                 "ws connect error: {err} (stream=orderbook symbol={symbol} url={url} conn={conn_id})"
             )));
@@ -1590,8 +1593,13 @@ async fn stream_orderbooks(
         "WebSocket stream ended ({})",
         ws_state.context("orderbook", Some(symbol), url)
     );
-    let mut cache = order_book_cache.write().await;
-    cache.remove(symbol);
+    // Leave the cached book intact across stream restarts. Extended closes
+    // idle (and even active) connections periodically; spawn_ws_tasks
+    // reconnects after a 2 s sleep and the new SNAPSHOT lands ~100 ms
+    // later. Keeping the cache lets get_cached_order_book's staleness
+    // gate (ORDERBOOK_STALE_AFTER = 5 s) decide when callers should see
+    // "unavailable" — same behaviour as today for real outages, silent
+    // for the common transient-reconnect case. See bot-strategy#141.
     result
 }
 
