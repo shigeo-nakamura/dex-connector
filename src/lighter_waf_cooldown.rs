@@ -159,15 +159,24 @@ fn jittered_cooldown_secs() -> u64 {
 }
 
 /// Engage the cooldown. Idempotent: if a longer cooldown is already in effect,
-/// the existing deadline wins. Logs a single WARN per engagement event in this
-/// process, tagged with the observed [`RateLimitSource`]. Returns the duration
-/// that is now in effect (which may be the pre-existing one).
+/// the existing deadline wins. Logs a single WARN at the **start** of each
+/// cooldown event — concurrent callers that engage while a cooldown is already
+/// live (e.g., A/B/C strategies racing on the same 429 burst) extend the
+/// deadline but do not produce additional WARN lines (bot-strategy#150).
+/// Returns the duration that is now in effect (which may be the pre-existing
+/// one).
 pub fn engage_cooldown(source: RateLimitSource) -> Duration {
     let now = now_unix();
     let new_deadline = now + jittered_cooldown_secs() as i64;
 
+    let existing = read_deadline();
+    // Was a cooldown already live before our call? If so, a concurrent caller
+    // already engaged this cooldown on the same 429 burst; our call only
+    // extends it and should not produce a second WARN line (#150).
+    let was_active_before = matches!(existing, Some(d) if d > now);
+
     // Don't shorten an existing longer cooldown.
-    let final_deadline = match read_deadline() {
+    let final_deadline = match existing {
         Some(existing) if existing > new_deadline => existing,
         _ => {
             write_deadline(new_deadline);
@@ -175,11 +184,9 @@ pub fn engage_cooldown(source: RateLimitSource) -> Duration {
         }
     };
 
-    // Log once per engagement event in this process. We treat it as a "new
-    // event" if the deadline we just observed is strictly later than the last
-    // one this process logged about.
-    let last_logged = LAST_LOGGED_DEADLINE.load(Ordering::Acquire);
-    if final_deadline > last_logged {
+    // Log once per fresh cooldown start. Same-burst jitter extensions land in
+    // the `was_active_before = true` path and are silent.
+    if !was_active_before {
         LAST_LOGGED_DEADLINE.store(final_deadline, Ordering::Release);
         let secs = (final_deadline - now).max(0);
         log::warn!(
@@ -364,6 +371,46 @@ mod tests {
         let _ = engage_cooldown(RateLimitSource::WafCaptcha);
         let read_back = read_deadline().unwrap();
         assert_eq!(read_back, far, "engage must not shorten an existing cooldown");
+        clear();
+    }
+
+    #[test]
+    fn engage_during_active_cooldown_does_not_relog() {
+        // bot-strategy#150: when A/B/C strategies each hit a 429 on the same
+        // burst, the second engage_cooldown() lands while the first's deadline
+        // is still live. It must silently extend (or keep) the deadline
+        // without producing a second WARN line. We observe this via
+        // `LAST_LOGGED_DEADLINE` — the log call stores the deadline there.
+        let _g = FILE_LOCK.lock().unwrap();
+        clear();
+
+        // Fresh start — stores a non-zero deadline in LAST_LOGGED_DEADLINE.
+        let _ = engage_cooldown(RateLimitSource::ApiRateLimit);
+        assert!(
+            LAST_LOGGED_DEADLINE.load(Ordering::Acquire) > 0,
+            "first engage should record a logged deadline"
+        );
+
+        // Reset the marker; leave the file deadline live. A second engage
+        // during the active cooldown must not restore the marker (no log).
+        LAST_LOGGED_DEADLINE.store(0, Ordering::Release);
+        let _ = engage_cooldown(RateLimitSource::ApiRateLimit);
+        assert_eq!(
+            LAST_LOGGED_DEADLINE.load(Ordering::Acquire),
+            0,
+            "same-burst extension must not produce a second log (bot-strategy#150)"
+        );
+
+        // Expire the cooldown; the next engage is a fresh event and must log
+        // (marker moves off zero).
+        write_deadline(now_unix() - 1);
+        LAST_LOGGED_DEADLINE.store(0, Ordering::Release);
+        let _ = engage_cooldown(RateLimitSource::ApiRateLimit);
+        assert!(
+            LAST_LOGGED_DEADLINE.load(Ordering::Acquire) > 0,
+            "post-expiry engage should re-log"
+        );
+
         clear();
     }
 }
