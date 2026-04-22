@@ -122,7 +122,7 @@ pub struct OpenOrdersResponse {
     pub orders: Vec<OpenOrder>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Clone)]
 pub struct BalanceResponse {
     pub equity: Decimal,
     pub balance: Decimal,

@@ -386,7 +386,9 @@ pub struct LighterConnector {
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
     cached_positions: Arc<RwLock<Vec<PositionSnapshot>>>,
     positions_ready: Arc<AtomicBool>,
-    balance_cache: Arc<RwLock<Option<BalanceResponse>>>,
+    // (response, fetched_at) — Instant so we can expire entries beyond the
+    // BALANCE_CACHE_TTL_SECS window. See bot-strategy#155.
+    balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
     // Connection epoch counter for race detection
     connection_epoch: Arc<AtomicU64>,
     // Market metadata cache for symbol↔market_id resolution
@@ -3454,32 +3456,14 @@ impl DexConnector for LighterConnector {
             return Ok(cached);
         }
 
-        // WS snapshot hasn't arrived yet. Typical at engine init: the caller
-        // reaches here a few ms after start() returns, while the WS account
-        // update is still inflight. Burning a REST budget slot now is the
-        // prime cause of startup 429s (see bot-strategy#148). Poll the cache
-        // for a bounded window before REST fallback — once populated the
-        // cache is permanent for the process lifetime, so this path is only
-        // paid at most once per process.
-        {
-            const WS_WARMUP_MAX: Duration = Duration::from_secs(10);
-            const WS_POLL_INTERVAL: Duration = Duration::from_millis(200);
-            let start_wait = Instant::now();
-            while start_wait.elapsed() < WS_WARMUP_MAX {
-                tokio::time::sleep(WS_POLL_INTERVAL).await;
-                if let Some(cached) = self.try_read_cached_balance(symbol).await {
-                    log::info!(
-                        "get_balance: WS snapshot arrived during warmup ({}ms) — skipping REST",
-                        start_wait.elapsed().as_millis()
-                    );
-                    return Ok(cached);
-                }
-            }
-            log::info!(
-                "get_balance: WS snapshot did not arrive within {}s — falling back to REST",
-                WS_WARMUP_MAX.as_secs()
-            );
-        }
+        // Cache miss (or stale past BALANCE_CACHE_TTL_SECS, or invalidated
+        // by a recent WS fill). Go direct to REST — Lighter's `account_all`
+        // WS channel does not publish `total_asset_value` /
+        // `available_balance` for perp sub-accounts, so there is no WS
+        // warmup path that would populate this cache; the previous 10s
+        // warmup was always a no-op that forced step() over the 5s tick
+        // and caused STEP_OVERRUN on every equity refresh. See
+        // bot-strategy#155 (event-sourced equity tracking).
 
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
 
@@ -3620,22 +3604,39 @@ impl DexConnector for LighterConnector {
             available_balance
         );
 
-        Ok(BalanceResponse {
+        let response = BalanceResponse {
             equity: total_asset_value,  // Total account value in USD
             balance: available_balance, // Available balance in USD
             position_entry_price: None, // Account-level call doesn't have position info
             position_sign: None,
-        })
+        };
+
+        // Populate the cache with this authoritative REST value so subsequent
+        // get_balance(None) calls within BALANCE_CACHE_TTL_SECS return from
+        // memory. A WS fill invalidates eagerly (handle_account_update) so
+        // realized P&L / fees are picked up on the next caller. See
+        // bot-strategy#155 (event-sourced equity tracking).
+        {
+            let mut cache = self.balance_cache.write().await;
+            *cache = Some((response.clone(), Instant::now()));
+        }
+
+        Ok(response)
     }
 
     async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
         let cached = {
             let cache = self.balance_cache.read().await;
-            cache.as_ref().map(|balance| BalanceResponse {
-                equity: balance.equity,
-                balance: balance.balance,
-                position_entry_price: balance.position_entry_price,
-                position_sign: balance.position_sign,
+            cache.as_ref().and_then(|(balance, fetched_at)| {
+                if fetched_at.elapsed() >= Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS) {
+                    return None;
+                }
+                Some(BalanceResponse {
+                    equity: balance.equity,
+                    balance: balance.balance,
+                    position_entry_price: balance.position_entry_price,
+                    position_sign: balance.position_sign,
+                })
             })
         };
         if let Some(balance) = cached {
@@ -4945,6 +4946,18 @@ impl LighterConnector {
     // periodic /funding-rates fetch 60x. See bot-strategy#128 follow-up.
     const STATS_CACHE_TTL_SECS: u64 = 3600;
 
+    /// TTL for the cached `/account` equity snapshot.
+    ///
+    /// Lighter's WS `account_all` does not publish `total_asset_value` for
+    /// perp sub-accounts, so we treat REST `/account` as the source of
+    /// truth, cached here to avoid hitting it on every step(). The value
+    /// changes only via (a) trade fills, which the WS stream notifies us
+    /// about and which explicitly invalidate this cache, (b) funding every
+    /// 8h, and (c) manual deposits/withdrawals. 5 minutes caps funding
+    /// drift at roughly one rate-tick and matches pairtrade's
+    /// `EQUITY_REFRESH_CACHE_SECS`. See bot-strategy#155.
+    const BALANCE_CACHE_TTL_SECS: u64 = 300;
+
     /// Snapshot read of WS-fed balance/position caches for `get_balance`.
     /// Returns `None` if the WS has not yet delivered an account update; the
     /// caller then decides whether to wait (see bot-strategy#148) or fall
@@ -4963,7 +4976,15 @@ impl LighterConnector {
                     position_sign: Some(pos.sign),
                 });
             }
-            let has_ws_balance = self.balance_cache.read().await.is_some();
+            let has_ws_balance = self
+                .balance_cache
+                .read()
+                .await
+                .as_ref()
+                .map(|(_, fetched_at)| {
+                    fetched_at.elapsed() < Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS)
+                })
+                .unwrap_or(false);
             if !positions.is_empty() || has_ws_balance {
                 return Some(BalanceResponse {
                     equity: Decimal::ZERO,
@@ -4975,11 +4996,16 @@ impl LighterConnector {
             None
         } else {
             let cache = self.balance_cache.read().await;
-            cache.as_ref().map(|balance| BalanceResponse {
-                equity: balance.equity,
-                balance: balance.balance,
-                position_entry_price: balance.position_entry_price,
-                position_sign: balance.position_sign,
+            cache.as_ref().and_then(|(balance, fetched_at)| {
+                if fetched_at.elapsed() >= Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS) {
+                    return None;
+                }
+                Some(BalanceResponse {
+                    equity: balance.equity,
+                    balance: balance.balance,
+                    position_entry_price: balance.position_entry_price,
+                    position_sign: balance.position_sign,
+                })
             })
         }
     }
@@ -5991,7 +6017,7 @@ impl LighterConnector {
         cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
-        balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
+        balance_cache: &Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
         account_index: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -6224,7 +6250,7 @@ impl LighterConnector {
         cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
-        balance_cache: &Arc<RwLock<Option<BalanceResponse>>>,
+        balance_cache: &Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
         account_id: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -6316,12 +6342,15 @@ impl LighterConnector {
                 .unwrap_or(Decimal::ZERO);
             let balance = available_balance.or(total_asset_value).unwrap_or(equity);
             let mut cache = balance_cache.write().await;
-            *cache = Some(BalanceResponse {
-                equity,
-                balance,
-                position_entry_price: None,
-                position_sign: None,
-            });
+            *cache = Some((
+                BalanceResponse {
+                    equity,
+                    balance,
+                    position_entry_price: None,
+                    position_sign: None,
+                },
+                Instant::now(),
+            ));
             log::debug!(
                 "Updated cached balance from WS: equity={}, balance={}",
                 equity,
@@ -6464,7 +6493,8 @@ impl LighterConnector {
                 }
             }
 
-            if !pending_inserts.is_empty() {
+            let had_fills = !pending_inserts.is_empty();
+            if had_fills {
                 let mut filled_map = filled_orders.write().await;
                 for (symbol_key, filled_order) in pending_inserts {
                     filled_map
@@ -6472,6 +6502,19 @@ impl LighterConnector {
                         .or_insert_with(Vec::new)
                         .push(filled_order);
                 }
+            }
+
+            // Event-sourced equity: a fill changes realized PnL + fees in a
+            // way that's not surfaced by the `account_all` WS snapshot for
+            // perp sub-accounts (Lighter only publishes per-market state
+            // there, not aggregate collateral). Invalidate the cache so the
+            // next get_balance(None) falls through to a fresh REST fetch
+            // rather than returning pre-fill equity for up to a full TTL
+            // window. See bot-strategy#155.
+            if had_fills {
+                let mut cache = balance_cache.write().await;
+                *cache = None;
+                log::debug!("Invalidated balance_cache after WS fill");
             }
         } else {
             log::trace!("No 'fills' array or 'trades' object found in account data");
@@ -6792,5 +6835,137 @@ mod tests {
                 panic!("get_open_orders test failed: {}", e);
             }
         }
+    }
+
+    // bot-strategy#155: event-sourced equity tracking. An update that carries
+    // explicit totals must land in balance_cache as (response, fetched_at) so
+    // TTL-aware readers can expire it. Verifies the tuple shape and non-zero
+    // timestamp (which matters for try_read_cached_balance staleness checks).
+    #[tokio::test]
+    async fn account_update_with_explicit_totals_populates_cache_with_timestamp() {
+        use serde_json::json;
+        use std::str::FromStr;
+        use std::sync::atomic::AtomicBool;
+
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_positions = Arc::new(RwLock::new(Vec::new()));
+        let positions_ready = Arc::new(AtomicBool::new(false));
+        let balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>> =
+            Arc::new(RwLock::new(None));
+        let market_cache = Arc::new(RwLock::new(MarketCache::default()));
+
+        let data = json!({
+            "account": {
+                "total_asset_value": "999.04",
+                "available_balance": "800.00"
+            }
+        });
+
+        let before = Instant::now();
+        LighterConnector::handle_account_update(
+            &data,
+            "update/account_all",
+            &filled_orders,
+            &canceled_orders,
+            &cached_open_orders,
+            &cached_positions,
+            &positions_ready,
+            &balance_cache,
+            1,
+            &market_cache,
+            "BTC",
+        )
+        .await;
+
+        let guard = balance_cache.read().await;
+        let (resp, fetched_at) = guard
+            .as_ref()
+            .expect("explicit totals must populate cache");
+        assert_eq!(resp.equity, Decimal::from_str("999.04").unwrap());
+        assert_eq!(resp.balance, Decimal::from_str("800.00").unwrap());
+        assert!(*fetched_at >= before, "fetched_at must be recent");
+    }
+
+    // bot-strategy#155: a WS fill must invalidate balance_cache so the next
+    // get_balance(None) goes back to REST and picks up the post-fill
+    // realized P&L + fees. We simulate a pre-populated cache, deliver a
+    // trades payload, and verify the cache is cleared.
+    #[tokio::test]
+    async fn ws_fill_invalidates_balance_cache() {
+        use serde_json::json;
+        use std::str::FromStr;
+        use std::sync::atomic::AtomicBool;
+
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_positions = Arc::new(RwLock::new(Vec::new()));
+        let positions_ready = Arc::new(AtomicBool::new(false));
+        let balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>> =
+            Arc::new(RwLock::new(Some((
+                BalanceResponse {
+                    equity: Decimal::from_str("500.0").unwrap(),
+                    balance: Decimal::from_str("500.0").unwrap(),
+                    position_entry_price: None,
+                    position_sign: None,
+                },
+                Instant::now(),
+            ))));
+
+        // Seed market_cache so the fill's market_id=0 resolves to a symbol
+        // and the trade parse path engages (otherwise pending_inserts stays
+        // empty and we wouldn't exercise the invalidation).
+        let market_cache = Arc::new(RwLock::new({
+            let mut mc = MarketCache::default();
+            mc.by_id.insert(
+                0,
+                crate::lighter_connector::MarketInfo {
+                    canonical_symbol: "ETH".to_string(),
+                    market_id: 0,
+                    price_decimals: 2,
+                    size_decimals: 4,
+                    min_order: Some(Decimal::from_str("0.01").unwrap()),
+                },
+            );
+            mc
+        }));
+
+        let data = json!({
+            "account": 522842,
+            "trades": {
+                "0": [{
+                    "ask_id": 1u64,
+                    "bid_id": 2u64,
+                    "ask_account_id": 522842u64,
+                    "bid_account_id": 999u64,
+                    "size": "0.5",
+                    "price": "3500.00",
+                    "trade_id": 42u64
+                }]
+            },
+            "type": "update/account_all"
+        });
+
+        LighterConnector::handle_account_update(
+            &data,
+            "update/account_all",
+            &filled_orders,
+            &canceled_orders,
+            &cached_open_orders,
+            &cached_positions,
+            &positions_ready,
+            &balance_cache,
+            522842,
+            &market_cache,
+            "ETH",
+        )
+        .await;
+
+        assert!(
+            balance_cache.read().await.is_none(),
+            "WS fill must invalidate balance_cache so the next get_balance fetches fresh equity"
+        );
     }
 }
