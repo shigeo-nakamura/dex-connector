@@ -675,7 +675,22 @@ impl ExtendedConnector {
         let symbols = self.tracked_symbols.clone();
 
         for symbol in symbols.iter() {
-            let orderbook_path = format!("/orderbooks/{symbol}");
+            // Callers track bare tokens ("BTC") but Extended's stream paths
+            // require the collateral-qualified market name ("BTC-USD"). If
+            // we connect to /orderbooks/BTC the server accepts the upgrade
+            // and then sends nothing, so the cache never populates. Resolve
+            // once here and keep the bare symbol as the cache key.
+            let market_name = match self.get_market(symbol).await {
+                Ok(market) => market.name,
+                Err(err) => {
+                    log::warn!(
+                        "extended ws: cannot resolve market for {symbol}: {err}; skipping streams"
+                    );
+                    continue;
+                }
+            };
+
+            let orderbook_path = format!("/orderbooks/{market_name}");
             if let Some(url) = self.build_ws_url(&orderbook_path) {
                 let order_book_cache = Arc::clone(&self.order_book_cache);
                 let symbol = symbol.clone();
@@ -690,7 +705,7 @@ impl ExtendedConnector {
                 }));
             }
 
-            let trades_path = format!("/publicTrades/{symbol}");
+            let trades_path = format!("/publicTrades/{market_name}");
             if let Some(url) = self.build_ws_url(&trades_path) {
                 let last_trades = Arc::clone(&self.last_trades);
                 let symbol = symbol.clone();
