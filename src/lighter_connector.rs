@@ -6302,7 +6302,17 @@ impl LighterConnector {
             }
         }
 
-        let balance_source = data.get("account").unwrap_or(data);
+        // In `subscribed/account_all` snapshots the account state is flat at
+        // the top level and `data["account"]` is the account_id as a number,
+        // not a nested object. Without the is_object() guard the old
+        // `.unwrap_or(data)` returned that number and every subsequent
+        // `.get(...)` silently missed, leaving balance_cache unpopulated for
+        // the process lifetime (bot-strategy#155).
+        let balance_source = data
+            .get("account")
+            .filter(|v| v.is_object())
+            .unwrap_or(data);
+
         let total_asset_value = balance_source
             .get("total_asset_value")
             .and_then(Self::value_to_decimal);
@@ -6310,11 +6320,69 @@ impl LighterConnector {
             .get("available_balance")
             .and_then(Self::value_to_decimal);
 
-        if total_asset_value.is_some() || available_balance.is_some() {
-            let equity = total_asset_value
+        let is_snapshot = msg_type == "subscribed/account_all";
+
+        // `subscribed/account_all` doesn't carry the aggregated totals —
+        // derive equity from USDC asset balance + open-position unrealized
+        // PnL so the WS fast path populates on the first snapshot instead of
+        // timing out 10s to REST on every equity-refresh tick (#155).
+        let totals: Option<(Decimal, Decimal)> = if total_asset_value.is_some()
+            || available_balance.is_some()
+        {
+            let eq = total_asset_value
                 .or(available_balance)
                 .unwrap_or(Decimal::ZERO);
-            let balance = available_balance.or(total_asset_value).unwrap_or(equity);
+            let bal = available_balance.or(total_asset_value).unwrap_or(eq);
+            Some((eq, bal))
+        } else if is_snapshot {
+            let usdc: Decimal = balance_source
+                .get("assets")
+                .and_then(|a| a.as_object())
+                .map(|assets| {
+                    assets
+                        .values()
+                        .filter(|v| {
+                            v.get("symbol")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.eq_ignore_ascii_case("USDC"))
+                                .unwrap_or(false)
+                        })
+                        .filter_map(|v| {
+                            v.get("balance").and_then(Self::value_to_decimal)
+                        })
+                        .sum()
+                })
+                .unwrap_or(Decimal::ZERO);
+            let unrealized: Decimal = match balance_source.get("positions") {
+                Some(p) if p.is_array() => p
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|v| {
+                        v.get("unrealized_pnl").and_then(Self::value_to_decimal)
+                    })
+                    .sum(),
+                Some(p) if p.is_object() => p
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .filter_map(|v| {
+                        v.get("unrealized_pnl").and_then(Self::value_to_decimal)
+                    })
+                    .sum(),
+                _ => Decimal::ZERO,
+            };
+            // Use USDC balance as `available` — matches REST's
+            // available_balance for the flat / no-locked-margin case. For
+            // heavily-margined accounts this understates by the locked
+            // portion; acceptable because pairtrade's equity check only
+            // reads `equity`, not `balance`.
+            Some((usdc + unrealized, usdc))
+        } else {
+            None
+        };
+
+        if let Some((equity, balance)) = totals {
             let mut cache = balance_cache.write().await;
             *cache = Some(BalanceResponse {
                 equity,
@@ -6328,7 +6396,10 @@ impl LighterConnector {
                 balance
             );
         } else {
-            log::debug!("Skipping WS balance update: missing account totals");
+            log::debug!(
+                "Skipping WS balance update: no totals and msg_type={}",
+                msg_type
+            );
         }
 
         // Handle filled orders - try both 'fills' and 'trades' fields
@@ -6792,5 +6863,165 @@ mod tests {
                 panic!("get_open_orders test failed: {}", e);
             }
         }
+    }
+
+    // bot-strategy#155: `subscribed/account_all` is flat at the top level
+    // and `data["account"]` is the account_id number. Verify the handler
+    // now guards the account-indexing and derives equity from USDC asset
+    // balance + position unrealized PnL, populating balance_cache on the
+    // first snapshot instead of timing out 10s to REST.
+    #[tokio::test]
+    async fn account_snapshot_populates_balance_cache_via_derived_totals() {
+        use serde_json::json;
+        use std::str::FromStr;
+        use std::sync::atomic::AtomicBool;
+
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_positions = Arc::new(RwLock::new(Vec::new()));
+        let positions_ready = Arc::new(AtomicBool::new(false));
+        let balance_cache: Arc<RwLock<Option<BalanceResponse>>> =
+            Arc::new(RwLock::new(None));
+        let market_cache = Arc::new(RwLock::new(MarketCache::default()));
+
+        let data = json!({
+            "account": 522842,
+            "assets": {
+                "2": {"asset_id":2, "balance":"0.00000000", "locked_balance":"0.0", "symbol":"LIT"},
+                "3": {"asset_id":3, "balance":"250.5", "locked_balance":"0.0", "symbol":"USDC"}
+            },
+            "positions": {
+                "0": {
+                    "market_id": 0, "symbol":"ETH",
+                    "position":"0.5000", "sign": 1,
+                    "avg_entry_price":"3500.00",
+                    "unrealized_pnl":"10.5",
+                    "open_order_count": 0
+                }
+            },
+            "type": "subscribed/account_all"
+        });
+
+        LighterConnector::handle_account_update(
+            &data,
+            "subscribed/account_all",
+            &filled_orders,
+            &canceled_orders,
+            &cached_open_orders,
+            &cached_positions,
+            &positions_ready,
+            &balance_cache,
+            522842,
+            &market_cache,
+            "BTC",
+        )
+        .await;
+
+        let guard = balance_cache.read().await;
+        let resp = guard
+            .as_ref()
+            .expect("balance_cache must populate from snapshot");
+        // equity = USDC balance (250.5) + position unrealized PnL (10.5)
+        assert_eq!(resp.equity, Decimal::from_str("261.0").unwrap());
+        // balance = USDC balance only (approximation for `available`)
+        assert_eq!(resp.balance, Decimal::from_str("250.5").unwrap());
+    }
+
+    // An almost-empty sub-account (observed on Frankfurt) must still
+    // populate balance_cache — otherwise get_balance's warmup loop times
+    // out for the entire process lifetime. bot-strategy#155.
+    #[tokio::test]
+    async fn account_snapshot_zero_equity_still_populates_cache() {
+        use serde_json::json;
+        use std::str::FromStr;
+        use std::sync::atomic::AtomicBool;
+
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_positions = Arc::new(RwLock::new(Vec::new()));
+        let positions_ready = Arc::new(AtomicBool::new(false));
+        let balance_cache: Arc<RwLock<Option<BalanceResponse>>> =
+            Arc::new(RwLock::new(None));
+        let market_cache = Arc::new(RwLock::new(MarketCache::default()));
+
+        let data = json!({
+            "account": 522842,
+            "assets": {
+                "3": {"asset_id":3, "balance":"0.006930", "locked_balance":"0.0", "symbol":"USDC"}
+            },
+            "positions": {},
+            "type": "subscribed/account_all"
+        });
+
+        LighterConnector::handle_account_update(
+            &data,
+            "subscribed/account_all",
+            &filled_orders,
+            &canceled_orders,
+            &cached_open_orders,
+            &cached_positions,
+            &positions_ready,
+            &balance_cache,
+            522842,
+            &market_cache,
+            "BTC",
+        )
+        .await;
+
+        let guard = balance_cache.read().await;
+        let resp = guard
+            .as_ref()
+            .expect("zero-equity snapshot must still populate cache");
+        assert_eq!(resp.balance, Decimal::from_str("0.006930").unwrap());
+    }
+
+    // Incremental updates that *do* carry the aggregate totals must keep
+    // using them verbatim (don't blow them away by deriving something
+    // different). bot-strategy#155.
+    #[tokio::test]
+    async fn account_update_with_explicit_totals_uses_them_verbatim() {
+        use serde_json::json;
+        use std::str::FromStr;
+        use std::sync::atomic::AtomicBool;
+
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_positions = Arc::new(RwLock::new(Vec::new()));
+        let positions_ready = Arc::new(AtomicBool::new(false));
+        let balance_cache: Arc<RwLock<Option<BalanceResponse>>> =
+            Arc::new(RwLock::new(None));
+        let market_cache = Arc::new(RwLock::new(MarketCache::default()));
+
+        let data = json!({
+            "account": {
+                "total_asset_value": "999.04",
+                "available_balance": "800.00"
+            }
+        });
+
+        LighterConnector::handle_account_update(
+            &data,
+            "update/account_all",
+            &filled_orders,
+            &canceled_orders,
+            &cached_open_orders,
+            &cached_positions,
+            &positions_ready,
+            &balance_cache,
+            1,
+            &market_cache,
+            "BTC",
+        )
+        .await;
+
+        let guard = balance_cache.read().await;
+        let resp = guard
+            .as_ref()
+            .expect("explicit totals must populate cache");
+        assert_eq!(resp.equity, Decimal::from_str("999.04").unwrap());
+        assert_eq!(resp.balance, Decimal::from_str("800.00").unwrap());
     }
 }
