@@ -312,6 +312,12 @@ static CACHED_EXCHANGE_STATS: std::sync::LazyLock<
 static CACHED_FUNDING_RATES: std::sync::LazyLock<
     Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
 > = std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
+/// Serialize `/funding-rates` refetch across all connector instances in the
+/// process. Without this, A/B/C strategies reaching the TTL expiry within the
+/// same tokio tick each fire a REST (thundering herd) — observed as paired
+/// 429s that engaged the WAF cooldown twice. See bot-strategy#150.
+static CACHED_FUNDING_RATES_FETCH_LOCK: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 /// Track and log API calls for rate limit monitoring
 fn track_api_call(endpoint: &str, method: &str) {
@@ -395,6 +401,8 @@ pub struct LighterConnector {
     // Cached exchange stats / funding rates to reduce REST API calls
     cached_exchange_stats: Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
     cached_funding_rates: Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
+    // Single-flight lock for funding-rates refetch (see #150)
+    cached_funding_rates_fetch_lock: Arc<tokio::sync::Mutex<()>>,
     // Broadcast sender for real-time price updates from WS OB changes
     price_update_tx: tokio::sync::broadcast::Sender<crate::PriceUpdate>,
     // Host-shared weight-based rate limiter (bot-strategy#79). Routes every
@@ -1602,6 +1610,7 @@ impl LighterConnector {
             ob_stale_after: Duration::from_secs(ob_stale_secs),
             cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
             cached_funding_rates: Arc::clone(&CACHED_FUNDING_RATES),
+            cached_funding_rates_fetch_lock: Arc::clone(&CACHED_FUNDING_RATES_FETCH_LOCK),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
@@ -1662,6 +1671,7 @@ impl LighterConnector {
             ob_stale_after: Duration::from_secs(ob_stale_secs),
             cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
             cached_funding_rates: Arc::clone(&CACHED_FUNDING_RATES),
+            cached_funding_rates_fetch_lock: Arc::clone(&CACHED_FUNDING_RATES_FETCH_LOCK),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
@@ -4993,6 +5003,8 @@ impl LighterConnector {
     }
 
     async fn get_funding_rates_cached(&self) -> Result<LighterFundingRates, DexError> {
+        // Fast path: a fresh entry in the shared cache is returned without
+        // touching the fetch lock, so steady-state reads don't serialize.
         {
             let cache = self.cached_funding_rates.read().await;
             if let Some((rates, ts)) = &*cache {
@@ -5001,6 +5013,25 @@ impl LighterConnector {
                 }
             }
         }
+
+        // Slow path: serialize the refetch across all connector instances in
+        // the process. Without this, A/B/C strategies reaching TTL expiry
+        // within the same tokio tick each fire a REST — a cache stampede that
+        // burned the WAF weight budget and engaged the cooldown twice on the
+        // same burst (bot-strategy#150, observed 2026-04-22 14:19:25 +0100).
+        let _refill = self.cached_funding_rates_fetch_lock.lock().await;
+
+        // Re-check after acquiring the lock: a sibling refill that completed
+        // while we were queued should be reused rather than re-fetched.
+        {
+            let cache = self.cached_funding_rates.read().await;
+            if let Some((rates, ts)) = &*cache {
+                if ts.elapsed() < Duration::from_secs(Self::STATS_CACHE_TTL_SECS) {
+                    return Ok(rates.clone());
+                }
+            }
+        }
+
         let rates = self.get_funding_rates().await?;
         {
             let mut cache = self.cached_funding_rates.write().await;
