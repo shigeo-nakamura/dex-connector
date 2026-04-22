@@ -3435,22 +3435,47 @@ impl DexConnector for LighterConnector {
             url
         );
 
-        // Track API call
-        track_api_call(&endpoint, "GET");
+        // Lighter occasionally 429s the head of a balance-refresh burst even
+        // when our per-URL rate is ~1/min. Its short-window per-wallet throttle
+        // is shared across all endpoints, so a concurrent order-placement or
+        // nextNonce call can push the instantaneous rate over the edge. Retry
+        // a couple of times with backoff so a transient 429 doesn't blank out
+        // the equity observation for a full 5-minute cache cycle. See
+        // bot-strategy#142.
+        const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[2_000, 5_000];
 
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+        let mut attempt: usize = 0;
+        let (status, response_text) = loop {
+            track_api_call(&endpoint, "GET");
+            let response = self
+                .client
+                .get(&url)
+                .header("X-API-KEY", &self.api_key_public)
+                .send()
+                .await
+                .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
 
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+            let status = response.status();
+            let response_text = response
+                .text()
+                .await
+                .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+
+            if status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                || attempt >= BALANCE_RETRY_BACKOFF_MS.len()
+            {
+                break (status, response_text);
+            }
+            let backoff_ms = BALANCE_RETRY_BACKOFF_MS[attempt];
+            log::warn!(
+                "get_balance: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
+                attempt + 1,
+                BALANCE_RETRY_BACKOFF_MS.len() + 1,
+                backoff_ms
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            attempt += 1;
+        };
 
         log::info!(
             "Account API response (status: {}): {}",
