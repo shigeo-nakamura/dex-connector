@@ -1280,10 +1280,17 @@ struct WrappedStreamResponse<T> {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct StreamOrderbookQuantity {
+    // On SNAPSHOT frames `q` is the absolute quantity at that level.
+    // On DELTA frames `q` is the *change* in quantity (can be negative),
+    // and `c` is the new cumulative quantity the exchange already computed.
+    // Prefer `c` when present so we never have to do delta arithmetic
+    // ourselves.
     #[serde(alias = "q")]
     qty: Decimal,
     #[serde(alias = "p")]
     price: Decimal,
+    #[serde(alias = "c", default)]
+    cumulative: Option<Decimal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1547,17 +1554,19 @@ async fn stream_orderbooks(
             entry.asks.clear();
         }
         for level in update.bid {
-            if level.qty.is_zero() {
+            let absolute = level.cumulative.unwrap_or(level.qty);
+            if absolute.is_zero() {
                 entry.bids.remove(&level.price);
             } else {
-                entry.bids.insert(level.price, level.qty);
+                entry.bids.insert(level.price, absolute);
             }
         }
         for level in update.ask {
-            if level.qty.is_zero() {
+            let absolute = level.cumulative.unwrap_or(level.qty);
+            if absolute.is_zero() {
                 entry.asks.remove(&level.price);
             } else {
-                entry.asks.insert(level.price, level.qty);
+                entry.asks.insert(level.price, absolute);
             }
         }
         entry.updated_at = Instant::now();
