@@ -16,7 +16,7 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use starknet::core::types::Felt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -35,7 +35,6 @@ const DOMAIN_VERSION: &str = "v0";
 const DOMAIN_REVISION: &str = "1";
 const MAINNET_CHAIN_ID: &str = "SN_MAIN";
 const TESTNET_CHAIN_ID: &str = "SN_SEPOLIA";
-const DEFAULT_ORDERBOOK_DEPTH: usize = 50;
 const ORDERBOOK_STALE_AFTER: StdDuration = StdDuration::from_secs(5);
 const DEFAULT_CLOSE_ALL_POSITIONS_SLIPPAGE_BPS: u32 = 50;
 static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -518,8 +517,23 @@ pub struct ExtendedConnector {
 
 #[derive(Debug, Clone)]
 struct OrderBookCacheEntry {
-    snapshot: OrderBookSnapshot,
+    // Book state as (price -> qty). Extended's ws stream delivers an initial
+    // SNAPSHOT followed by incremental DELTA frames; maintaining sorted maps
+    // makes the merge O(log n) per level and keeps best bid/ask retrievable
+    // without a per-query sort.
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
     updated_at: Instant,
+}
+
+impl Default for OrderBookCacheEntry {
+    fn default() -> Self {
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            updated_at: Instant::now(),
+        }
+    }
 }
 
 impl ExtendedConnector {
@@ -612,10 +626,10 @@ impl ExtendedConnector {
     }
 
     async fn get_cached_order_book(&self, symbol: &str, depth: usize) -> Option<OrderBookSnapshot> {
-        let (snapshot, updated_at) = {
+        let (bids_map, asks_map, updated_at) = {
             let cache = self.order_book_cache.read().await;
             let entry = cache.get(symbol)?;
-            (entry.snapshot.clone(), entry.updated_at)
+            (entry.bids.clone(), entry.asks.clone(), entry.updated_at)
         };
         let age = updated_at.elapsed();
         if age > ORDERBOOK_STALE_AFTER {
@@ -628,8 +642,24 @@ impl ExtendedConnector {
             log::debug!("orderbook {} stale (age={}ms)", symbol, age.as_millis());
             return None;
         }
-        let bids = snapshot.bids.into_iter().take(depth).collect();
-        let asks = snapshot.asks.into_iter().take(depth).collect();
+        // Best bids = highest prices first; asks = lowest prices first.
+        let bids = bids_map
+            .iter()
+            .rev()
+            .take(depth)
+            .map(|(price, size)| OrderBookLevel {
+                price: *price,
+                size: *size,
+            })
+            .collect();
+        let asks = asks_map
+            .iter()
+            .take(depth)
+            .map(|(price, size)| OrderBookLevel {
+                price: *price,
+                size: *size,
+            })
+            .collect();
         Some(OrderBookSnapshot { bids, asks })
     }
 
@@ -1500,34 +1530,37 @@ async fn stream_orderbooks(
                 Ok(payload) => payload,
                 Err(err) => break Err(DexError::Other(format!("orderbook parse error: {err}"))),
             };
-        if let Some(update) = payload.data {
-            let bids = update
-                .bid
-                .into_iter()
-                .take(DEFAULT_ORDERBOOK_DEPTH)
-                .map(|level| OrderBookLevel {
-                    price: level.price,
-                    size: level.qty,
-                })
-                .collect::<Vec<_>>();
-            let asks = update
-                .ask
-                .into_iter()
-                .take(DEFAULT_ORDERBOOK_DEPTH)
-                .map(|level| OrderBookLevel {
-                    price: level.price,
-                    size: level.qty,
-                })
-                .collect::<Vec<_>>();
-            let mut cache = order_book_cache.write().await;
-            cache.insert(
-                symbol.to_string(),
-                OrderBookCacheEntry {
-                    snapshot: OrderBookSnapshot { bids, asks },
-                    updated_at: Instant::now(),
-                },
-            );
+        let Some(update) = payload.data else {
+            continue;
+        };
+        // Extended sends SNAPSHOT on (re)connect and DELTA frames in between.
+        // Treating every frame as a full snapshot wipes the book each delta,
+        // leaving bid/ask empty. We rebuild on SNAPSHOT and apply level-by-
+        // level (qty==0 → remove, else set) on DELTA.
+        let msg_type = payload.msg_type.as_deref().unwrap_or("");
+        let mut cache = order_book_cache.write().await;
+        let entry = cache
+            .entry(symbol.to_string())
+            .or_insert_with(OrderBookCacheEntry::default);
+        if msg_type == "SNAPSHOT" {
+            entry.bids.clear();
+            entry.asks.clear();
         }
+        for level in update.bid {
+            if level.qty.is_zero() {
+                entry.bids.remove(&level.price);
+            } else {
+                entry.bids.insert(level.price, level.qty);
+            }
+        }
+        for level in update.ask {
+            if level.qty.is_zero() {
+                entry.asks.remove(&level.price);
+            } else {
+                entry.asks.insert(level.price, level.qty);
+            }
+        }
+        entry.updated_at = Instant::now();
     };
     log::debug!(
         "WebSocket stream ended ({})",
