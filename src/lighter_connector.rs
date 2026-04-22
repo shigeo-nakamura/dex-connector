@@ -1248,6 +1248,34 @@ impl LighterConnector {
                 let error_cstr = CStr::from_ptr(check_result);
                 let error_msg = error_cstr.to_string_lossy().to_string();
                 libc::free(check_result as *mut libc::c_void);
+
+                // Go SDK CheckClient translates *any* error from
+                // /api/v1/apikeys into "key not registered". Under WAF/429
+                // pressure the endpoint legitimately returns 429 → classify
+                // as transient RateLimited instead of permanent auth failure
+                // so callers do not drop into the re-registration path.
+                // See bot-strategy#85 priority-2.
+                //
+                // On rate-limit: engage the host-shared cooldown (so other
+                // callers / next restart see the real state via #148's
+                // pre-check) and log at WARN, not ERROR — a transient 429 is
+                // not an auth failure and must not feed `auto-error` issue
+                // generators. See bot-strategy#151.
+                let is_rate_limited = error_msg.contains("Too Many Requests")
+                    || error_msg.contains("\"code\":23000");
+
+                if is_rate_limited {
+                    log::warn!(
+                        "API key validation hit rate limit (transient): {}",
+                        error_msg
+                    );
+                    let cooldown = crate::lighter_waf_cooldown::engage_cooldown(
+                        crate::lighter_waf_cooldown::RateLimitSource::ApiRateLimit,
+                    );
+                    let until = Utc::now().timestamp() + cooldown.as_secs() as i64;
+                    return Err(DexError::RateLimited { until_unix: until });
+                }
+
                 log::error!("API key validation failed: {}", error_msg);
 
                 // Parse the error message to extract key details
@@ -1278,19 +1306,6 @@ impl LighterConnector {
                             );
                         }
                     }
-                }
-
-                // Go SDK CheckClient translates *any* error from
-                // /api/v1/apikeys into "key not registered". Under WAF/429
-                // pressure the endpoint legitimately returns 429 → classify
-                // as transient RateLimited instead of permanent auth failure
-                // so callers do not drop into the re-registration path.
-                // See bot-strategy#85 priority-2.
-                if error_msg.contains("Too Many Requests")
-                    || error_msg.contains("\"code\":23000")
-                {
-                    let until = Utc::now().timestamp() + 30;
-                    return Err(DexError::RateLimited { until_unix: until });
                 }
                 // If we have the EVM wallet key, try to update the API key
                 #[cfg(feature = "lighter-sdk")]
