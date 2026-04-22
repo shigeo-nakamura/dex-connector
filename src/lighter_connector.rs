@@ -360,6 +360,12 @@ pub struct LighterConnector {
     canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
     // Cache for API key data to avoid repeated requests
     cached_server_pubkey: Arc<tokio::sync::RwLock<Option<(String, std::time::Instant)>>>,
+    // Latched after the first successful Go-SDK CheckClient() call so that
+    // subsequent create_go_client() invocations skip the /api/v1/apikeys REST
+    // probe. The API key doesn't change during process lifetime; re-validating
+    // on every sendTx let partial-fill reissue bursts 429 the wallet's short
+    // window. See bot-strategy#144.
+    api_key_validated: Arc<AtomicBool>,
     is_running: Arc<AtomicBool>,
     // Auto-cleanup management
     cleanup_started: Arc<AtomicBool>,
@@ -1222,6 +1228,16 @@ impl LighterConnector {
                 )));
             }
 
+            // Skip the Go-SDK CheckClient() call (which hits /api/v1/apikeys)
+            // once we've already validated the key. CreateClient above is
+            // memory-only in the Go SDK so repeating it on every sendTx is
+            // cheap, but CheckClient's REST probe would otherwise burst the
+            // wallet's short-window rate-limit during partial-fill reissue
+            // storms. See bot-strategy#144.
+            if self.api_key_validated.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
             // Verify the API key is properly registered with Lighter
             let check_result = CheckClient(
                 self.api_key_index as c_int,
@@ -1294,6 +1310,9 @@ impl LighterConnector {
                 )));
             }
 
+            // Latch: subsequent create_go_client() calls skip the /apikeys
+            // probe. See bot-strategy#144.
+            self.api_key_validated.store(true, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -1542,6 +1561,7 @@ impl LighterConnector {
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
+            api_key_validated: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1602,6 +1622,7 @@ impl LighterConnector {
             filled_orders: Arc::new(RwLock::new(HashMap::new())),
             canceled_orders: Arc::new(RwLock::new(HashMap::new())),
             cached_server_pubkey: Arc::new(tokio::sync::RwLock::new(None)),
+            api_key_validated: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
