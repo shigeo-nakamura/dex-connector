@@ -3067,6 +3067,16 @@ impl DexConnector for LighterConnector {
             self.websocket_url
         );
 
+        // If a prior process (or earlier call on this host) engaged a WAF /
+        // API rate-limit cooldown, wait it out before the first REST call of
+        // start() rather than burning a budget slot on a doomed request and
+        // re-learning the cooldown from a fresh 429. See bot-strategy#148.
+        if let Some(remaining) =
+            crate::lighter_waf_cooldown::pending_cooldown_wait("LighterConnector::start")
+        {
+            tokio::time::sleep(remaining).await;
+        }
+
         // Initialize the Go client and validate API key
         #[cfg(feature = "lighter-sdk")]
         {
@@ -3415,35 +3425,35 @@ impl DexConnector for LighterConnector {
     }
 
     async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
-        if let Some(token_symbol) = symbol {
-            let positions = self.cached_positions.read().await;
-            if let Some(pos) = positions.iter().find(|p| p.symbol == token_symbol) {
-                return Ok(BalanceResponse {
-                    equity: pos.size,
-                    balance: pos.size,
-                    position_entry_price: pos.entry_price,
-                    position_sign: Some(pos.sign),
-                });
+        if let Some(cached) = self.try_read_cached_balance(symbol).await {
+            return Ok(cached);
+        }
+
+        // WS snapshot hasn't arrived yet. Typical at engine init: the caller
+        // reaches here a few ms after start() returns, while the WS account
+        // update is still inflight. Burning a REST budget slot now is the
+        // prime cause of startup 429s (see bot-strategy#148). Poll the cache
+        // for a bounded window before REST fallback — once populated the
+        // cache is permanent for the process lifetime, so this path is only
+        // paid at most once per process.
+        {
+            const WS_WARMUP_MAX: Duration = Duration::from_secs(10);
+            const WS_POLL_INTERVAL: Duration = Duration::from_millis(200);
+            let start_wait = Instant::now();
+            while start_wait.elapsed() < WS_WARMUP_MAX {
+                tokio::time::sleep(WS_POLL_INTERVAL).await;
+                if let Some(cached) = self.try_read_cached_balance(symbol).await {
+                    log::info!(
+                        "get_balance: WS snapshot arrived during warmup ({}ms) — skipping REST",
+                        start_wait.elapsed().as_millis()
+                    );
+                    return Ok(cached);
+                }
             }
-            let has_ws_balance = self.balance_cache.read().await.is_some();
-            if !positions.is_empty() || has_ws_balance {
-                return Ok(BalanceResponse {
-                    equity: Decimal::ZERO,
-                    balance: Decimal::ZERO,
-                    position_entry_price: None,
-                    position_sign: None,
-                });
-            }
-        } else {
-            let cache = self.balance_cache.read().await;
-            if let Some(balance) = cache.as_ref() {
-                return Ok(BalanceResponse {
-                    equity: balance.equity,
-                    balance: balance.balance,
-                    position_entry_price: balance.position_entry_price,
-                    position_sign: balance.position_sign,
-                });
-            }
+            log::info!(
+                "get_balance: WS snapshot did not arrive within {}s — falling back to REST",
+                WS_WARMUP_MAX.as_secs()
+            );
         }
 
         let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
@@ -4909,6 +4919,45 @@ impl LighterConnector {
     // REST pressure. 1h TTL keeps the data "fresh enough" while cutting the
     // periodic /funding-rates fetch 60x. See bot-strategy#128 follow-up.
     const STATS_CACHE_TTL_SECS: u64 = 3600;
+
+    /// Snapshot read of WS-fed balance/position caches for `get_balance`.
+    /// Returns `None` if the WS has not yet delivered an account update; the
+    /// caller then decides whether to wait (see bot-strategy#148) or fall
+    /// back to REST.
+    async fn try_read_cached_balance(
+        &self,
+        symbol: Option<&str>,
+    ) -> Option<BalanceResponse> {
+        if let Some(token_symbol) = symbol {
+            let positions = self.cached_positions.read().await;
+            if let Some(pos) = positions.iter().find(|p| p.symbol == token_symbol) {
+                return Some(BalanceResponse {
+                    equity: pos.size,
+                    balance: pos.size,
+                    position_entry_price: pos.entry_price,
+                    position_sign: Some(pos.sign),
+                });
+            }
+            let has_ws_balance = self.balance_cache.read().await.is_some();
+            if !positions.is_empty() || has_ws_balance {
+                return Some(BalanceResponse {
+                    equity: Decimal::ZERO,
+                    balance: Decimal::ZERO,
+                    position_entry_price: None,
+                    position_sign: None,
+                });
+            }
+            None
+        } else {
+            let cache = self.balance_cache.read().await;
+            cache.as_ref().map(|balance| BalanceResponse {
+                equity: balance.equity,
+                balance: balance.balance,
+                position_entry_price: balance.position_entry_price,
+                position_sign: balance.position_sign,
+            })
+        }
+    }
 
     #[allow(dead_code)]
     async fn get_exchange_stats_cached(&self) -> Result<LighterExchangeStats, DexError> {

@@ -126,6 +126,25 @@ pub fn cooldown_remaining() -> Option<Duration> {
     }
 }
 
+/// Startup-path variant of [`cooldown_remaining`]: if a cooldown is active,
+/// logs a single WARN tagged with `caller` and returns the remaining duration
+/// so the caller can `tokio::time::sleep(d).await` before issuing its first
+/// REST call. Returns `None` if no cooldown is active (fast path).
+///
+/// Unlike the pre-REST fail-fast path (see call sites in `lighter_connector`),
+/// this is meant to be used at process startup or other entry-points where the
+/// right behavior is to *wait out* an inherited cooldown rather than surface
+/// it as an error. See bot-strategy#148.
+pub fn pending_cooldown_wait(caller: &str) -> Option<Duration> {
+    let remaining = cooldown_remaining()?;
+    log::warn!(
+        "[Lighter rate-limit] waiting out active cooldown before {}: {}s remaining (deadline inherited from prior process or call)",
+        caller,
+        remaining.as_secs()
+    );
+    Some(remaining)
+}
+
 /// Pick a jittered cooldown length in `[COOLDOWN_MIN_SECS, COOLDOWN_MAX_SECS]`.
 ///
 /// Uses nanosecond entropy from the system clock so we don't pull in a `rand`
@@ -315,6 +334,23 @@ mod tests {
         // Simulate expiry by writing a past deadline.
         write_deadline(now_unix() - 1);
         assert!(cooldown_remaining().is_none());
+        clear();
+    }
+
+    #[test]
+    fn pending_cooldown_wait_returns_none_when_clear() {
+        let _g = FILE_LOCK.lock().unwrap();
+        clear();
+        assert!(pending_cooldown_wait("test").is_none());
+    }
+
+    #[test]
+    fn pending_cooldown_wait_returns_remaining_when_active() {
+        let _g = FILE_LOCK.lock().unwrap();
+        clear();
+        write_deadline(now_unix() + 42);
+        let remaining = pending_cooldown_wait("test").expect("cooldown should be active");
+        assert!(remaining.as_secs() >= 41 && remaining.as_secs() <= 42);
         clear();
     }
 
