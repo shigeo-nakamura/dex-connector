@@ -309,16 +309,6 @@ static MARKET_CACHE_INIT_LOCK: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> 
 static CACHED_EXCHANGE_STATS: std::sync::LazyLock<
     Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
 > = std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
-static CACHED_FUNDING_RATES: std::sync::LazyLock<
-    Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
-> = std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
-/// Serialize `/funding-rates` refetch across all connector instances in the
-/// process. Without this, A/B/C strategies reaching the TTL expiry within the
-/// same tokio tick each fire a REST (thundering herd) — observed as paired
-/// 429s that engaged the WAF cooldown twice. See bot-strategy#150.
-static CACHED_FUNDING_RATES_FETCH_LOCK: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
-
 /// Track and log API calls for rate limit monitoring
 fn track_api_call(endpoint: &str, method: &str) {
     let call_count = API_CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
@@ -404,11 +394,15 @@ pub struct LighterConnector {
     nonce_cache: Arc<tokio::sync::Mutex<Option<NonceCache>>>,
     nonce_cache_ttl: Duration,
     ob_stale_after: Duration,
-    // Cached exchange stats / funding rates to reduce REST API calls
+    // Cached exchange stats to reduce REST API calls
     cached_exchange_stats: Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
-    cached_funding_rates: Arc<RwLock<Option<(LighterFundingRates, Instant)>>>,
-    // Single-flight lock for funding-rates refetch (see #150)
-    cached_funding_rates_fetch_lock: Arc<tokio::sync::Mutex<()>>,
+    // Per-market funding rate fed by the `market_stats/{market_id}` WS channel
+    // (bot-strategy#162). Key: market_id. Value: the `funding_rate` field of
+    // the WS payload (the rate at the most recent funding settlement — same
+    // semantics the strategy consumed from `/funding-rates` REST previously).
+    // Cold-start is an empty map; callers handle the missing-entry case by
+    // falling back to `None`, which matches the prior REST error path.
+    funding_rate_cache: Arc<RwLock<HashMap<u32, Decimal>>>,
     // Broadcast sender for real-time price updates from WS OB changes
     price_update_tx: tokio::sync::broadcast::Sender<crate::PriceUpdate>,
     // Host-shared weight-based rate limiter (bot-strategy#79). Routes every
@@ -1721,8 +1715,7 @@ impl LighterConnector {
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
             cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
-            cached_funding_rates: Arc::clone(&CACHED_FUNDING_RATES),
-            cached_funding_rates_fetch_lock: Arc::clone(&CACHED_FUNDING_RATES_FETCH_LOCK),
+            funding_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
@@ -1783,8 +1776,7 @@ impl LighterConnector {
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
             cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
-            cached_funding_rates: Arc::clone(&CACHED_FUNDING_RATES),
-            cached_funding_rates_fetch_lock: Arc::clone(&CACHED_FUNDING_RATES_FETCH_LOCK),
+            funding_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
@@ -3349,7 +3341,18 @@ impl DexConnector for LighterConnector {
         // cuts a chunk of the periodic 429 trigger. See bot-strategy#128
         // follow-up.
         let stats_data: Option<LighterExchangeStats> = None;
-        let funding_data = self.get_funding_rates_cached().await.ok();
+        // Funding rate is fed by the `market_stats/{market_id}` WS channel
+        // (bot-strategy#162). Cold-start before the first WS push returns None,
+        // matching the prior REST error-path fallback. The switch also moves
+        // us from the accidental binance rate (first `.find()` hit in the REST
+        // list) to Lighter's own rate — behavior change is immaterial under
+        // production config (`funding_entry_z_scale=0`, `net_funding_min_per_hour=-0.01`).
+        let funding_rate_from_ws = self
+            .funding_rate_cache
+            .read()
+            .await
+            .get(&market_info.market_id)
+            .copied();
 
         // Try to get price from WebSocket first, but check if it's recent
         if let Some((ws_price, price_timestamp)) = self
@@ -3396,15 +3399,7 @@ impl DexConnector for LighterConnector {
                     (Some(Decimal::ZERO), None)
                 };
 
-                let funding_rate = if let Some(funding) = &funding_data {
-                    funding
-                        .funding_rates
-                        .iter()
-                        .find(|f| normalize_symbol(&f.symbol) == canonical_symbol)
-                        .and_then(|f| Decimal::from_f64_retain(f.rate))
-                } else {
-                    None
-                };
+                let funding_rate = funding_rate_from_ws;
 
                 log::trace!(
                     "Using WebSocket price with API stats: price={}, volume={:?}, trades={:?}",
@@ -3479,16 +3474,8 @@ impl DexConnector for LighterConnector {
 
         let min_tick = Self::calculate_min_tick(price, market_info.price_decimals, false);
 
-        // Get funding rate
-        let funding_rate = if let Some(funding) = &funding_data {
-            funding
-                .funding_rates
-                .iter()
-                .find(|f| normalize_symbol(&f.symbol) == canonical_symbol)
-                .and_then(|f| Decimal::from_f64_retain(f.rate))
-        } else {
-            None
-        };
+        // Funding rate comes from the WS cache populated by market_stats.
+        let funding_rate = funding_rate_from_ws;
 
         // Use stats data if available, otherwise fallback to trades data
         let (volume, num_trades) = if let Some(stats) = &stats_data {
@@ -5090,44 +5077,6 @@ impl LighterConnector {
         Ok(stats)
     }
 
-    async fn get_funding_rates_cached(&self) -> Result<LighterFundingRates, DexError> {
-        // Fast path: a fresh entry in the shared cache is returned without
-        // touching the fetch lock, so steady-state reads don't serialize.
-        {
-            let cache = self.cached_funding_rates.read().await;
-            if let Some((rates, ts)) = &*cache {
-                if ts.elapsed() < Duration::from_secs(Self::STATS_CACHE_TTL_SECS) {
-                    return Ok(rates.clone());
-                }
-            }
-        }
-
-        // Slow path: serialize the refetch across all connector instances in
-        // the process. Without this, A/B/C strategies reaching TTL expiry
-        // within the same tokio tick each fire a REST — a cache stampede that
-        // burned the WAF weight budget and engaged the cooldown twice on the
-        // same burst (bot-strategy#150, observed 2026-04-22 14:19:25 +0100).
-        let _refill = self.cached_funding_rates_fetch_lock.lock().await;
-
-        // Re-check after acquiring the lock: a sibling refill that completed
-        // while we were queued should be reused rather than re-fetched.
-        {
-            let cache = self.cached_funding_rates.read().await;
-            if let Some((rates, ts)) = &*cache {
-                if ts.elapsed() < Duration::from_secs(Self::STATS_CACHE_TTL_SECS) {
-                    return Ok(rates.clone());
-                }
-            }
-        }
-
-        let rates = self.get_funding_rates().await?;
-        {
-            let mut cache = self.cached_funding_rates.write().await;
-            *cache = Some((rates.clone(), Instant::now()));
-        }
-        Ok(rates)
-    }
-
     #[allow(dead_code)]
     async fn get_exchange_stats(&self) -> Result<LighterExchangeStats, DexError> {
         let url = format!("{}/api/v1/exchangeStats", self.base_url);
@@ -5206,6 +5155,7 @@ impl LighterConnector {
         let cached_open_orders = self.cached_open_orders.clone();
         let positions_ready = self.positions_ready.clone();
         let balance_cache = self.balance_cache.clone();
+        let funding_rate_cache = self.funding_rate_cache.clone();
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
@@ -5481,6 +5431,29 @@ impl LighterConnector {
                             {
                                 log::error!(
                                     "Failed to send orderbook subscription for {}: {}",
+                                    market_id,
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Subscribe to market_stats for every tracked market so the
+                        // funding_rate field arrives over WS and get_ticker no longer
+                        // needs the `/funding-rates` REST poll. See bot-strategy#162.
+                        for market_id in &orderbook_market_ids {
+                            let subscribe_market_stats = serde_json::json!({
+                                "type": "subscribe",
+                                "channel": format!("market_stats/{}", market_id)
+                            });
+                            if let Err(e) = ws_stream
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    subscribe_market_stats.to_string(),
+                                ))
+                                .await
+                            {
+                                log::error!(
+                                    "Failed to send market_stats subscription for {}: {}",
                                     market_id,
                                     e
                                 );
@@ -5765,6 +5738,7 @@ impl LighterConnector {
                                                 &cached_positions,
                                                 &positions_ready,
                                                 &balance_cache,
+                                                &funding_rate_cache,
                                                 account_index,
                                                 &market_cache,
                                                 default_symbol.as_str(),
@@ -6080,6 +6054,7 @@ impl LighterConnector {
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
+        funding_rate_cache: &Arc<RwLock<HashMap<u32, Decimal>>>,
         account_index: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -6275,6 +6250,9 @@ impl LighterConnector {
                     }
                 }
             }
+            "subscribed/market_stats" | "update/market_stats" => {
+                Self::handle_market_stats_update(&message, funding_rate_cache).await;
+            }
             "subscribed/account_all" | "update/account_all" => {
                 log::trace!(
                     "Received account message: type={}, message={:?}",
@@ -6300,6 +6278,68 @@ impl LighterConnector {
             }
             _ => {
                 log::trace!("Unhandled WebSocket message type: {}", msg_type);
+            }
+        }
+    }
+
+    /// Extract the per-market funding rate from a `market_stats/{id}` push and
+    /// store it in the shared cache. Lighter's payload carries both
+    /// `funding_rate` (realized at the most recent funding_timestamp) and
+    /// `current_funding_rate` (running estimate for the next payment); we keep
+    /// the realized value to match what `/funding-rates` REST exposed and what
+    /// the strategy is calibrated against. See bot-strategy#162.
+    async fn handle_market_stats_update(
+        message: &Value,
+        funding_rate_cache: &Arc<RwLock<HashMap<u32, Decimal>>>,
+    ) {
+        let channel = message
+            .get("channel")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        // The server accepts `market_stats/<id>` on subscribe but delivers
+        // `market_stats:<id>` on the push, matching the order_book pattern.
+        let market_id = channel
+            .rsplit(|c| c == '/' || c == ':')
+            .next()
+            .and_then(|id| id.parse::<u32>().ok());
+        let Some(market_id) = market_id else {
+            log::warn!(
+                "[WS] market_stats update missing market_id (channel='{}'); skipping",
+                channel
+            );
+            return;
+        };
+        let rate_str = message
+            .get("market_stats")
+            .and_then(|s| s.get("funding_rate"))
+            .and_then(|v| v.as_str());
+        let Some(rate_str) = rate_str else {
+            log::trace!(
+                "[WS] market_stats for market_id={} has no funding_rate field (channel='{}')",
+                market_id,
+                channel
+            );
+            return;
+        };
+        match string_to_decimal(Some(rate_str.to_string())) {
+            Ok(rate) => {
+                funding_rate_cache
+                    .write()
+                    .await
+                    .insert(market_id, rate);
+                log::trace!(
+                    "[WS_FUNDING] market_id={} funding_rate={}",
+                    market_id,
+                    rate
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[WS] failed to parse funding_rate='{}' for market_id={}: {}",
+                    rate_str,
+                    market_id,
+                    e
+                );
             }
         }
     }
@@ -7029,5 +7069,106 @@ mod tests {
             balance_cache.read().await.is_none(),
             "WS fill must invalidate balance_cache so the next get_balance fetches fresh equity"
         );
+    }
+
+    // bot-strategy#162: a `market_stats` WS push with a `funding_rate` field
+    // must populate the per-market cache keyed by the market_id parsed out of
+    // the channel string. Both delimiter shapes the server uses (`/` on
+    // subscribe, `:` on push) must resolve to the same market_id.
+    #[tokio::test]
+    async fn market_stats_push_populates_funding_rate_cache() {
+        use serde_json::json;
+        use std::str::FromStr;
+
+        let cache: Arc<RwLock<HashMap<u32, Decimal>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let push_with_colon = json!({
+            "channel": "market_stats:1",
+            "type": "update/market_stats",
+            "market_stats": {
+                "symbol": "BTC",
+                "market_id": 1,
+                "current_funding_rate": "-0.0032",
+                "funding_rate": "-0.0017",
+                "funding_timestamp": 1776967200000u64
+            }
+        });
+        LighterConnector::handle_market_stats_update(&push_with_colon, &cache).await;
+        assert_eq!(
+            cache.read().await.get(&1).copied(),
+            Some(Decimal::from_str("-0.0017").unwrap()),
+            "push with ':' delimiter must store the realized funding_rate"
+        );
+
+        let sub_with_slash = json!({
+            "channel": "market_stats/2",
+            "type": "subscribed/market_stats",
+            "market_stats": {
+                "symbol": "ETH",
+                "market_id": 2,
+                "funding_rate": "0.00001"
+            }
+        });
+        LighterConnector::handle_market_stats_update(&sub_with_slash, &cache).await;
+        assert_eq!(
+            cache.read().await.get(&2).copied(),
+            Some(Decimal::from_str("0.00001").unwrap()),
+            "subscribed push with '/' delimiter must also resolve and cache"
+        );
+
+        // A later push for market_id=1 must overwrite (most recent wins).
+        let overwrite = json!({
+            "channel": "market_stats:1",
+            "type": "update/market_stats",
+            "market_stats": {
+                "symbol": "BTC",
+                "market_id": 1,
+                "funding_rate": "0.00005"
+            }
+        });
+        LighterConnector::handle_market_stats_update(&overwrite, &cache).await;
+        assert_eq!(
+            cache.read().await.get(&1).copied(),
+            Some(Decimal::from_str("0.00005").unwrap()),
+            "later push must replace the stored value"
+        );
+    }
+
+    // bot-strategy#162: malformed / partial pushes must not poison the cache
+    // nor panic. A missing market_id or funding_rate field is skipped silently.
+    #[tokio::test]
+    async fn market_stats_missing_fields_are_skipped() {
+        use serde_json::json;
+
+        let cache: Arc<RwLock<HashMap<u32, Decimal>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Channel without a parseable trailing id.
+        let bad_channel = json!({
+            "channel": "market_stats/",
+            "type": "update/market_stats",
+            "market_stats": {"funding_rate": "0.001"}
+        });
+        LighterConnector::handle_market_stats_update(&bad_channel, &cache).await;
+        assert!(cache.read().await.is_empty(), "bad channel must not populate");
+
+        // Payload missing funding_rate entirely.
+        let missing_rate = json!({
+            "channel": "market_stats:3",
+            "type": "update/market_stats",
+            "market_stats": {"symbol": "SOL", "market_id": 3}
+        });
+        LighterConnector::handle_market_stats_update(&missing_rate, &cache).await;
+        assert!(cache.read().await.is_empty(), "missing funding_rate must not populate");
+
+        // Unparseable rate string.
+        let bad_rate = json!({
+            "channel": "market_stats:4",
+            "type": "update/market_stats",
+            "market_stats": {"funding_rate": "not-a-number"}
+        });
+        LighterConnector::handle_market_stats_update(&bad_rate, &cache).await;
+        assert!(cache.read().await.is_empty(), "bad rate must not populate");
     }
 }
