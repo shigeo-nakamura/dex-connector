@@ -1198,6 +1198,24 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[test]
+    fn normalize_symbol_strips_usd_suffix() {
+        assert_eq!(normalize_symbol("BTC-USD"), "BTC");
+        assert_eq!(normalize_symbol("ETH-USDT"), "ETH");
+    }
+
+    #[test]
+    fn normalize_symbol_passes_bare_token_through() {
+        assert_eq!(normalize_symbol("BTC"), "BTC");
+        assert_eq!(normalize_symbol("SOL"), "SOL");
+    }
+
+    #[test]
+    fn normalize_symbol_handles_multi_dash() {
+        // Prefix before first '-' wins; first segment is the base.
+        assert_eq!(normalize_symbol("CRCL_24_5-USD"), "CRCL_24_5");
+    }
+
     fn dec(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
     }
@@ -1833,7 +1851,9 @@ async fn stream_account(
                 let mut cache = open_orders_cache.write().await;
                 cache.clear();
                 for order in orders {
-                    let entry = cache.entry(order.market.clone()).or_default();
+                    let entry = cache
+                        .entry(normalize_symbol(&order.market))
+                        .or_default();
                     entry.push(OpenOrder {
                         order_id: order.external_id.clone(),
                         symbol: order.market.clone(),
@@ -1863,7 +1883,9 @@ async fn stream_account(
                 }
                 let mut cache = filled_orders.write().await;
                 for (trade, order_id) in mapped_trades {
-                    let entry = cache.entry(trade.market.clone()).or_default();
+                    let entry = cache
+                        .entry(normalize_symbol(&trade.market))
+                        .or_default();
                     entry.push(FilledOrder {
                         order_id,
                         is_rejected: false,
@@ -1899,6 +1921,20 @@ async fn stream_account(
     Ok(())
 }
 
+/// Normalize a market name or bare token to the bare-symbol key used
+/// in all WS caches. Extended's REST and WS surfaces use the market
+/// name ("BTC-USD") while callers across pairtrade/slow-mm pass the
+/// bare token ("BTC"). Keying caches by the market name caused
+/// `get_filled_orders("BTC")` to miss every WS-streamed fill
+/// (bot-strategy#179, observed 2026-04-23 Tokyo) because they were
+/// stored under "BTC-USD".
+fn normalize_symbol(market_or_symbol: &str) -> String {
+    match market_or_symbol.split_once('-') {
+        Some((base, _)) => base.to_string(),
+        None => market_or_symbol.to_string(),
+    }
+}
+
 fn position_snapshot_from_model(position: PositionModel) -> Option<PositionSnapshot> {
     if let Some(status) = position.status.as_ref() {
         if status != "OPENED" {
@@ -1918,7 +1954,7 @@ fn position_snapshot_from_model(position: PositionModel) -> Option<PositionSnaps
         return None;
     }
     Some(PositionSnapshot {
-        symbol: position.market,
+        symbol: normalize_symbol(&position.market),
         size,
         sign,
         entry_price: position.open_price,
@@ -2314,22 +2350,23 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+        let key = normalize_symbol(symbol);
         if self.websocket_url.is_some() {
             let cache = self.filled_orders.read().await;
-            if let Some(orders) = cache.get(symbol) {
+            if let Some(orders) = cache.get(&key) {
                 return Ok(FilledOrdersResponse {
                     orders: orders.clone(),
                 });
             }
             log::debug!(
                 "[filled_orders][extended] cache miss for {}; falling back to REST",
-                symbol
+                key
             );
         }
 
         let orders = self.fetch_filled_orders_via_http(symbol).await?;
         let mut cache = self.filled_orders.write().await;
-        cache.insert(symbol.to_string(), orders.clone());
+        cache.insert(key, orders.clone());
         Ok(FilledOrdersResponse { orders })
     }
 
@@ -2350,14 +2387,15 @@ impl DexConnector for ExtendedConnector {
             .collect::<Vec<_>>();
 
         let mut cache = self.canceled_orders.write().await;
-        cache.insert(symbol.to_string(), orders.clone());
+        cache.insert(normalize_symbol(symbol), orders.clone());
         Ok(CanceledOrdersResponse { orders })
     }
 
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+        let key = normalize_symbol(symbol);
         let orders = if self.websocket_url.is_some() {
             let cache = self.open_orders_cache.read().await;
-            cache.get(symbol).cloned().unwrap_or_else(|| Vec::new())
+            cache.get(&key).cloned().unwrap_or_else(|| Vec::new())
         } else {
             let market_name = self.get_market(symbol).await?.name;
             let path = build_query(
@@ -2498,9 +2536,10 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
+        let key = normalize_symbol(symbol);
         if self.websocket_url.is_some() {
             let cache = self.last_trades.read().await;
-            let trades = cache.get(symbol).cloned().ok_or_else(|| {
+            let trades = cache.get(&key).cloned().ok_or_else(|| {
                 DexError::Other("last trades unavailable: waiting for websocket data".to_string())
             })?;
             Ok(LastTradesResponse { trades })
@@ -2525,7 +2564,7 @@ impl DexConnector for ExtendedConnector {
                 .collect::<Vec<_>>();
 
             let mut cache = self.last_trades.write().await;
-            cache.insert(symbol.to_string(), last_trades.clone());
+            cache.insert(normalize_symbol(symbol), last_trades.clone());
             Ok(LastTradesResponse {
                 trades: last_trades,
             })
@@ -2576,8 +2615,9 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn clear_filled_order(&self, symbol: &str, trade_id: &str) -> Result<(), DexError> {
+        let key = normalize_symbol(symbol);
         let mut filled_orders = self.filled_orders.write().await;
-        if let Some(orders) = filled_orders.get_mut(symbol) {
+        if let Some(orders) = filled_orders.get_mut(&key) {
             let initial_len = orders.len();
             orders.retain(|order| order.trade_id != trade_id);
             if orders.len() < initial_len {
