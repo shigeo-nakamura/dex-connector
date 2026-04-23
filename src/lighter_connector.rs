@@ -3602,6 +3602,17 @@ impl DexConnector for LighterConnector {
 
         let mut attempt: usize = 0;
         let (status, response_text) = loop {
+            // Gate through the shared 60s/60000-weight bucket before each
+            // attempt. Wait policy with a short cap — headroom is huge in
+            // normal ops so this rarely blocks, but it keeps the sidecar's
+            // view of outbound traffic complete and paces bursts. The retry
+            // below still handles Lighter's short-window throttle that the
+            // sidecar does not model. See bot-strategy#167.
+            self.acquire_rest_budget(
+                &endpoint,
+                crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 1_000 },
+            )
+            .await?;
             track_api_call(&endpoint, "GET");
             let response = self
                 .client
