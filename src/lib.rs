@@ -89,6 +89,14 @@ pub struct FilledOrder {
     pub filled_size: Option<Decimal>,
     pub filled_value: Option<Decimal>,
     pub filled_fee: Option<Decimal>,
+    /// Exchange-reported fill time in Unix epoch milliseconds. Enables
+    /// callers to detect "pre-reconcile" fills (WS delivered late after
+    /// a REST position reconcile already absorbed the state change)
+    /// and silently dedupe them instead of double-counting. See
+    /// bot-strategy#190. Extended populates this from the trade stream's
+    /// `created_time`; Lighter / Hyperliquid leave `None` as their WS
+    /// fill events do not surface a reliable fill timestamp.
+    pub filled_ts_ms: Option<i64>,
 }
 
 #[derive(Deserialize, Debug, Default)]

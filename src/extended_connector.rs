@@ -2112,6 +2112,7 @@ async fn stream_account(
                         filled_size: Some(trade.qty),
                         filled_value: Some(trade.value),
                         filled_fee: Some(trade.fee),
+                        filled_ts_ms: Some(trade.created_time),
                     });
                 }
             }
@@ -2312,6 +2313,7 @@ impl ExtendedConnector {
                     filled_size: Some(trade.qty),
                     filled_value: Some(trade.value),
                     filled_fee: Some(trade.fee),
+                    filled_ts_ms: Some(trade.created_time),
                 }
             })
             .collect::<Vec<_>>();

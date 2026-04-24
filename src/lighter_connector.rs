@@ -6576,6 +6576,7 @@ impl LighterConnector {
                                     filled_size: Some(size),
                                     filled_value: Some(size * price),
                                     filled_fee: None,
+                                    filled_ts_ms: None,
                                 };
 
                                 pending_inserts.push((market_symbol.clone(), filled_order));
@@ -6718,6 +6719,7 @@ impl LighterConnector {
             filled_size: Some(filled_size),
             filled_value,
             filled_fee: None,
+            filled_ts_ms: None,
         })
     }
 

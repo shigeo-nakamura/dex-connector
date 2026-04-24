@@ -1583,6 +1583,7 @@ impl DexConnector for HyperliquidConnector {
                 filled_size: Some(order.filled_size),
                 filled_fee: Some(order.filled_fee),
                 filled_value: Some(order.filled_value),
+                filled_ts_ms: None,
             };
             response.push(filled_order);
         }
