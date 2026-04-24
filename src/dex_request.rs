@@ -10,6 +10,7 @@ use std::{
     fmt::{self, Display},
 };
 
+#[derive(Clone, Copy)]
 pub enum HttpMethod {
     Get,
     Post,
@@ -153,7 +154,7 @@ impl DexRequest {
         if !status.is_success() {
             let error_message =
                 format!("Server returned error: {}. requested url: {}", status, url);
-            log::error!("{}", &error_message);
+            log::warn!("{}", &error_message);
         }
 
         let response_headers = response.headers().clone();
@@ -161,7 +162,7 @@ impl DexRequest {
 
         let response_body = response.text().await.map_err(DexError::from)?;
         if !status.is_success() {
-            log::error!("Response body (non-success): {}", response_body);
+            log::warn!("Response body (non-success): {}", response_body);
         } else {
             log::trace!("Response body: {}", response_body);
         }

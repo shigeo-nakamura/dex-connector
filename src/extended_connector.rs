@@ -272,29 +272,91 @@ impl ExtendedApi {
             None => String::new(),
         };
 
-        let response: WrappedApiResponse<T> = self
-            .request
-            .handle_request::<WrappedApiResponse<T>, serde_json::Value>(
-                method,
-                path,
-                &headers,
-                json_payload,
-            )
-            .await?;
+        // Retry transient Extended 5xx (code 1006 "Internal Server Error") and
+        // transport-level errors only for idempotent GETs. Extended's REST
+        // sporadically returns 500 and typically recovers within a few seconds
+        // (see bot-strategy#206). Non-GET verbs are never retried to avoid
+        // double-execution of state-changing operations.
+        let max_attempts: u32 = if matches!(method, HttpMethod::Get) {
+            3
+        } else {
+            1
+        };
 
-        if response.status != ResponseStatus::Ok || response.error.is_some() {
-            let message = response
-                .error
-                .as_ref()
-                .map(|err| err.message.clone())
-                .unwrap_or_else(|| "Extended API error".to_string());
-            return Err(DexError::ServerResponse(message));
+        for attempt in 1..=max_attempts {
+            let response_result: Result<WrappedApiResponse<T>, DexError> = self
+                .request
+                .handle_request::<WrappedApiResponse<T>, serde_json::Value>(
+                    method,
+                    path.clone(),
+                    &headers,
+                    json_payload.clone(),
+                )
+                .await;
+
+            let response = match response_result {
+                Ok(r) => r,
+                Err(ref e) if attempt < max_attempts && is_transient_transport_err(e) => {
+                    let backoff_ms = 500u64 * (1u64 << (attempt - 1));
+                    log::warn!(
+                        "[extended] transport retry {}/{} ({}ms) on {}: {}",
+                        attempt,
+                        max_attempts,
+                        backoff_ms,
+                        path,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            if response.status != ResponseStatus::Ok || response.error.is_some() {
+                let code = response.error.as_ref().map(|err| err.code).unwrap_or(0);
+                let message = response
+                    .error
+                    .as_ref()
+                    .map(|err| err.message.clone())
+                    .unwrap_or_else(|| "Extended API error".to_string());
+                if attempt < max_attempts && is_transient_api_code(code) {
+                    let backoff_ms = 500u64 * (1u64 << (attempt - 1));
+                    log::warn!(
+                        "[extended] api retry {}/{} ({}ms) on {} (code={}): {}",
+                        attempt,
+                        max_attempts,
+                        backoff_ms,
+                        path,
+                        code,
+                        message
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                return Err(DexError::ServerResponse(message));
+            }
+
+            return response
+                .data
+                .ok_or_else(|| DexError::Other("Extended API returned empty data".to_string()));
         }
-
-        response
-            .data
-            .ok_or_else(|| DexError::Other("Extended API returned empty data".to_string()))
+        unreachable!("extended send retry loop exited without Ok/Err")
     }
+}
+
+/// Transport-level failures that may succeed on retry (connection reset,
+/// DNS hiccup, TLS handshake blip). Reqwest groups all of these under
+/// `DexError::Reqwest`.
+fn is_transient_transport_err(err: &DexError) -> bool {
+    matches!(err, DexError::Reqwest(_))
+}
+
+/// Extended API error codes that map to HTTP 5xx and are safe to retry.
+/// Keep this list minimal — only codes we've observed resolve on retry.
+fn is_transient_api_code(code: i64) -> bool {
+    // 1006 = "Internal Server Error" (Extended's HTTP 500 envelope). Matches
+    // what production saw on 2026-04-24 during the bot-strategy#207 window.
+    code == 1006
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
