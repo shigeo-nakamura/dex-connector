@@ -2430,6 +2430,51 @@ impl ExtendedConnector {
 }
 
 impl ExtendedConnector {
+    /// Fetch recent order history via REST and seed `order_id_map`.
+    /// Best-effort: failures are logged and ignored so startup isn't
+    /// blocked by a transient Extended 5xx. bot-strategy#206.
+    async fn bootstrap_order_id_map(&self) -> Result<(), DexError> {
+        for symbol in self.tracked_symbols.iter() {
+            let market_name = match self.get_market(symbol).await {
+                Ok(m) => m.name,
+                Err(e) => {
+                    log::warn!(
+                        "[order_id_map][extended] get_market({}) failed during bootstrap: {:?}",
+                        symbol,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let path = build_query(
+                "/user/orders/history",
+                vec![("market".to_string(), market_name.clone())],
+            );
+            let history: Vec<OpenOrderModel> = match self.api.get(path, true).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "[order_id_map][extended] /user/orders/history({}) failed: {:?}",
+                        market_name,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let seeded = history.len();
+            let mut map = self.order_id_map.write().await;
+            for order in history {
+                map.insert(order.id, order.external_id.clone());
+            }
+            log::info!(
+                "[order_id_map][extended] bootstrap seeded {} entries for {}",
+                seeded,
+                market_name
+            );
+        }
+        Ok(())
+    }
+
     /// Evaluate the env-var-declared maintenance windows against `now` using
     /// the same upcoming+active semantics as Hyperliquid/Lighter. The active
     /// grace is fixed at `EXTENDED_MAINTENANCE_ACTIVE_GRACE_MINS`; the window's
@@ -2586,51 +2631,6 @@ impl DexConnector for ExtendedConnector {
             log::warn!(
                 "[order_id_map][extended] bootstrap failed: {:?} — continuing without pre-populated map",
                 e
-            );
-        }
-        Ok(())
-    }
-
-    /// Fetch recent order history via REST and seed \`order_id_map\`.
-    /// Best-effort: failures are logged and ignored so startup isn't
-    /// blocked by a transient Extended 5xx. bot-strategy#206.
-    async fn bootstrap_order_id_map(&self) -> Result<(), DexError> {
-        for symbol in self.tracked_symbols.iter() {
-            let market_name = match self.get_market(symbol).await {
-                Ok(m) => m.name,
-                Err(e) => {
-                    log::warn!(
-                        "[order_id_map][extended] get_market({}) failed during bootstrap: {:?}",
-                        symbol,
-                        e
-                    );
-                    continue;
-                }
-            };
-            let path = build_query(
-                "/user/orders/history",
-                vec![("market".to_string(), market_name.clone())],
-            );
-            let history: Vec<OpenOrderModel> = match self.api.get(path, true).await {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!(
-                        "[order_id_map][extended] /user/orders/history({}) failed: {:?}",
-                        market_name,
-                        e
-                    );
-                    continue;
-                }
-            };
-            let seeded = history.len();
-            let mut map = self.order_id_map.write().await;
-            for order in history {
-                map.insert(order.id, order.external_id.clone());
-            }
-            log::info!(
-                "[order_id_map][extended] bootstrap seeded {} entries for {}",
-                seeded,
-                market_name
             );
         }
         Ok(())
