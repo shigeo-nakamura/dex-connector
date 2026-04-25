@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     error::Error as StdError,
     fmt::{self, Display},
+    time::Duration,
 };
 
 #[derive(Clone, Copy)]
@@ -105,9 +106,17 @@ impl From<reqwest::Error> for DexError {
 
 impl DexRequest {
     pub async fn new(endpoint: String) -> Result<Self, DexError> {
+        // Bound REST calls so a hung server can't stall callers indefinitely.
+        // Mirrors the Lighter pattern (see lighter_connector.rs builder, 5s
+        // connect + 15s overall). Combined with extended_connector.rs's send
+        // retry (3 attempts, 500/1000/2000ms backoff) the worst-case is
+        // ~50s before bubbling up; well below the 167-min stuck event from
+        // the bot-strategy#102 P2 incident.
         let client = Client::builder()
             .cookie_store(true)
             .user_agent("debot/1.0")
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
             .build()?;
 
         Ok(DexRequest { client, endpoint })
