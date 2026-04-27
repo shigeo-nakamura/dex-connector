@@ -383,6 +383,14 @@ pub struct LighterConnector {
     // (response, fetched_at) — Instant so we can expire entries beyond the
     // BALANCE_CACHE_TTL_SECS window. See bot-strategy#155.
     balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
+    // Latest known `assets[USDC].margin_balance` (the perp sub-account
+    // collateral). Seeded from REST `/account` and from the initial
+    // `subscribed/account_all` WS snapshot, then combined with the live
+    // `positions[*].unrealized_pnl` from `update/account_all` to derive a
+    // mark-to-market equity without further REST calls. Invalidated by
+    // WS-fill (see balance_cache invalidation) so the next REST refresh
+    // reseeds it. See bot-strategy#239.
+    cached_collateral: Arc<RwLock<Option<Decimal>>>,
     // Connection epoch counter for race detection
     connection_epoch: Arc<AtomicU64>,
     // Market metadata cache for symbol↔market_id resolution
@@ -465,6 +473,8 @@ struct LighterAsset {
     asset_id: u32,
     balance: String,
     locked_balance: String,
+    #[serde(default)]
+    margin_balance: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -476,6 +486,8 @@ struct LighterPosition {
     sign: i8,
     open_order_count: u32,
     avg_entry_price: String,
+    #[serde(default)]
+    unrealized_pnl: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1706,6 +1718,7 @@ impl LighterConnector {
             cached_positions: Arc::new(RwLock::new(Vec::new())),
             positions_ready: Arc::new(AtomicBool::new(false)),
             balance_cache: Arc::new(RwLock::new(None)),
+            cached_collateral: Arc::new(RwLock::new(None)),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::clone(&MARKET_CACHE),
@@ -1768,6 +1781,7 @@ impl LighterConnector {
             cached_positions: Arc::new(RwLock::new(Vec::new())),
             positions_ready: Arc::new(AtomicBool::new(false)),
             balance_cache: Arc::new(RwLock::new(None)),
+            cached_collateral: Arc::new(RwLock::new(None)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::clone(&MARKET_CACHE),
             market_cache_init_lock: Arc::clone(&MARKET_CACHE_INIT_LOCK),
@@ -3750,6 +3764,21 @@ impl DexConnector for LighterConnector {
             *cache = Some((response.clone(), Instant::now()));
         }
 
+        // Seed cached_collateral from REST so subsequent WS-only updates can
+        // recompute equity = collateral + sum(unrealized_pnl) without another
+        // REST. Use assets[USDC].margin_balance from the response when
+        // present; this matches `total_asset_value` minus
+        // sum(positions.unrealized_pnl). See bot-strategy#239.
+        if let Some(usdc) = account
+            .assets
+            .iter()
+            .find(|a| a.symbol == "USDC")
+            .and_then(|a| string_to_decimal(Some(a.margin_balance.clone())).ok())
+        {
+            let mut collateral = self.cached_collateral.write().await;
+            *collateral = Some(usdc);
+        }
+
         Ok(response)
     }
 
@@ -5170,6 +5199,7 @@ impl LighterConnector {
         let cached_open_orders = self.cached_open_orders.clone();
         let positions_ready = self.positions_ready.clone();
         let balance_cache = self.balance_cache.clone();
+        let cached_collateral = self.cached_collateral.clone();
         let funding_rate_cache = self.funding_rate_cache.clone();
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
@@ -5753,6 +5783,7 @@ impl LighterConnector {
                                                 &cached_positions,
                                                 &positions_ready,
                                                 &balance_cache,
+                                                &cached_collateral,
                                                 &funding_rate_cache,
                                                 account_index,
                                                 &market_cache,
@@ -6069,6 +6100,7 @@ impl LighterConnector {
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
+        cached_collateral: &Arc<RwLock<Option<Decimal>>>,
         funding_rate_cache: &Arc<RwLock<HashMap<u32, Decimal>>>,
         account_index: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
@@ -6285,6 +6317,7 @@ impl LighterConnector {
                     cached_positions,
                     positions_ready,
                     balance_cache,
+                    cached_collateral,
                     account_index as u64,
                     market_cache,
                     default_symbol,
@@ -6368,6 +6401,7 @@ impl LighterConnector {
         cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
         positions_ready: &Arc<AtomicBool>,
         balance_cache: &Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
+        cached_collateral: &Arc<RwLock<Option<Decimal>>>,
         account_id: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -6378,7 +6412,9 @@ impl LighterConnector {
             log::info!("[WS_ACCOUNT_DUMP] {}", data.to_string());
         }
 
-        // Handle positions update (can be array or object)
+        // Handle positions update (can be array or object). Track unrealized_pnl
+        // alongside the snapshot fields so we can re-derive perp equity from
+        // WS without hitting REST (bot-strategy#239).
         let positions_vals: Option<Vec<Value>> =
             if let Some(arr) = data.get("positions").and_then(|p| p.as_array()) {
                 Some(arr.clone())
@@ -6387,6 +6423,12 @@ impl LighterConnector {
             } else {
                 None
             };
+        // None when no positions field was carried in this message;
+        // Some(sum) — possibly zero — when the message did carry positions.
+        // The distinction matters: a missing positions field must NOT cause
+        // us to treat unrealized_pnl as 0 (which would corrupt the cached
+        // equity); a present-but-all-flat positions field correctly means 0.
+        let mut sum_unrealized_pnl: Option<Decimal> = None;
         if let Some(vals) = positions_vals {
             let allow_empty = msg_type == "subscribed/account_all";
             if vals.is_empty() && !allow_empty {
@@ -6396,8 +6438,12 @@ impl LighterConnector {
                 );
             } else {
                 let mut updates: Vec<(String, Option<PositionSnapshot>)> = Vec::new();
+                let mut acc = Decimal::ZERO;
                 for pos_val in vals {
                     if let Ok(position) = serde_json::from_value::<LighterPosition>(pos_val) {
+                        if let Ok(pnl) = Decimal::from_str(&position.unrealized_pnl) {
+                            acc += pnl;
+                        }
                         let size = match Decimal::from_str(&position.position) {
                             Ok(s) => s.abs(),
                             Err(_) => Decimal::ZERO,
@@ -6418,6 +6464,7 @@ impl LighterConnector {
                         ));
                     }
                 }
+                sum_unrealized_pnl = Some(acc);
                 if msg_type == "subscribed/account_all" {
                     let mut cache = cached_positions.write().await;
                     *cache = updates.into_iter().filter_map(|(_, snap)| snap).collect();
@@ -6445,19 +6492,62 @@ impl LighterConnector {
             }
         }
 
-        let balance_source = data.get("account").unwrap_or(data);
-        let total_asset_value = balance_source
+        // Equity derivation for perp sub-accounts (bot-strategy#239).
+        //
+        // Lighter does not publish `total_asset_value` / `available_balance`
+        // for perp sub-accounts on either snapshot or update messages
+        // (verified empirically; the original direct-field code below was
+        // dead for these accounts). The aggregate is reconstructible as
+        //   equity = assets[USDC].margin_balance + sum(positions.unrealized_pnl)
+        // matching REST `total_asset_value` to within rounding (~$0.002 on
+        // $1000 in measured fixtures).
+        //
+        // `subscribed/account_all` carries assets, so margin_balance gets
+        // refreshed on (re)subscribe and after fills (which trigger a REST
+        // refresh that reseeds cached_collateral). `update/account_all` ships
+        // `assets:null` but does carry positions, so we recompute equity
+        // from the latest unrealized_pnl combined with the previously cached
+        // collateral. Fall back to the legacy direct-totals path if Lighter
+        // ever populates them on the parent account or returns to the older
+        // schema.
+        let direct_total = data
             .get("total_asset_value")
             .and_then(Self::value_to_decimal);
-        let available_balance = balance_source
+        let direct_available = data
             .get("available_balance")
             .and_then(Self::value_to_decimal);
 
-        if total_asset_value.is_some() || available_balance.is_some() {
-            let equity = total_asset_value
-                .or(available_balance)
+        let usdc_margin_balance = data
+            .get("assets")
+            .and_then(|a| a.as_object())
+            .and_then(|map| {
+                map.values().find_map(|asset| {
+                    let symbol = asset.get("symbol").and_then(|s| s.as_str())?;
+                    if symbol != "USDC" {
+                        return None;
+                    }
+                    asset
+                        .get("margin_balance")
+                        .and_then(Self::value_to_decimal)
+                })
+            });
+        if let Some(mb) = usdc_margin_balance {
+            let mut collateral = cached_collateral.write().await;
+            *collateral = Some(mb);
+        }
+
+        let derived_equity = if let Some(pnl_sum) = sum_unrealized_pnl {
+            let collateral = cached_collateral.read().await;
+            collateral.map(|c| (c, c + pnl_sum))
+        } else {
+            None
+        };
+
+        if direct_total.is_some() || direct_available.is_some() {
+            let equity = direct_total
+                .or(direct_available)
                 .unwrap_or(Decimal::ZERO);
-            let balance = available_balance.or(total_asset_value).unwrap_or(equity);
+            let balance = direct_available.or(direct_total).unwrap_or(equity);
             let mut cache = balance_cache.write().await;
             *cache = Some((
                 BalanceResponse {
@@ -6469,12 +6559,33 @@ impl LighterConnector {
                 Instant::now(),
             ));
             log::debug!(
-                "Updated cached balance from WS: equity={}, balance={}",
+                "Updated cached balance from WS direct totals: equity={}, balance={}",
                 equity,
                 balance
             );
+        } else if let Some((collateral, equity)) = derived_equity {
+            let mut cache = balance_cache.write().await;
+            *cache = Some((
+                BalanceResponse {
+                    equity,
+                    balance: collateral,
+                    position_entry_price: None,
+                    position_sign: None,
+                },
+                Instant::now(),
+            ));
+            log::debug!(
+                "Updated cached balance from WS derivation: collateral={} +unrealized_pnl_sum={} =equity={}",
+                collateral,
+                equity - collateral,
+                equity
+            );
         } else {
-            log::debug!("Skipping WS balance update: missing account totals");
+            log::debug!(
+                "Skipping WS balance update: no direct totals and no derivation inputs (collateral_cached={}, positions_in_msg={})",
+                cached_collateral.read().await.is_some(),
+                sum_unrealized_pnl.is_some(),
+            );
         }
 
         // Handle filled orders - try both 'fills' and 'trades' fields
@@ -6973,13 +7084,12 @@ mod tests {
         let positions_ready = Arc::new(AtomicBool::new(false));
         let balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>> =
             Arc::new(RwLock::new(None));
+        let cached_collateral: Arc<RwLock<Option<Decimal>>> = Arc::new(RwLock::new(None));
         let market_cache = Arc::new(RwLock::new(MarketCache::default()));
 
         let data = json!({
-            "account": {
-                "total_asset_value": "999.04",
-                "available_balance": "800.00"
-            }
+            "total_asset_value": "999.04",
+            "available_balance": "800.00"
         });
 
         let before = Instant::now();
@@ -6992,6 +7102,7 @@ mod tests {
             &cached_positions,
             &positions_ready,
             &balance_cache,
+            &cached_collateral,
             1,
             &market_cache,
             "BTC",
@@ -7032,6 +7143,7 @@ mod tests {
                 },
                 Instant::now(),
             ))));
+        let cached_collateral: Arc<RwLock<Option<Decimal>>> = Arc::new(RwLock::new(None));
 
         // Seed market_cache so the fill's market_id=0 resolves to a symbol
         // and the trade parse path engages (otherwise pending_inserts stays
@@ -7076,6 +7188,7 @@ mod tests {
             &cached_positions,
             &positions_ready,
             &balance_cache,
+            &cached_collateral,
             522842,
             &market_cache,
             "ETH",
@@ -7086,6 +7199,155 @@ mod tests {
             balance_cache.read().await.is_none(),
             "WS fill must invalidate balance_cache so the next get_balance fetches fresh equity"
         );
+    }
+
+    // bot-strategy#239: subscribed/account_all carries assets[USDC].margin_balance
+    // and positions; equity must be derived as collateral + sum(unrealized_pnl).
+    // A subsequent update/account_all carries assets:null but updated positions
+    // and must keep the previously-cached collateral while refreshing the
+    // unrealized-pnl portion of the equity.
+    #[tokio::test]
+    async fn ws_subscribed_then_update_derives_perp_equity_from_margin_balance_and_pnl() {
+        use serde_json::json;
+        use std::str::FromStr;
+        use std::sync::atomic::AtomicBool;
+
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
+        let cached_positions = Arc::new(RwLock::new(Vec::new()));
+        let positions_ready = Arc::new(AtomicBool::new(false));
+        let balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>> =
+            Arc::new(RwLock::new(None));
+        let cached_collateral: Arc<RwLock<Option<Decimal>>> = Arc::new(RwLock::new(None));
+        let market_cache = Arc::new(RwLock::new(MarketCache::default()));
+
+        // Fixture mirrors Frankfurt 2026-04-25 00:11 UTC REST response (one
+        // sub-account, two open positions): collateral 998.96368343036,
+        // unrealized_pnl ETH=0.052700 + BTC=0.127140 = 0.179840,
+        // total_asset_value 999.1455 — matches to within rounding.
+        let subscribed = json!({
+            "account": 281474976624818u64,
+            "assets": {
+                "3": {
+                    "asset_id": 3,
+                    "balance": "0.000000",
+                    "locked_balance": "0.000000",
+                    "margin_balance": "998.96368343036",
+                    "margin_mode": "disabled",
+                    "symbol": "USDC"
+                }
+            },
+            "positions": {
+                "0": {
+                    "market_id": 0,
+                    "symbol": "ETH",
+                    "position": "0.0850",
+                    "sign": -1,
+                    "open_order_count": 0,
+                    "avg_entry_price": "2313.40",
+                    "unrealized_pnl": "0.052700"
+                },
+                "1": {
+                    "market_id": 1,
+                    "symbol": "BTC",
+                    "position": "0.00260",
+                    "sign": 1,
+                    "open_order_count": 0,
+                    "avg_entry_price": "77358.5",
+                    "unrealized_pnl": "0.127140"
+                }
+            },
+            "type": "subscribed/account_all"
+        });
+
+        LighterConnector::handle_account_update(
+            &subscribed,
+            "subscribed/account_all",
+            &filled_orders,
+            &canceled_orders,
+            &cached_open_orders,
+            &cached_positions,
+            &positions_ready,
+            &balance_cache,
+            &cached_collateral,
+            281474976624818,
+            &market_cache,
+            "ETH",
+        )
+        .await;
+
+        let collateral = Decimal::from_str("998.96368343036").unwrap();
+        let pnl_sum = Decimal::from_str("0.179840").unwrap();
+        let expected_equity = collateral + pnl_sum;
+
+        assert_eq!(
+            *cached_collateral.read().await,
+            Some(collateral),
+            "subscribed snapshot must seed cached_collateral from assets[USDC].margin_balance"
+        );
+        let guard = balance_cache.read().await;
+        let (resp, _) = guard.as_ref().expect("subscribed snapshot must populate balance_cache");
+        assert_eq!(resp.balance, collateral, "balance reflects raw collateral");
+        assert_eq!(resp.equity, expected_equity, "equity = collateral + sum(unrealized_pnl)");
+        drop(guard);
+
+        // Now deliver an update with assets:null but updated positions
+        // (mark-to-market drift). Equity must update using the SAME
+        // cached_collateral combined with the new pnl_sum.
+        let update = json!({
+            "account": 281474976624818u64,
+            "assets": null,
+            "positions": {
+                "0": {
+                    "market_id": 0,
+                    "symbol": "ETH",
+                    "position": "0.0850",
+                    "sign": -1,
+                    "open_order_count": 0,
+                    "avg_entry_price": "2313.40",
+                    "unrealized_pnl": "1.000000"
+                },
+                "1": {
+                    "market_id": 1,
+                    "symbol": "BTC",
+                    "position": "0.00260",
+                    "sign": 1,
+                    "open_order_count": 0,
+                    "avg_entry_price": "77358.5",
+                    "unrealized_pnl": "2.000000"
+                }
+            },
+            "type": "update/account_all"
+        });
+
+        LighterConnector::handle_account_update(
+            &update,
+            "update/account_all",
+            &filled_orders,
+            &canceled_orders,
+            &cached_open_orders,
+            &cached_positions,
+            &positions_ready,
+            &balance_cache,
+            &cached_collateral,
+            281474976624818,
+            &market_cache,
+            "ETH",
+        )
+        .await;
+
+        let new_pnl_sum = Decimal::from_str("3.000000").unwrap();
+        let new_expected_equity = collateral + new_pnl_sum;
+        assert_eq!(
+            *cached_collateral.read().await,
+            Some(collateral),
+            "update with assets:null must NOT reset cached_collateral"
+        );
+        let guard = balance_cache.read().await;
+        let (resp, _) = guard.as_ref().expect("update must refresh balance_cache");
+        assert_eq!(resp.balance, collateral);
+        assert_eq!(resp.equity, new_expected_equity);
     }
 
     // bot-strategy#162: a `market_stats` WS push with a `funding_rate` field
