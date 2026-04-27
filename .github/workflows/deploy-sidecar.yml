@@ -4,6 +4,10 @@ name: Deploy Lighter rate-limit sidecar
 # deploy produces the same binary and healthy service as the current slow-mm
 # pipeline, we'll add a `push:` trigger on tag `v*.*.*` and remove the
 # sidecar steps from slow-mm's CI.
+#
+# Multi-region (bot-strategy#220): build once, fan out SSM install to every
+# Lighter-running instance. Targets are hardcoded below — one entry per
+# instance hosting a Lighter client process.
 on:
   workflow_dispatch:
     inputs:
@@ -21,17 +25,19 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: eu-central-1
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
   # Same bucket slow-mm uses today; when slow-mm drops sidecar ownership
   # (phase 3 of #101) the keys stay where clients already expect them.
+  # The bucket lives in eu-central-1; cross-region SSM clients pull from it
+  # at install time only, so the extra hop is negligible.
   SIDECAR_S3_PREFIX: lighter-ratelimit
   SIDECAR_UNIT_S3_KEY: deploy/lighter-ratelimit.service
+  BUILD_REGION: eu-central-1
 
 jobs:
-  build-and-deploy:
+  build:
     # Inherits the same secrets the slow-mm pipeline used:
-    #   AWS_ROLE_ARN, S3_BUCKET, INSTANCE_ID (or their `vars.*` equivalents).
+    #   AWS_ROLE_ARN, S3_BUCKET (or their `vars.*` equivalents).
     # Register them on this repo before the first dispatch.
     runs-on: ubuntu-latest
     environment: sidecar
@@ -97,7 +103,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ env.BUILD_REGION }}
 
       - name: Upload to S3
         env:
@@ -108,10 +114,31 @@ jobs:
           aws s3 cp deploy/lighter-ratelimit.service \
             "s3://${S3_BUCKET}/${SIDECAR_UNIT_S3_KEY}"
 
-      - name: Deploy via SSM (install, enable, start, verify)
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: sidecar
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: frankfurt
+            region: eu-central-1
+            instance_id: i-0c08fba996bc21879
+          - target: tokyo
+            region: ap-northeast-1
+            instance_id: i-015f7f9388cac0a1b
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Deploy via SSM (install, enable, start, verify) [${{ matrix.target }}]
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
-          INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
+          INSTANCE_ID: ${{ matrix.instance_id }}
         run: |
           cat > /tmp/ssm-params.json <<'JSON'
           {
@@ -135,7 +162,7 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy lighter-ratelimit sidecar (dex-connector)" \
+            --comment "Deploy lighter-ratelimit sidecar (dex-connector) [${{ matrix.target }}]" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" \
             --output text)
