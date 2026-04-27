@@ -3621,12 +3621,27 @@ impl DexConnector for LighterConnector {
                 break (status, response_text);
             }
             let backoff_ms = BALANCE_RETRY_BACKOFF_MS[attempt];
-            log::warn!(
-                "get_balance: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
-                attempt + 1,
-                BALANCE_RETRY_BACKOFF_MS.len() + 1,
-                backoff_ms
-            );
+            // Lighter's per-wallet short-window throttle is shared across
+            // endpoints and the first 429 is recovered transparently by the
+            // backoff retry below; logging WARN on every attempt 1 hit
+            // pollutes error-watch (bot-strategy#213, #227). Escalate only
+            // when the throttle persists into attempt 2+, which signals real
+            // sustained pressure that warrants attention.
+            if attempt == 0 {
+                log::info!(
+                    "get_balance: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
+                    attempt + 1,
+                    BALANCE_RETRY_BACKOFF_MS.len() + 1,
+                    backoff_ms
+                );
+            } else {
+                log::warn!(
+                    "get_balance: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
+                    attempt + 1,
+                    BALANCE_RETRY_BACKOFF_MS.len() + 1,
+                    backoff_ms
+                );
+            }
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             attempt += 1;
         };
