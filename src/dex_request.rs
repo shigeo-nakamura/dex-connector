@@ -160,10 +160,22 @@ impl DexRequest {
         let response = request_builder.send().await.map_err(DexError::from)?;
         let status = response.status();
 
+        // 4xx is an application-level rejection (the caller knows the context
+        // and re-logs at the right level — e.g. Extended's 1137 race). 5xx is
+        // a server-side issue worth surfacing to ops, so keep WARN for that.
+        let non_success_level = if status.is_client_error() {
+            log::Level::Info
+        } else {
+            log::Level::Warn
+        };
+
         if !status.is_success() {
-            let error_message =
-                format!("Server returned error: {}. requested url: {}", status, url);
-            log::warn!("{}", &error_message);
+            log::log!(
+                non_success_level,
+                "Server returned error: {}. requested url: {}",
+                status,
+                url
+            );
         }
 
         let response_headers = response.headers().clone();
@@ -171,7 +183,11 @@ impl DexRequest {
 
         let response_body = response.text().await.map_err(DexError::from)?;
         if !status.is_success() {
-            log::warn!("Response body (non-success): {}", response_body);
+            log::log!(
+                non_success_level,
+                "Response body (non-success): {}",
+                response_body
+            );
         } else {
             log::trace!("Response body: {}", response_body);
         }
