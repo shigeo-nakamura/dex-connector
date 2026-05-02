@@ -678,6 +678,11 @@ struct OrderBookCacheEntry {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
     updated_at: Instant,
+    // Exchange-side publish timestamp (ms since epoch) from the wrapping
+    // `ts` field on the WS frame. Surfaced via `get_ticker` as
+    // `exchange_ts` so multi-process deploys converge on identical bar
+    // closes (bot-strategy#274 / #276 / #280).
+    last_publish_ts_ms: Option<i64>,
 }
 
 impl Default for OrderBookCacheEntry {
@@ -686,6 +691,7 @@ impl Default for OrderBookCacheEntry {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             updated_at: Instant::now(),
+            last_publish_ts_ms: None,
         }
     }
 }
@@ -780,6 +786,17 @@ impl ExtendedConnector {
         let base = self.websocket_url.as_ref()?;
         let base = base.trim_end_matches('/');
         Some(format!("{base}{path}"))
+    }
+
+    async fn cached_publish_ts_ms(&self, symbol: &str) -> Option<u64> {
+        let cache = self.order_book_cache.read().await;
+        let entry = cache.get(symbol)?;
+        if entry.updated_at.elapsed() > ORDERBOOK_STALE_AFTER {
+            return None;
+        }
+        entry
+            .last_publish_ts_ms
+            .and_then(|ts| u64::try_from(ts).ok())
     }
 
     async fn get_cached_order_book(&self, symbol: &str, depth: usize) -> Option<OrderBookSnapshot> {
@@ -1510,17 +1527,90 @@ mod tests {
         let now = Utc::now();
         assert!(!ExtendedConnector::maintenance_within_window(&[], &now, 24));
     }
+
+    #[test]
+    fn apply_orderbook_frame_records_publish_ts_from_payload() {
+        // Synthetic SNAPSHOT frame (Extended camelCase aliases). The wrapping
+        // `ts` is the exchange publish time the connector now surfaces as
+        // `exchange_ts` on the ticker. See bot-strategy#280.
+        let raw = r#"{
+            "type": "SNAPSHOT",
+            "ts": 1717023600123,
+            "seq": 42,
+            "data": {
+                "m": "BTC-USD",
+                "b": [{"p": "100.0", "q": "1.5"}],
+                "a": [{"p": "101.0", "q": "2.0"}]
+            }
+        }"#;
+        let payload: WrappedStreamResponse<StreamOrderbookUpdate> =
+            serde_json::from_str(raw).expect("synthetic frame parses");
+        let msg_type = payload.msg_type.clone().unwrap_or_default();
+        let update = payload.data.expect("snapshot has data");
+
+        let mut entry = OrderBookCacheEntry::default();
+        apply_orderbook_frame(&msg_type, update, payload.ts, &mut entry);
+
+        assert_eq!(entry.last_publish_ts_ms, Some(1717023600123));
+        assert_eq!(entry.bids.get(&dec("100.0")), Some(&dec("1.5")));
+        assert_eq!(entry.asks.get(&dec("101.0")), Some(&dec("2.0")));
+    }
+
+    #[test]
+    fn apply_orderbook_frame_overwrites_publish_ts_on_delta() {
+        // First a SNAPSHOT seeds the book, then a later DELTA must update the
+        // publish timestamp so downstream `exchange_ts` reflects the most
+        // recent exchange-side event rather than the snapshot time.
+        let snapshot: WrappedStreamResponse<StreamOrderbookUpdate> = serde_json::from_str(
+            r#"{
+                "type": "SNAPSHOT",
+                "ts": 1000,
+                "seq": 1,
+                "data": {"m": "BTC-USD", "b": [{"p": "1.0", "q": "1.0"}], "a": []}
+            }"#,
+        )
+        .unwrap();
+        let mut entry = OrderBookCacheEntry::default();
+        apply_orderbook_frame(
+            &snapshot.msg_type.clone().unwrap_or_default(),
+            snapshot.data.unwrap(),
+            snapshot.ts,
+            &mut entry,
+        );
+        assert_eq!(entry.last_publish_ts_ms, Some(1000));
+
+        let delta: WrappedStreamResponse<StreamOrderbookUpdate> = serde_json::from_str(
+            r#"{
+                "type": "DELTA",
+                "ts": 2500,
+                "seq": 2,
+                "data": {"m": "BTC-USD", "b": [{"p": "1.0", "q": "0", "c": "0"}], "a": []}
+            }"#,
+        )
+        .unwrap();
+        apply_orderbook_frame(
+            &delta.msg_type.clone().unwrap_or_default(),
+            delta.data.unwrap(),
+            delta.ts,
+            &mut entry,
+        );
+
+        assert_eq!(entry.last_publish_ts_ms, Some(2500));
+        // qty=0 on DELTA removes the level rather than wiping the book.
+        assert!(entry.bids.is_empty());
+    }
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct WrappedStreamResponse<T> {
     #[serde(rename = "type")]
     msg_type: Option<String>,
     data: Option<T>,
+    #[allow(dead_code)]
     error: Option<String>,
     ts: i64,
+    #[allow(dead_code)]
     seq: i64,
 }
 
@@ -1710,6 +1800,40 @@ async fn connect_ws(
     Ok(stream)
 }
 
+// Extended sends SNAPSHOT on (re)connect and DELTA frames in between.
+// Treating every frame as a full snapshot wipes the book each delta,
+// leaving bid/ask empty. We rebuild on SNAPSHOT and apply level-by-level
+// (qty==0 → remove, else set) on DELTA.
+fn apply_orderbook_frame(
+    msg_type: &str,
+    update: StreamOrderbookUpdate,
+    publish_ts_ms: i64,
+    entry: &mut OrderBookCacheEntry,
+) {
+    if msg_type == "SNAPSHOT" {
+        entry.bids.clear();
+        entry.asks.clear();
+    }
+    for level in update.bid {
+        let absolute = level.cumulative.unwrap_or(level.qty);
+        if absolute.is_zero() {
+            entry.bids.remove(&level.price);
+        } else {
+            entry.bids.insert(level.price, absolute);
+        }
+    }
+    for level in update.ask {
+        let absolute = level.cumulative.unwrap_or(level.qty);
+        if absolute.is_zero() {
+            entry.asks.remove(&level.price);
+        } else {
+            entry.asks.insert(level.price, absolute);
+        }
+    }
+    entry.updated_at = Instant::now();
+    entry.last_publish_ts_ms = Some(publish_ts_ms);
+}
+
 async fn stream_orderbooks(
     url: &str,
     symbol: &str,
@@ -1790,36 +1914,12 @@ async fn stream_orderbooks(
         let Some(update) = payload.data else {
             continue;
         };
-        // Extended sends SNAPSHOT on (re)connect and DELTA frames in between.
-        // Treating every frame as a full snapshot wipes the book each delta,
-        // leaving bid/ask empty. We rebuild on SNAPSHOT and apply level-by-
-        // level (qty==0 → remove, else set) on DELTA.
-        let msg_type = payload.msg_type.as_deref().unwrap_or("");
+        let msg_type = payload.msg_type.as_deref().unwrap_or("").to_string();
         let mut cache = order_book_cache.write().await;
         let entry = cache
             .entry(symbol.to_string())
             .or_insert_with(OrderBookCacheEntry::default);
-        if msg_type == "SNAPSHOT" {
-            entry.bids.clear();
-            entry.asks.clear();
-        }
-        for level in update.bid {
-            let absolute = level.cumulative.unwrap_or(level.qty);
-            if absolute.is_zero() {
-                entry.bids.remove(&level.price);
-            } else {
-                entry.bids.insert(level.price, absolute);
-            }
-        }
-        for level in update.ask {
-            let absolute = level.cumulative.unwrap_or(level.qty);
-            if absolute.is_zero() {
-                entry.asks.remove(&level.price);
-            } else {
-                entry.asks.insert(level.price, absolute);
-            }
-        }
-        entry.updated_at = Instant::now();
+        apply_orderbook_frame(&msg_type, update, payload.ts, entry);
     };
     log::debug!(
         "WebSocket stream ended ({})",
@@ -2750,6 +2850,10 @@ impl DexConnector for ExtendedConnector {
             }
             Err(_) => fallback_price(&self.last_trades, symbol, &market).await?,
         };
+        // Only the WS-cache path carries an exchange-side timestamp; the REST
+        // fallback book has none and stays at None so callers fall back to
+        // wall-clock bucketing.
+        let exchange_ts = self.cached_publish_ts_ms(symbol).await;
         Ok(TickerResponse {
             symbol: market.name.clone(),
             price,
@@ -2761,7 +2865,7 @@ impl DexConnector for ExtendedConnector {
             open_interest: Some(market.market_stats.open_interest),
             funding_rate: Some(market.market_stats.funding_rate),
             oracle_price: Some(market.market_stats.index_price),
-            exchange_ts: None,
+            exchange_ts,
         })
     }
 
