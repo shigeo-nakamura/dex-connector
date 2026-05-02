@@ -3439,43 +3439,22 @@ impl DexConnector for LighterConnector {
             }
         }
 
-        // Fallback to REST API if WebSocket data is not available
+        // Fallback to REST API if WebSocket data is not available.
+        // Routed through `fetch_text_with_waf_guard` so the first 429 engages
+        // `lighter_waf_cooldown` and subsequent calls within the cooldown
+        // window shed locally without sending HTTP. Without this gating the
+        // bot's own retry storm extends Lighter's lockout (bot-strategy#281).
         log::warn!("WebSocket data not available, falling back to REST API");
 
-        // Get market_id for the symbol
         let market_id = market_info.market_id;
-
-        // Query recent trades to get current price and volume
         let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=100", market_id);
-
-        // Debug the raw response first
         let url = format!("{}{}", self.base_url, endpoint);
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
 
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+        let response_text = self
+            .fetch_text_with_waf_guard(&url, "recentTrades")
+            .await?;
 
-        log::trace!(
-            "Trades API response (status: {}): {}",
-            status,
-            response_text
-        );
-
-        if !status.is_success() {
-            return Err(DexError::Other(format!(
-                "HTTP {}: {}",
-                status, response_text
-            )));
-        }
+        log::trace!("Trades API response: {}", response_text);
 
         let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
             .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
