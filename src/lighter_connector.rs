@@ -5990,8 +5990,28 @@ impl LighterConnector {
                                         &e,
                                         tokio_tungstenite::tungstenite::Error::Protocol(_)
                                     );
+                                    let is_benign_io = matches!(
+                                        &e,
+                                        tokio_tungstenite::tungstenite::Error::Io(io_err)
+                                            if matches!(
+                                                io_err.kind(),
+                                                std::io::ErrorKind::ConnectionReset
+                                                    | std::io::ErrorKind::UnexpectedEof
+                                                    | std::io::ErrorKind::BrokenPipe
+                                            )
+                                    );
                                     if is_protocol {
                                         log::info!(
+                                            "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}). Will attempt reconnection.",
+                                            e,
+                                            std::any::type_name_of_val(&e),
+                                            conn_label,
+                                            now.saturating_sub(last_rx_at),
+                                            now.saturating_sub(last_tx_at),
+                                            pending_client_ping.load(Ordering::SeqCst),
+                                        );
+                                    } else if is_benign_io {
+                                        log::warn!(
                                             "WebSocket error: {} (type: {:?}) (conn={}, idle_rx={}s, idle_tx={}s, pending_client_ping={}). Will attempt reconnection.",
                                             e,
                                             std::any::type_name_of_val(&e),
@@ -6022,12 +6042,21 @@ impl LighterConnector {
                                             );
                                         }
                                         tokio_tungstenite::tungstenite::Error::Io(io_err) => {
-                                            log::error!(
-                                                "WebSocket IO error detail: kind={:?}, error={} (conn={})",
-                                                io_err.kind(),
-                                                io_err,
-                                                conn_label
-                                            );
+                                            if is_benign_io {
+                                                log::warn!(
+                                                    "WebSocket IO error detail: kind={:?}, error={} (conn={})",
+                                                    io_err.kind(),
+                                                    io_err,
+                                                    conn_label
+                                                );
+                                            } else {
+                                                log::error!(
+                                                    "WebSocket IO error detail: kind={:?}, error={} (conn={})",
+                                                    io_err.kind(),
+                                                    io_err,
+                                                    conn_label
+                                                );
+                                            }
                                         }
                                         tokio_tungstenite::tungstenite::Error::Tls(tls_err) => {
                                             log::error!(
