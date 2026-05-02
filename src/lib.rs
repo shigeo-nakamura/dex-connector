@@ -72,11 +72,13 @@ pub struct TickerResponse {
     pub open_interest: Option<Decimal>,
     pub funding_rate: Option<Decimal>,
     pub oracle_price: Option<Decimal>,
-    /// Exchange-side timestamp (Unix seconds) of the most recent price update.
-    /// When `Some`, this is the event time as reported by the exchange (e.g.
-    /// the WS order_book message's `last_updated_at`). Multiple processes
+    /// Exchange-side timestamp (Unix milliseconds) of the most recent price
+    /// update. When `Some`, this is the event time as reported by the exchange
+    /// (e.g. the WS order_book message's `last_updated_at`). Multiple processes
     /// observing the same feed will see identical values for the same update,
-    /// which is required for multi-bot A/B fairness (see pairtrade#4).
+    /// which is required for multi-bot A/B fairness (see pairtrade#4). Bumped
+    /// from seconds to ms so that within-second tick orderings are no longer
+    /// collapsed by the bar bucketing layer (bot-strategy#274 / #276).
     pub exchange_ts: Option<u64>,
 }
 
@@ -218,6 +220,9 @@ pub enum TpSl {
 }
 
 /// Real-time price update from WebSocket order book changes.
+///
+/// `timestamp` is Unix milliseconds (the exchange-reported event time when
+/// available, otherwise the local clock at receive). bot-strategy#274 / #276.
 #[derive(Debug, Clone)]
 pub struct PriceUpdate {
     pub symbol: String,

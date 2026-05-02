@@ -3379,14 +3379,15 @@ impl DexConnector for LighterConnector {
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs();
+                .as_millis() as u64;
 
-            // Check if WebSocket price is stale (older than 30 seconds)
-            let price_age = current_time.saturating_sub(price_timestamp);
-            if price_age > 30 {
+            // Check if WebSocket price is stale (older than 30 seconds).
+            // `price_timestamp` is now ms (bot-strategy#274 / #276).
+            let price_age_ms = current_time.saturating_sub(price_timestamp);
+            if price_age_ms > 30_000 {
                 log::warn!(
-                    "WebSocket price is stale ({}s old), falling back to REST API",
-                    price_age
+                    "WebSocket price is stale ({}ms old), falling back to REST API",
+                    price_age_ms
                 );
                 // Fall through to REST API fallback below
             } else {
@@ -6235,25 +6236,27 @@ impl LighterConnector {
                                 // Prefer the exchange-side `last_updated_at` (microseconds since
                                 // epoch) so that all bots observing the same WS feed share an
                                 // identical timestamp for the same update. Required for the
-                                // multi-bot bar-alignment fix (pairtrade#4).
-                                let exchange_ts_secs = message
+                                // multi-bot bar-alignment fix (pairtrade#4). Stored in ms so
+                                // within-second orderings are preserved for bar bucketing
+                                // (bot-strategy#274 / #276).
+                                let exchange_ts_ms = message
                                     .get("last_updated_at")
                                     .and_then(|v| v.as_u64())
-                                    .map(|us| us / 1_000_000);
-                                let timestamp = exchange_ts_secs.unwrap_or_else(|| {
+                                    .map(|us| us / 1_000);
+                                let timestamp = exchange_ts_ms.unwrap_or_else(|| {
                                     std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap()
-                                        .as_secs()
+                                        .as_millis() as u64
                                 });
                                 log::debug!(
-                                    "[WS_OB] {} best_bid={} best_ask={} mid={} ts={}{}",
+                                    "[WS_OB] {} best_bid={} best_ask={} mid={} ts_ms={}{}",
                                     symbol,
                                     bid_price,
                                     ask_price,
                                     mid_price,
                                     timestamp,
-                                    if exchange_ts_secs.is_some() { " (exchange)" } else { " (local)" }
+                                    if exchange_ts_ms.is_some() { " (exchange)" } else { " (local)" }
                                 );
                                 current_price
                                     .write()
