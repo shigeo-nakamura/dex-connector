@@ -1345,6 +1345,135 @@ impl ExtendedConnector {
             client_order_id: None,
         })
     }
+
+    /// bot-strategy#302: low-level IOC submit. Mirrors the
+    /// `close_all_positions` IOC path but lets the caller drive size /
+    /// side / reduce_only directly so it can be reused for entry-side
+    /// taker semantics (where `close_all_positions` would refuse —
+    /// no resting position to close).
+    ///
+    /// Pricing matches `close_all_positions`: top-of-book ± 1 tick
+    /// (aggressive) ± `slippage_bps`, falling back to market stats +
+    /// default 5% slippage if the order book is unreachable. The
+    /// venue's IOC TIF terminates the order on first match (filled or
+    /// zero-fill cancel) within ~ms, so callers do not need to chase or
+    /// cancel — `poll_fill_status` will see a terminal response on the
+    /// next read.
+    async fn submit_taker_ioc(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        slippage_bps: u32,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let market = self.get_market(symbol).await?;
+        let side_str = match side {
+            OrderSide::Long => "BUY",
+            OrderSide::Short => "SELL",
+        };
+        let tick = market.trading_config.min_price_change;
+
+        // Top of opposing side; REST fallback if WS cache empty.
+        let mut base_price: Option<Decimal> = None;
+        if let Ok(ob) = self.get_order_book(symbol, 1).await {
+            base_price = match side {
+                OrderSide::Long => ob.asks.first().map(|level| level.price),
+                OrderSide::Short => ob.bids.first().map(|level| level.price),
+            };
+        }
+        if base_price.is_none() {
+            if let Ok(ob) = self.get_order_book_rest(symbol, 1).await {
+                base_price = match side {
+                    OrderSide::Long => ob.asks.first().map(|level| level.price),
+                    OrderSide::Short => ob.bids.first().map(|level| level.price),
+                };
+            }
+        }
+
+        let (mut order_price, used_market_stats) = if let Some(px) = base_price {
+            (px, false)
+        } else {
+            let stats_price = if market.market_stats.index_price > Decimal::ZERO {
+                market.market_stats.index_price
+            } else {
+                market.market_stats.last_price
+            };
+            (stats_price, true)
+        };
+        if used_market_stats {
+            order_price = slippage_price(order_price, side == OrderSide::Long);
+        } else {
+            if tick > Decimal::ZERO {
+                match side {
+                    OrderSide::Long => order_price += tick,
+                    OrderSide::Short => order_price -= tick,
+                }
+            }
+            order_price = Self::apply_close_slippage_bps(order_price, slippage_bps, side);
+        }
+        let rounded_price = Self::round_price_for_market_aggressive(order_price, &market, side);
+        let rounded_size = Self::round_size_for_market(size, &market)?;
+
+        let expire_time = Utc::now() + Duration::hours(1);
+        let nonce = rand::random::<u32>() as u64;
+        let settlement = self.compute_settlement(
+            &market,
+            side_str,
+            rounded_size,
+            rounded_price,
+            expire_time,
+            nonce,
+        )?;
+
+        let order = NewOrderModel {
+            id: settlement.order_hash.to_string(),
+            market: market.name.clone(),
+            order_type: "LIMIT".to_string(),
+            side: side_str.to_string(),
+            qty: rounded_size,
+            price: rounded_price,
+            reduce_only,
+            post_only: false,
+            time_in_force: "IOC".to_string(),
+            expiry_epoch_millis: Self::to_epoch_millis(expire_time),
+            fee: settlement.fee_rate,
+            self_trade_protection_level: "ACCOUNT".to_string(),
+            nonce: Decimal::from(nonce),
+            cancel_id: None,
+            settlement: Some(settlement.settlement),
+            tp_sl_type: None,
+            take_profit: None,
+            stop_loss: None,
+            debugging_amounts: Some(settlement.debugging_amounts),
+            builder_fee: None,
+            builder_id: None,
+        };
+
+        log::info!(
+            "[create_order_taker_ioc] {} side={} size={} price={} tif=IOC reduce_only={} source={} slippage_bps={}",
+            symbol,
+            side_str,
+            rounded_size,
+            rounded_price,
+            reduce_only,
+            if used_market_stats { "stats" } else { "order_book" },
+            if used_market_stats { 0 } else { slippage_bps },
+        );
+
+        let response: PlacedOrderModel = self
+            .api
+            .post("/user/order".to_string(), order, true)
+            .await?;
+
+        Ok(CreateOrderResponse {
+            order_id: response.external_id,
+            exchange_order_id: Some(response.id.to_string()),
+            ordered_price: rounded_price,
+            ordered_size: rounded_size,
+            client_order_id: None,
+        })
+    }
 }
 
 impl ExtendedConnector {
@@ -1824,6 +1953,24 @@ impl DexConnector for ExtendedConnector {
             false,
         )
         .await
+    }
+
+    /// bot-strategy#302: real taker IOC for callers that want
+    /// "cross now or cancel" semantics. Reuses the same IOC + aggressive
+    /// pricing pattern as `close_all_positions` (touch ± 1 tick + slippage,
+    /// `time_in_force=IOC`, `post_only=false`). Unlike `create_order`,
+    /// this does not fall back to GTT — a non-crossing order is cancelled
+    /// by the venue immediately rather than left as a 1 h passive maker.
+    async fn create_order_taker_ioc(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        slippage_bps: u32,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        self.submit_taker_ioc(symbol, size, side, slippage_bps, reduce_only)
+            .await
     }
 
     /// Standalone TPSL (currently only Stop-Loss × MarketWithSlippageControl).

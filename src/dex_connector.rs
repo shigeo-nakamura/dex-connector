@@ -97,6 +97,39 @@ pub trait DexConnector: Send + Sync {
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError>;
 
+    /// Place a taker order with IOC time-in-force.
+    ///
+    /// `create_order` historically submits with `time_in_force=GTT` (1 h
+    /// resting LIMIT) regardless of the caller's intent. For genuine
+    /// taker semantics — "cross the book now, accept partial fill,
+    /// cancel any unmatched residual immediately" — callers need this
+    /// dedicated entry point so the venue actually receives an IOC.
+    ///
+    /// Implementations should:
+    /// - Read top of book (REST fallback if WS empty).
+    /// - Place a LIMIT IOC at touch ± 1 tick (aggressive) ± `slippage_bps`
+    ///   so the order crosses on the first opposing level even if the
+    ///   book moves a few ticks between read and submit.
+    /// - Set `post_only=false`, `reduce_only=<param>`,
+    ///   `time_in_force=IOC` so the venue terminates the order on first
+    ///   match (filled or zero-fill cancel) within ~ms.
+    ///
+    /// Default impl returns `DexError::Other(...)` so this is opt-in
+    /// per connector. bot-strategy#302 — Extended impl reuses the IOC
+    /// path that `close_all_positions` already exercises.
+    async fn create_order_taker_ioc(
+        &self,
+        _symbol: &str,
+        _size: Decimal,
+        _side: OrderSide,
+        _slippage_bps: u32,
+        _reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        Err(DexError::Other(
+            "create_order_taker_ioc not implemented for this connector".into(),
+        ))
+    }
+
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError>;
