@@ -186,7 +186,7 @@ fn normalize_symbol(symbol: &str) -> String {
 // Cryptographic imports
 #[cfg(feature = "lighter-sdk")]
 use libc::{c_char, c_int, c_longlong};
-use secp256k1::{Message, Secp256k1, SecretKey};
+use secp256k1::{Message, Secp256k1};
 use sha3::{Digest, Keccak256};
 #[cfg(feature = "lighter-sdk")]
 use std::ffi::{CStr, CString};
@@ -3094,66 +3094,6 @@ impl LighterConnector {
         let address = format!("0x{}", hex::encode(&hash[12..]));
 
         Ok(address)
-    }
-
-    fn _unused_sign_with_evm_key(
-        &self,
-        evm_private_key: &str,
-        message: &str,
-    ) -> Result<String, String> {
-        // Parse the private key - try base64 first, then hex
-        let private_key_bytes = if evm_private_key.contains("=")
-            || evm_private_key.contains("+")
-            || evm_private_key.contains("/")
-        {
-            // Looks like base64
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(evm_private_key)
-                .map_err(|e| format!("Failed to decode private key base64: {}", e))?
-        } else {
-            // Try hex format
-            let private_key_hex = if evm_private_key.starts_with("0x") {
-                &evm_private_key[2..]
-            } else {
-                evm_private_key
-            };
-
-            hex::decode(private_key_hex)
-                .map_err(|e| format!("Failed to decode private key hex: {}", e))?
-        };
-
-        if private_key_bytes.len() != 32 {
-            return Err("Private key must be 32 bytes".to_string());
-        }
-
-        let secret_key = SecretKey::from_slice(&private_key_bytes)
-            .map_err(|e| format!("Failed to create secret key: {}", e))?;
-
-        // Create EIP-191 prefixed message hash
-        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
-        let full_message = format!("{}{}", prefix, message);
-
-        let mut hasher = Keccak256::new();
-        hasher.update(full_message.as_bytes());
-        let message_hash = hasher.finalize();
-
-        // Sign the message
-        let secp = Secp256k1::new();
-        let message_obj = Message::from_digest_slice(&message_hash)
-            .map_err(|e| format!("Failed to create message: {}", e))?;
-
-        let signature = secp.sign_ecdsa_recoverable(&message_obj, &secret_key);
-        let (recovery_id, compact_sig) = signature.serialize_compact();
-
-        // Construct 65-byte signature: [r(32) | s(32) | v(1)]
-        // For EVM signatures, v = recovery_id + 27
-        let mut signature_bytes = [0u8; 65];
-        signature_bytes[0..64].copy_from_slice(&compact_sig);
-        signature_bytes[64] = (recovery_id.to_i32() + 27) as u8; // v = recovery_id + 27
-
-        // Encode as hex
-        Ok(hex::encode(signature_bytes))
     }
 
     async fn send_change_api_key_request(
