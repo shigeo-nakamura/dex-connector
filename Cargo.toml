@@ -38,13 +38,12 @@ crypto-mac = "0.11"
 rust_decimal = { version = "1.0", features = ["serde"] }
 lazy_static = "1.3"
 regex = "1"
-ethers = { version = "2.0.14", features = ["eip712", "abigen"] } # Updated to match hyperliquid_rust_sdk
+ethers = { version = "2.0.14", features = ["eip712", "abigen"] }
 debot-utils = "1.0.*"
 ecdsa = "0.16.9"
 hex-literal = "0.4.1"
 k256 = "0.13.3"
 primitive-types = "0.12"
-hyperliquid_rust_sdk_fork = "0.5.2"
 secp256k1 = { version = "0.28", features = ["recovery"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 urlencoding = "2.1"

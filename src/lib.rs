@@ -8,7 +8,6 @@ mod dex_request;
 mod dex_websocket;
 #[cfg(feature = "extended-sdk")]
 mod extended_connector;
-mod hyperliquid_connector;
 #[cfg(feature = "lighter-sdk")]
 pub mod lighter_connector;
 // The rate limiter was split into its own crate (bot-strategy#118) so the
@@ -27,7 +26,6 @@ pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
 #[cfg(feature = "extended-sdk")]
 pub use extended_connector::*;
-pub use hyperliquid_connector::*;
 #[cfg(feature = "lighter-sdk")]
 pub use lighter_connector::*;
 
@@ -96,7 +94,7 @@ pub struct FilledOrder {
     /// a REST position reconcile already absorbed the state change)
     /// and silently dedupe them instead of double-counting. See
     /// bot-strategy#190. Extended populates this from the trade stream's
-    /// `created_time`; Lighter / Hyperliquid leave `None` as their WS
+    /// `created_time`; Lighter leaves `None` as its WS
     /// fill events do not surface a reliable fill timestamp.
     pub filled_ts_ms: Option<i64>,
 }
