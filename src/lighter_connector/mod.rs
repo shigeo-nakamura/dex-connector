@@ -184,106 +184,19 @@ fn normalize_symbol(symbol: &str) -> String {
 }
 
 // Cryptographic imports
-#[cfg(feature = "lighter-sdk")]
-use libc::{c_char, c_int, c_longlong};
+use libc::{c_int, c_longlong};
 use secp256k1::{Message, Secp256k1};
 use sha3::{Digest, Keccak256};
-#[cfg(feature = "lighter-sdk")]
 use std::ffi::{CStr, CString};
 use tokio::time::sleep;
 use tokio_tungstenite;
 
-// FFI bindings for Go shared library (only with lighter-sdk feature)
-#[cfg(feature = "lighter-sdk")]
-#[repr(C)]
-pub struct StrOrErr {
-    pub str: *mut c_char,
-    pub err: *mut c_char,
-}
-
-#[cfg(feature = "lighter-sdk")]
-#[repr(C)]
-pub struct SignedTxResponse {
-    pub tx_type: u8,
-    pub tx_info: *mut c_char,
-    pub tx_hash: *mut c_char,
-    pub message_to_sign: *mut c_char,
-    pub err: *mut c_char,
-}
-
-#[cfg(feature = "lighter-sdk")]
-extern "C" {
-    fn CreateClient(
-        url: *const c_char,
-        private_key: *const c_char,
-        chain_id: c_int,
-        api_key_index: c_int,
-        account_index: c_longlong,
-    ) -> *mut c_char;
-
-    fn CheckClient(api_key_index: c_int, account_index: c_longlong) -> *mut c_char;
-
-    fn SignCreateOrder(
-        market_index: c_int,
-        client_order_index: c_longlong,
-        base_amount: c_longlong,
-        price: c_int,
-        is_ask: c_int,
-        order_type: c_int,
-        time_in_force: c_int,
-        reduce_only: c_int,
-        trigger_price: c_int,
-        order_expiry: c_longlong,
-        nonce: c_longlong,
-        api_key_index: c_int,
-        account_index: c_longlong,
-    ) -> SignedTxResponse;
-
-    fn SignCancelOrder(
-        market_index: c_int,
-        order_index: c_longlong,
-        nonce: c_longlong,
-        api_key_index: c_int,
-        account_index: c_longlong,
-    ) -> SignedTxResponse;
-
-    fn SignChangePubKey(
-        new_pubkey: *const c_char,
-        nonce: c_longlong,
-        api_key_index: c_int,
-        account_index: c_longlong,
-    ) -> SignedTxResponse;
-}
-
-#[cfg(feature = "lighter-sdk")]
-unsafe fn take_c_string(ptr: *mut c_char) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    let s = CStr::from_ptr(ptr).to_string_lossy().to_string();
-    libc::free(ptr as *mut libc::c_void);
-    Some(s)
-}
-
-#[cfg(feature = "lighter-sdk")]
-unsafe fn parse_signed_tx_response(
-    resp: SignedTxResponse,
-) -> Result<(String, Option<String>), DexError> {
-    if !resp.err.is_null() {
-        let err_msg = take_c_string(resp.err).unwrap_or_else(|| "unknown error".to_string());
-        let _ = take_c_string(resp.tx_info);
-        let _ = take_c_string(resp.tx_hash);
-        let _ = take_c_string(resp.message_to_sign);
-        return Err(DexError::Other(format!("Go SDK error: {}", err_msg)));
-    }
-
-    let tx_info = take_c_string(resp.tx_info)
-        .ok_or_else(|| DexError::Other("Go SDK returned null tx_info".to_string()))?;
-    let message_to_sign = take_c_string(resp.message_to_sign);
-    let _ = take_c_string(resp.tx_hash);
-
-    Ok((tx_info, message_to_sign))
-}
+mod ffi;
+pub use ffi::{SignedTxResponse, StrOrErr};
+use ffi::{
+    parse_signed_tx_response, CheckClient, CreateClient, SignCancelOrder, SignChangePubKey,
+    SignCreateOrder,
+};
 
 /// Global API call counter for monitoring Lighter Protocol rate limits
 static API_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
