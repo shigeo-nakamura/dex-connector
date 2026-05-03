@@ -283,8 +283,8 @@ pub(super) async fn stream_orderbooks(
         }
     };
     let mut ws_state = WsStreamState::new(conn_id);
-    log::debug!(
-        "WebSocket connected ({})",
+    log::info!(
+        "WebSocket connected successfully ({})",
         ws_state.context("orderbook", Some(symbol), url)
     );
     let result = loop {
@@ -400,8 +400,8 @@ pub(super) async fn stream_trades(
         }
     };
     let mut ws_state = WsStreamState::new(conn_id);
-    log::debug!(
-        "WebSocket connected ({})",
+    log::info!(
+        "WebSocket connected successfully ({})",
         ws_state.context("trades", Some(symbol), url)
     );
     while let Some(message) = ws.next().await {
@@ -506,8 +506,8 @@ pub(super) async fn stream_account(
         }
     };
     let mut ws_state = WsStreamState::new(conn_id);
-    log::debug!(
-        "WebSocket connected ({})",
+    log::info!(
+        "WebSocket connected successfully ({})",
         ws_state.context("account", None, url)
     );
     let mut logged_once = false;
