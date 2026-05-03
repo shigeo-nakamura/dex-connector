@@ -49,9 +49,8 @@ static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
 //    symbol flipping to `DISABLED` / `REDUCE_ONLY` means maintenance
 //    already started on that market.
 const EXTENDED_MAINTENANCE_POLL_SECS: u64 = 60;
-// Mirrors Hyperliquid's 90-min active grace in hyperliquid_connector.rs:
-// once a window has started, keep reporting maintenance until it's been
-// 90 min past the start, even if the window's nominal end is shorter.
+// Once a window has started, keep reporting maintenance until 90 min
+// past the start, even if the window's nominal end is shorter.
 const EXTENDED_MAINTENANCE_ACTIVE_GRACE_MINS: i64 = 90;
 
 fn default_taker_fee() -> Decimal {
@@ -2640,9 +2639,9 @@ impl ExtendedConnector {
     }
 
     /// Evaluate the env-var-declared maintenance windows against `now` using
-    /// the same upcoming+active semantics as Hyperliquid/Lighter. The active
-    /// grace is fixed at `EXTENDED_MAINTENANCE_ACTIVE_GRACE_MINS`; the window's
-    /// own `end` is only used to decide "upcoming".
+    /// the same upcoming+active semantics as Lighter. The active grace is
+    /// fixed at `EXTENDED_MAINTENANCE_ACTIVE_GRACE_MINS`; the window's own
+    /// `end` is only used to decide "upcoming".
     fn maintenance_within_window(
         windows: &[MaintenanceWindow],
         now: &DateTime<Utc>,

@@ -275,29 +275,6 @@ impl LighterConnector {
                                     }
                                 }
                             }
-                            tokio_tungstenite::MaybeTlsStream::NativeTls(tls_stream) => {
-                                let tcp_stream = tls_stream.get_ref().get_ref().get_ref();
-
-                                // Apply TCP optimizations for native TLS connection
-                                if let Err(e) = tcp_stream.set_nodelay(true) {
-                                    log::debug!("Failed to set TCP_NODELAY on native TLS: {}", e);
-                                }
-
-                                match (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
-                                    (Ok(local), Ok(peer)) => (local, peer, "native-tls"),
-                                    _ => {
-                                        log::debug!(
-                                            "Failed to get native TLS socket addresses for epoch {}",
-                                            current_epoch
-                                        );
-                                        (
-                                            "0.0.0.0:0".parse().unwrap(),
-                                            "0.0.0.0:0".parse().unwrap(),
-                                            "native-tls",
-                                        )
-                                    }
-                                }
-                            }
                             tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
                                 if let Err(e) = tcp_stream.set_nodelay(true) {
                                     log::debug!("Failed to set TCP_NODELAY on plain WS: {}", e);
