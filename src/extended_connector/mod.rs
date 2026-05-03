@@ -7,14 +7,13 @@ use crate::{
     TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
+#[cfg(test)]
+use chrono::DateTime;
 use futures::{SinkExt, StreamExt};
-use rust_crypto_lib_base::{get_order_hash, sign_message};
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
-use starknet::core::types::Felt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -26,9 +25,6 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-const DOMAIN_NAME: &str = "Perpetuals";
-const DOMAIN_VERSION: &str = "v0";
-const DOMAIN_REVISION: &str = "1";
 const ORDERBOOK_STALE_AFTER: StdDuration = StdDuration::from_secs(5);
 const DEFAULT_CLOSE_ALL_POSITIONS_SLIPPAGE_BPS: u32 = 50;
 static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -36,6 +32,7 @@ static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
 mod maintenance;
 mod parsing;
 mod rest;
+mod signing;
 
 use maintenance::{
     extended_maintenance_disabled, parse_maintenance_windows_env, MaintenanceWindow,
@@ -45,6 +42,7 @@ use parsing::{
     position_snapshot_from_model,
 };
 use rest::{build_query, ExtendedApi, ExtendedEnvironment};
+use signing::{NewOrderModel, TpslLegModel};
 #[cfg(test)]
 use maintenance::parse_maintenance_window;
 
@@ -207,94 +205,6 @@ struct PlacedOrderModel {
     external_id: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SettlementSignatureModel {
-    r: String,
-    s: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StarkSettlementModel {
-    signature: SettlementSignatureModel,
-    stark_key: String,
-    collateral_position: Decimal,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StarkDebuggingOrderAmountsModel {
-    collateral_amount: Decimal,
-    fee_amount: Decimal,
-    synthetic_amount: Decimal,
-}
-
-/// Take-profit / stop-loss leg attached to a parent order (or standalone
-/// TPSL order when the parent has `type=TPSL` and `tpSlType=ORDER`).
-/// See x10xchange/python_sdk → CreateOrderTpslTriggerModel.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TpslLegModel {
-    trigger_price: Decimal,
-    trigger_price_type: String, // "LAST" | "MARK" | "INDEX"
-    price: Decimal,             // execution price; for market-with-slippage this is slippage-adjusted
-    price_type: String,         // "LIMIT" | "MARKET"
-    settlement: StarkSettlementModel,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    debugging_amounts: Option<StarkDebuggingOrderAmountsModel>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NewOrderModel {
-    id: String,
-    market: String,
-    #[serde(rename = "type")]
-    order_type: String,
-    side: String,
-    qty: Decimal,
-    price: Decimal,
-    reduce_only: bool,
-    post_only: bool,
-    time_in_force: String,
-    expiry_epoch_millis: i64,
-    fee: Decimal,
-    self_trade_protection_level: String,
-    nonce: Decimal,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cancel_id: Option<String>,
-    // TPSL standalone orders omit the main settlement (the SL/TP leg carries
-    // its own signature). Limit/Market orders always include it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    settlement: Option<StarkSettlementModel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tp_sl_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    take_profit: Option<TpslLegModel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop_loss: Option<TpslLegModel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    debugging_amounts: Option<StarkDebuggingOrderAmountsModel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "builderFee")]
-    builder_fee: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "builderId")]
-    builder_id: Option<i64>,
-}
-
-#[allow(dead_code)]
-struct SettlementData {
-    stark_synthetic_amount: i64,
-    stark_collateral_amount: i64,
-    stark_fee_amount: u64,
-    fee_rate: Decimal,
-    order_hash: Felt,
-    settlement: StarkSettlementModel,
-    debugging_amounts: StarkDebuggingOrderAmountsModel,
-}
-
 pub struct ExtendedConnector {
     api: ExtendedApi,
     public_key: String,
@@ -431,10 +341,6 @@ impl ExtendedConnector {
         } else {
             ExtendedEnvironment::Mainnet
         }
-    }
-
-    fn domain_chain_id(&self) -> &'static str {
-        self.env.chain_id()
     }
 
     fn build_ws_url(&self, path: &str) -> Option<String> {
@@ -682,130 +588,6 @@ impl ExtendedConnector {
         }
     }
 
-    fn parse_private_key(&self) -> Result<Felt, DexError> {
-        Felt::from_hex(&self.private_key)
-            .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))
-    }
-
-    fn parse_public_key(&self) -> Result<Felt, DexError> {
-        Felt::from_hex(&self.public_key)
-            .map_err(|e| DexError::Other(format!("Invalid public key hex: {}", e)))
-    }
-
-    fn to_epoch_millis(value: DateTime<Utc>) -> i64 {
-        let secs = value.timestamp();
-        let nanos = value.timestamp_subsec_nanos() as i64;
-        let extra_ms = if nanos % 1_000_000 == 0 { 0 } else { 1 };
-        secs * 1000 + (nanos / 1_000_000) + extra_ms
-    }
-
-    fn settlement_expiration_secs(value: DateTime<Utc>) -> i64 {
-        let expiry = value + Duration::days(14);
-        let secs = expiry.timestamp();
-        let nanos = expiry.timestamp_subsec_nanos() as i64;
-        secs + if nanos == 0 { 0 } else { 1 }
-    }
-
-    fn to_stark_amount(
-        value: Decimal,
-        resolution: i64,
-        rounding: RoundingStrategy,
-    ) -> Result<i64, DexError> {
-        let scaled = value
-            * Decimal::from_i64(resolution).ok_or_else(|| {
-                DexError::Other("Invalid resolution for amount conversion".to_string())
-            })?;
-        let rounded = scaled.round_dp_with_strategy(0, rounding);
-        rounded
-            .to_i64()
-            .ok_or_else(|| DexError::Other("Failed to convert amount to i64".to_string()))
-    }
-
-    fn compute_settlement(
-        &self,
-        market: &MarketModel,
-        side: &str,
-        synthetic_amount: Decimal,
-        price: Decimal,
-        expire_time: DateTime<Utc>,
-        nonce: u64,
-    ) -> Result<SettlementData, DexError> {
-        let is_buying = side == "BUY";
-        let synthetic_resolution = market.l2_config.synthetic_resolution;
-        let collateral_resolution = market.l2_config.collateral_resolution;
-
-        let collateral_amount = synthetic_amount * price;
-        let total_fee_rate = default_taker_fee();
-        let fee_amount = total_fee_rate * collateral_amount;
-
-        let rounding_main = if is_buying {
-            RoundingStrategy::ToPositiveInfinity
-        } else {
-            RoundingStrategy::ToNegativeInfinity
-        };
-        let rounding_fee = RoundingStrategy::ToPositiveInfinity;
-
-        let mut stark_synthetic_amount =
-            Self::to_stark_amount(synthetic_amount, synthetic_resolution, rounding_main)?;
-        let mut stark_collateral_amount =
-            Self::to_stark_amount(collateral_amount, collateral_resolution, rounding_main)?;
-        let stark_fee_amount =
-            Self::to_stark_amount(fee_amount, collateral_resolution, rounding_fee)? as u64;
-
-        if is_buying {
-            stark_collateral_amount = -stark_collateral_amount;
-        } else {
-            stark_synthetic_amount = -stark_synthetic_amount;
-        }
-
-        let expiration_secs = Self::settlement_expiration_secs(expire_time);
-        let order_hash = get_order_hash(
-            self.vault.to_string(),
-            market.l2_config.synthetic_id.clone(),
-            stark_synthetic_amount.to_string(),
-            market.l2_config.collateral_id.clone(),
-            stark_collateral_amount.to_string(),
-            market.l2_config.collateral_id.clone(),
-            stark_fee_amount.to_string(),
-            expiration_secs.to_string(),
-            nonce.to_string(),
-            self.public_key.clone(),
-            DOMAIN_NAME.to_string(),
-            DOMAIN_VERSION.to_string(),
-            self.domain_chain_id().to_string(),
-            DOMAIN_REVISION.to_string(),
-        )
-        .map_err(|e| DexError::Other(format!("Failed to compute order hash: {}", e)))?;
-
-        let private_key = self.parse_private_key()?;
-        let signature = sign_message(&order_hash, &private_key)
-            .map_err(|e| DexError::Other(format!("Failed to sign order: {}", e)))?;
-
-        let settlement = StarkSettlementModel {
-            signature: SettlementSignatureModel {
-                r: signature.r.to_hex_string(),
-                s: signature.s.to_hex_string(),
-            },
-            stark_key: self.parse_public_key()?.to_hex_string(),
-            collateral_position: Decimal::from(self.vault),
-        };
-
-        let debugging_amounts = StarkDebuggingOrderAmountsModel {
-            collateral_amount: Decimal::from(stark_collateral_amount),
-            fee_amount: Decimal::from(stark_fee_amount),
-            synthetic_amount: Decimal::from(stark_synthetic_amount),
-        };
-
-        Ok(SettlementData {
-            stark_synthetic_amount,
-            stark_collateral_amount,
-            stark_fee_amount,
-            fee_rate: total_fee_rate,
-            order_hash,
-            settlement,
-            debugging_amounts,
-        })
-    }
 
     fn round_to_step(value: Decimal, step: Decimal, rounding: RoundingStrategy) -> Decimal {
         if step <= Decimal::ZERO {
