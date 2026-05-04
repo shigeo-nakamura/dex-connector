@@ -40,7 +40,6 @@ pub struct LighterConnectorConfig {
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
     dex_request::DexError,
-    dex_websocket::DexWebSocket,
     BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse, SpotAssetBalance,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
     OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
@@ -155,7 +154,6 @@ pub struct LighterConnector {
     // (see bot-strategy#160). One spawn per connector instance; the loop
     // exits when `is_running` flips false.
     maintenance_refresher_started: Arc<AtomicBool>,
-    _ws: Option<DexWebSocket>, // Reserved for future WebSocket implementation
     // WebSocket data storage
     current_price: Arc<RwLock<HashMap<String, (Decimal, u64)>>>, // symbol -> (price, timestamp)
     current_volume: Arc<RwLock<Option<Decimal>>>,
@@ -837,7 +835,6 @@ impl LighterConnector {
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             maintenance_refresher_started: Arc::new(AtomicBool::new(false)),
-            _ws: Some(DexWebSocket::new(config.websocket_url)),
             current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(HashMap::new())),
@@ -900,7 +897,6 @@ impl LighterConnector {
             cleanup_started: Arc::new(AtomicBool::new(false)),
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             maintenance_refresher_started: Arc::new(AtomicBool::new(false)),
-            _ws: Some(DexWebSocket::new(config.websocket_url)),
             current_price: Arc::new(RwLock::new(HashMap::new())),
             current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(HashMap::new())),

@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 mod dex_connector;
 mod dex_request;
-mod dex_websocket;
 #[cfg(feature = "extended-sdk")]
 mod extended_connector;
 #[cfg(feature = "lighter-sdk")]

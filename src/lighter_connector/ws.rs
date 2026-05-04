@@ -62,10 +62,6 @@ impl LighterConnector {
 
         log::info!("Connecting to WebSocket: {}", ws_url);
 
-        if self._ws.is_none() {
-            return Err(DexError::Other("WebSocket not initialized".to_string()));
-        }
-
         let primary_market_id = if let Some(symbol) = self.tracked_symbols.first() {
             match self.resolve_market_info(symbol).await {
                 Ok(info) => info.market_id,
