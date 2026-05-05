@@ -4,14 +4,28 @@
 //! constructing GET URLs with encoded params.
 
 use crate::dex_request::{DexError, DexRequest, HttpMethod};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 pub(super) const MAINNET_API_BASE: &str = "https://api.starknet.extended.exchange/api/v1";
 pub(super) const TESTNET_API_BASE: &str = "https://api.starknet.sepolia.extended.exchange/api/v1";
 
 pub(super) const MAINNET_CHAIN_ID: &str = "SN_MAIN";
 pub(super) const TESTNET_CHAIN_ID: &str = "SN_SEPOLIA";
+
+/// Extended REST error code for "Maintenance mode" envelope (`{"status":
+/// "ERROR","error":{"code":1010,"message":"Maintenance mode"}}`). Observed
+/// during the 2026-05-05 window. See bot-strategy#321.
+pub(super) const EXTENDED_MAINTENANCE_API_CODE: i64 = 1010;
+
+/// How long after the last observed code-1010 response we keep treating
+/// the venue as in maintenance. Long enough for the next `/info/markets`
+/// poll (60s cadence) to reconfirm via the symbol-status path; short
+/// enough that we re-arm quickly once the window genuinely ends.
+pub(super) const REST_1010_GRACE_SECS: i64 = 600;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ExtendedEnvironment {
@@ -39,13 +53,23 @@ impl ExtendedEnvironment {
 pub(super) struct ExtendedApi {
     request: DexRequest,
     pub(super) api_key: String,
+    /// Shared with `ExtendedConnector`. Bumped to `now + REST_1010_GRACE_SECS`
+    /// every time a response carries code 1010, so the connector's
+    /// `is_upcoming_maintenance` can short-circuit to true while the venue
+    /// is rejecting requests. bot-strategy#321.
+    rest_1010_clear_at: Arc<AtomicI64>,
 }
 
 impl ExtendedApi {
-    pub(super) async fn new(api_base: String, api_key: String) -> Result<Self, DexError> {
+    pub(super) async fn new(
+        api_base: String,
+        api_key: String,
+        rest_1010_clear_at: Arc<AtomicI64>,
+    ) -> Result<Self, DexError> {
         Ok(Self {
             request: DexRequest::new(api_base).await?,
             api_key,
+            rest_1010_clear_at,
         })
     }
 
@@ -162,6 +186,9 @@ impl ExtendedApi {
                     .as_ref()
                     .map(|err| err.message.clone())
                     .unwrap_or_else(|| "Extended API error".to_string());
+                if code == EXTENDED_MAINTENANCE_API_CODE {
+                    bump_rest_1010_clear_at(&self.rest_1010_clear_at, Utc::now().timestamp());
+                }
                 if attempt < max_attempts && is_transient_api_code(code) {
                     let backoff_ms = 500u64 * (1u64 << (attempt - 1));
                     log::warn!(
@@ -185,6 +212,20 @@ impl ExtendedApi {
         }
         unreachable!("extended send retry loop exited without Ok/Err")
     }
+}
+
+/// Push the REST-1010 grace deadline to `now + REST_1010_GRACE_SECS`.
+/// Uses `fetch_max` so a stale bump (clock drift between concurrent
+/// requests) never shortens an already-extended deadline. bot-strategy#321.
+fn bump_rest_1010_clear_at(clear_at: &AtomicI64, now_ts: i64) {
+    let new_clear = now_ts.saturating_add(REST_1010_GRACE_SECS);
+    clear_at.fetch_max(new_clear, Ordering::SeqCst);
+}
+
+/// True while the REST-1010 grace deadline has not yet passed.
+#[cfg(test)]
+fn rest_1010_active(clear_at: &AtomicI64, now_ts: i64) -> bool {
+    clear_at.load(Ordering::SeqCst) > now_ts
 }
 
 /// Transport-level failures that may succeed on retry (connection reset,
@@ -250,4 +291,51 @@ pub(super) fn build_query(base: &str, params: Vec<(String, String)>) -> String {
         parts.push(encoded);
     }
     format!("{}?{}", base, parts.join("&"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_1010_bump_arms_grace_window() {
+        let clear_at = AtomicI64::new(0);
+        bump_rest_1010_clear_at(&clear_at, 1_000);
+        assert_eq!(clear_at.load(Ordering::SeqCst), 1_000 + REST_1010_GRACE_SECS);
+        assert!(rest_1010_active(&clear_at, 1_500));
+        assert!(rest_1010_active(&clear_at, 1_000 + REST_1010_GRACE_SECS - 1));
+        // Boundary: at the deadline itself we're already clear.
+        assert!(!rest_1010_active(&clear_at, 1_000 + REST_1010_GRACE_SECS));
+        assert!(!rest_1010_active(&clear_at, 1_000 + REST_1010_GRACE_SECS + 60));
+    }
+
+    #[test]
+    fn rest_1010_bump_extends_deadline_forward() {
+        let clear_at = AtomicI64::new(0);
+        bump_rest_1010_clear_at(&clear_at, 1_000);
+        bump_rest_1010_clear_at(&clear_at, 1_300);
+        // Second bump from a later wall clock pushes the deadline forward.
+        assert_eq!(clear_at.load(Ordering::SeqCst), 1_300 + REST_1010_GRACE_SECS);
+        // Active at any `now` strictly less than the new deadline.
+        assert!(rest_1010_active(&clear_at, 1_300 + REST_1010_GRACE_SECS - 1));
+        assert!(!rest_1010_active(&clear_at, 1_300 + REST_1010_GRACE_SECS));
+    }
+
+    #[test]
+    fn rest_1010_bump_does_not_shrink_deadline() {
+        let clear_at = AtomicI64::new(0);
+        bump_rest_1010_clear_at(&clear_at, 1_000);
+        let after_first = clear_at.load(Ordering::SeqCst);
+        // A stale concurrent bump (e.g. with an earlier observed `now`)
+        // must never pull the deadline backward.
+        bump_rest_1010_clear_at(&clear_at, 500);
+        assert_eq!(clear_at.load(Ordering::SeqCst), after_first);
+    }
+
+    #[test]
+    fn rest_1010_inactive_when_never_bumped() {
+        let clear_at = AtomicI64::new(0);
+        assert!(!rest_1010_active(&clear_at, 0));
+        assert!(!rest_1010_active(&clear_at, 1_000));
+    }
 }

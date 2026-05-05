@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc,
 };
 use std::time::{Duration as StdDuration, Instant};
@@ -232,6 +232,13 @@ pub struct ExtendedConnector {
     // refresher spawned in `start()`.
     maintenance_symbol_inactive: Arc<AtomicBool>,
     maintenance_refresher_started: AtomicBool,
+    // UNIX-seconds timestamp at which the REST-1010 fallback expires. Set
+    // to `now + REST_1010_GRACE_SECS` whenever a REST response carries
+    // code 1010 ("Maintenance mode"); `is_upcoming_maintenance` returns
+    // true while this is in the future. Bridges the gap when neither the
+    // operator-declared windows nor the `/info/markets` poller catches a
+    // live maintenance event. See bot-strategy#321.
+    rest_1010_clear_at: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,7 +283,8 @@ impl ExtendedConnector {
             .map(Self::infer_environment)
             .unwrap_or(ExtendedEnvironment::Mainnet);
         let api_base = base_url.unwrap_or_else(|| env.api_base().to_string());
-        let api = ExtendedApi::new(api_base, api_key).await?;
+        let rest_1010_clear_at = Arc::new(AtomicI64::new(0));
+        let api = ExtendedApi::new(api_base, api_key, Arc::clone(&rest_1010_clear_at)).await?;
         let close_all_positions_slippage_bps = std::env::var("CLOSE_ALL_POSITIONS_SLIPPAGE_BPS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -331,6 +339,7 @@ impl ExtendedConnector {
             maintenance_windows: Arc::new(parse_maintenance_windows_env()),
             maintenance_symbol_inactive: Arc::new(AtomicBool::new(false)),
             maintenance_refresher_started: AtomicBool::new(false),
+            rest_1010_clear_at,
         })
     }
 
@@ -2375,6 +2384,20 @@ impl DexConnector for ExtendedConnector {
         // Operator kill-switch: short-circuit before touching any cache.
         if extended_maintenance_disabled() {
             return false;
+        }
+        // REST-1010 fallback: a recent REST response carried `code:1010
+        // "Maintenance mode"`, so the venue is rejecting requests right
+        // now even if the `/info/markets` poller hasn't flipped its flag.
+        // Auto-clears `REST_1010_GRACE_SECS` after the last 1010 hit.
+        // bot-strategy#321.
+        let now_ts = Utc::now().timestamp();
+        let clear_at = self.rest_1010_clear_at.load(Ordering::SeqCst);
+        if clear_at > now_ts {
+            log::debug!(
+                "[EXTENDED_MAINTENANCE] is_upcoming_maintenance=true via REST 1010 fallback (clears in {}s)",
+                clear_at - now_ts
+            );
+            return true;
         }
         // Reactive path: refresher observed a tracked symbol in a
         // non-ACTIVE state. Covers already-started maintenance regardless
