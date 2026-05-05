@@ -21,11 +21,25 @@ pub(super) const TESTNET_CHAIN_ID: &str = "SN_SEPOLIA";
 /// during the 2026-05-05 window. See bot-strategy#321.
 pub(super) const EXTENDED_MAINTENANCE_API_CODE: i64 = 1010;
 
+/// Extended REST error code for "Post only mode" envelope (`{"status":
+/// "ERROR","error":{"code":1011,"message":"Post only mode"}}`). Returned
+/// during transient post-only-only windows (auction / reopen phase) where
+/// the venue rejects aggressive IOC / non-post-only orders. Observed
+/// 2026-05-05 17:15-17:16 UTC, ~25s window. See bot-strategy#327.
+pub(super) const EXTENDED_POST_ONLY_API_CODE: i64 = 1011;
+
 /// How long after the last observed code-1010 response we keep treating
 /// the venue as in maintenance. Long enough for the next `/info/markets`
 /// poll (60s cadence) to reconfirm via the symbol-status path; short
 /// enough that we re-arm quickly once the window genuinely ends.
 pub(super) const REST_1010_GRACE_SECS: i64 = 600;
+
+/// How long after the last observed code-1011 response we keep treating
+/// the venue as rejecting aggressive orders. Observed window in the wild
+/// is ~25s; 60s gives one extra retry cycle of headroom while still
+/// re-arming quickly. Folded into `is_upcoming_maintenance` so existing
+/// pairtrade/xvenue-arb suppression wiring covers it. See bot-strategy#327.
+pub(super) const REST_1011_GRACE_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ExtendedEnvironment {
@@ -58,6 +72,12 @@ pub(super) struct ExtendedApi {
     /// `is_upcoming_maintenance` can short-circuit to true while the venue
     /// is rejecting requests. bot-strategy#321.
     rest_1010_clear_at: Arc<AtomicI64>,
+    /// Shared with `ExtendedConnector`. Bumped to `now + REST_1011_GRACE_SECS`
+    /// every time a response carries code 1011 ("Post only mode"). Folded
+    /// into the same `is_upcoming_maintenance` predicate as 1010 so the
+    /// existing suppression wiring covers transient post-only-only windows.
+    /// bot-strategy#327.
+    rest_1011_clear_at: Arc<AtomicI64>,
 }
 
 impl ExtendedApi {
@@ -65,11 +85,13 @@ impl ExtendedApi {
         api_base: String,
         api_key: String,
         rest_1010_clear_at: Arc<AtomicI64>,
+        rest_1011_clear_at: Arc<AtomicI64>,
     ) -> Result<Self, DexError> {
         Ok(Self {
             request: DexRequest::new(api_base).await?,
             api_key,
             rest_1010_clear_at,
+            rest_1011_clear_at,
         })
     }
 
@@ -188,6 +210,8 @@ impl ExtendedApi {
                     .unwrap_or_else(|| "Extended API error".to_string());
                 if code == EXTENDED_MAINTENANCE_API_CODE {
                     bump_rest_1010_clear_at(&self.rest_1010_clear_at, Utc::now().timestamp());
+                } else if code == EXTENDED_POST_ONLY_API_CODE {
+                    bump_rest_1011_clear_at(&self.rest_1011_clear_at, Utc::now().timestamp());
                 }
                 if attempt < max_attempts && is_transient_api_code(code) {
                     let backoff_ms = 500u64 * (1u64 << (attempt - 1));
@@ -222,9 +246,22 @@ fn bump_rest_1010_clear_at(clear_at: &AtomicI64, now_ts: i64) {
     clear_at.fetch_max(new_clear, Ordering::SeqCst);
 }
 
+/// Push the REST-1011 grace deadline to `now + REST_1011_GRACE_SECS`.
+/// Same `fetch_max` semantics as the 1010 helper. bot-strategy#327.
+fn bump_rest_1011_clear_at(clear_at: &AtomicI64, now_ts: i64) {
+    let new_clear = now_ts.saturating_add(REST_1011_GRACE_SECS);
+    clear_at.fetch_max(new_clear, Ordering::SeqCst);
+}
+
 /// True while the REST-1010 grace deadline has not yet passed.
 #[cfg(test)]
 fn rest_1010_active(clear_at: &AtomicI64, now_ts: i64) -> bool {
+    clear_at.load(Ordering::SeqCst) > now_ts
+}
+
+/// True while the REST-1011 grace deadline has not yet passed.
+#[cfg(test)]
+fn rest_1011_active(clear_at: &AtomicI64, now_ts: i64) -> bool {
     clear_at.load(Ordering::SeqCst) > now_ts
 }
 
@@ -337,5 +374,42 @@ mod tests {
         let clear_at = AtomicI64::new(0);
         assert!(!rest_1010_active(&clear_at, 0));
         assert!(!rest_1010_active(&clear_at, 1_000));
+    }
+
+    #[test]
+    fn rest_1011_bump_arms_grace_window() {
+        let clear_at = AtomicI64::new(0);
+        bump_rest_1011_clear_at(&clear_at, 1_000);
+        assert_eq!(clear_at.load(Ordering::SeqCst), 1_000 + REST_1011_GRACE_SECS);
+        assert!(rest_1011_active(&clear_at, 1_030));
+        assert!(rest_1011_active(&clear_at, 1_000 + REST_1011_GRACE_SECS - 1));
+        assert!(!rest_1011_active(&clear_at, 1_000 + REST_1011_GRACE_SECS));
+        assert!(!rest_1011_active(&clear_at, 1_000 + REST_1011_GRACE_SECS + 60));
+    }
+
+    #[test]
+    fn rest_1011_bump_extends_deadline_forward() {
+        let clear_at = AtomicI64::new(0);
+        bump_rest_1011_clear_at(&clear_at, 1_000);
+        bump_rest_1011_clear_at(&clear_at, 1_030);
+        assert_eq!(clear_at.load(Ordering::SeqCst), 1_030 + REST_1011_GRACE_SECS);
+        assert!(rest_1011_active(&clear_at, 1_030 + REST_1011_GRACE_SECS - 1));
+        assert!(!rest_1011_active(&clear_at, 1_030 + REST_1011_GRACE_SECS));
+    }
+
+    #[test]
+    fn rest_1011_bump_does_not_shrink_deadline() {
+        let clear_at = AtomicI64::new(0);
+        bump_rest_1011_clear_at(&clear_at, 1_000);
+        let after_first = clear_at.load(Ordering::SeqCst);
+        bump_rest_1011_clear_at(&clear_at, 500);
+        assert_eq!(clear_at.load(Ordering::SeqCst), after_first);
+    }
+
+    #[test]
+    fn rest_1011_inactive_when_never_bumped() {
+        let clear_at = AtomicI64::new(0);
+        assert!(!rest_1011_active(&clear_at, 0));
+        assert!(!rest_1011_active(&clear_at, 1_000));
     }
 }

@@ -239,6 +239,11 @@ pub struct ExtendedConnector {
     // operator-declared windows nor the `/info/markets` poller catches a
     // live maintenance event. See bot-strategy#321.
     rest_1010_clear_at: Arc<AtomicI64>,
+    // Same shape as `rest_1010_clear_at` but for code 1011 ("Post only
+    // mode"). Folded into `is_upcoming_maintenance` so the existing
+    // pairtrade/xvenue-arb suppression wiring covers transient
+    // post-only-only windows (auction / reopen). See bot-strategy#327.
+    rest_1011_clear_at: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,7 +289,14 @@ impl ExtendedConnector {
             .unwrap_or(ExtendedEnvironment::Mainnet);
         let api_base = base_url.unwrap_or_else(|| env.api_base().to_string());
         let rest_1010_clear_at = Arc::new(AtomicI64::new(0));
-        let api = ExtendedApi::new(api_base, api_key, Arc::clone(&rest_1010_clear_at)).await?;
+        let rest_1011_clear_at = Arc::new(AtomicI64::new(0));
+        let api = ExtendedApi::new(
+            api_base,
+            api_key,
+            Arc::clone(&rest_1010_clear_at),
+            Arc::clone(&rest_1011_clear_at),
+        )
+        .await?;
         let close_all_positions_slippage_bps = std::env::var("CLOSE_ALL_POSITIONS_SLIPPAGE_BPS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -340,6 +352,7 @@ impl ExtendedConnector {
             maintenance_symbol_inactive: Arc::new(AtomicBool::new(false)),
             maintenance_refresher_started: AtomicBool::new(false),
             rest_1010_clear_at,
+            rest_1011_clear_at,
         })
     }
 
@@ -2391,11 +2404,25 @@ impl DexConnector for ExtendedConnector {
         // Auto-clears `REST_1010_GRACE_SECS` after the last 1010 hit.
         // bot-strategy#321.
         let now_ts = Utc::now().timestamp();
-        let clear_at = self.rest_1010_clear_at.load(Ordering::SeqCst);
-        if clear_at > now_ts {
+        let clear_at_1010 = self.rest_1010_clear_at.load(Ordering::SeqCst);
+        if clear_at_1010 > now_ts {
             log::debug!(
                 "[EXTENDED_MAINTENANCE] is_upcoming_maintenance=true via REST 1010 fallback (clears in {}s)",
-                clear_at - now_ts
+                clear_at_1010 - now_ts
+            );
+            return true;
+        }
+        // REST-1011 fallback: a recent REST response carried `code:1011
+        // "Post only mode"`, i.e. the venue is currently rejecting
+        // aggressive (non-post-only) orders. Treated as the same business
+        // class as maintenance — entries / aggressive closes will keep
+        // failing until the window ends. Self-clears after a much shorter
+        // grace than 1010 (~25s observed window). bot-strategy#327.
+        let clear_at_1011 = self.rest_1011_clear_at.load(Ordering::SeqCst);
+        if clear_at_1011 > now_ts {
+            log::debug!(
+                "[EXTENDED_MAINTENANCE] is_upcoming_maintenance=true via REST 1011 fallback (clears in {}s)",
+                clear_at_1011 - now_ts
             );
             return true;
         }
