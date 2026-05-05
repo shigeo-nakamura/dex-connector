@@ -89,6 +89,11 @@ name = "extended-trigger-spike"
 path = "src/bin/extended-trigger-spike.rs"
 required-features = ["extended-sdk"]
 
+[[bin]]
+name = "lighter-spike"
+path = "src/bin/lighter-spike.rs"
+required-features = ["lighter-sdk"]
+
 [dev-dependencies]
 rusoto_core = "0.48"
 rusoto_kms = "0.48"

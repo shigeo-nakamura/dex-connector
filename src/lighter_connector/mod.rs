@@ -21,6 +21,50 @@ const DEFAULT_SIZE_DECIMALS: u32 = 5;
 const MAX_DECIMAL_PRECISION: u32 = 9;
 const DEFAULT_ORDERBOOK_STALE_SECS: u64 = 15;
 
+/// Resolve the cross-DexConnector `spread` parameter to a Lighter TIF +
+/// adjusted price. Pulled out of `create_order` so the
+/// `spread = -2 → TIF_POST_ONLY` mapping (used by xvenue-arb's
+/// maker-on-Lighter redesign — bot-strategy#309 / #317) is unit
+/// testable without a network round trip.
+///
+/// Convention (matches Extended; see `extended_connector::mod.rs`):
+/// - `Some(s)` with `s >= 0`: tick-based price adjustment, no TIF
+///   override. Final price = `price + s * tick_size`. TIF stays at
+///   `default_tif`.
+/// - `Some(-1)`: caller asked for IOC, but Lighter doesn't honor IOC
+///   on resting limits — degrade to GTT and keep the price unchanged.
+/// - `Some(-2)`: post-only. TIF flips to `TIF_POST_ONLY`; the venue
+///   rejects a cross instead of executing as taker.
+/// - `Some(other_negative)`: invalid sentinel; warn + fall back to
+///   `default_tif` (no price adjustment).
+/// - `None`: no spread, no TIF override. Price unchanged, TIF stays
+///   at `default_tif`.
+fn resolve_spread_to_tif_and_price(
+    price: Decimal,
+    spread: Option<i64>,
+    tick_size: Decimal,
+    default_tif: u32,
+) -> (Decimal, u32) {
+    match spread {
+        Some(s) if s < 0 => {
+            let tif = match s {
+                -1 => TIF_GTT,       // Treat IOC override as resting GTT on Lighter
+                -2 => TIF_POST_ONLY, // Post-only (resting limit)
+                _ => {
+                    log::warn!("Invalid TIF spread value: {}, using default", s);
+                    default_tif
+                }
+            };
+            (price, tif) // No price adjustment for TIF sentinels
+        }
+        Some(s) => {
+            let spread_amount = Decimal::from(s) * tick_size;
+            (price + spread_amount, default_tif)
+        }
+        None => (price, default_tif),
+    }
+}
+
 /// Configuration for creating a LighterConnector.
 #[derive(Debug, Clone)]
 pub struct LighterConnectorConfig {
@@ -2841,36 +2885,25 @@ impl DexConnector for LighterConnector {
         }
 
         let (price_value, order_type, tif) = if let Some(p) = price {
-            // Handle spread parameter: negative values for TIF, positive for price adjustment
-            let (final_price, order_tif) = if let Some(spread_ticks) = _spread {
-                if spread_ticks < 0 {
-                    // Negative spread values specify TIF
-                    let tif_value = match spread_ticks {
-                        -1 => TIF_GTT,       // Treat IOC override as resting GTT on Lighter
-                        -2 => TIF_POST_ONLY, // Post-only (resting limit)
-                        _ => {
-                            log::warn!("Invalid TIF spread value: {}, using GTT", spread_ticks);
-                            default_tif
-                        }
-                    };
-                    (p, tif_value) // No price adjustment for TIF orders
-                } else {
-                    // Positive spread values adjust price (original behavior)
-                    let tick_decimals = price_decimals.min(MAX_DECIMAL_PRECISION);
-                    if tick_decimals != price_decimals {
+            // Handle spread parameter: negative values for TIF, positive
+            // for price adjustment. See `resolve_spread_to_tif_and_price`
+            // for the full mapping (extracted to allow unit testing —
+            // bot-strategy#317).
+            let tick_decimals = price_decimals.min(MAX_DECIMAL_PRECISION);
+            if tick_decimals != price_decimals {
+                if let Some(s) = _spread {
+                    if s > 0 {
                         log::warn!(
                             "Price decimals {} exceed supported max {}, clamping for spread adjustment",
                             price_decimals,
                             MAX_DECIMAL_PRECISION
                         );
                     }
-                    let tick_size = Decimal::new(1, tick_decimals);
-                    let spread_amount = Decimal::from(spread_ticks) * tick_size;
-                    (p + spread_amount, default_tif)
                 }
-            } else {
-                (p, default_tif)
-            };
+            }
+            let tick_size = Decimal::new(1, tick_decimals);
+            let (final_price, order_tif) =
+                resolve_spread_to_tif_and_price(p, _spread, tick_size, default_tif);
 
             // Limit order
             let price_u32 = scale_decimal_to_u32(
@@ -3896,6 +3929,63 @@ mod tests {
             .and_then(|id| id.parse::<u64>().ok())
             .unwrap_or(timestamp);
         assert_eq!(client_order_index, timestamp);
+    }
+
+    /// bot-strategy#317: post-only spread sentinel (-2) must map to
+    /// TIF_POST_ONLY without adjusting the price. Locks in the
+    /// xvenue-arb maker-on-Lighter contract so future refactors of
+    /// `create_order` don't silently regress the mapping.
+    #[test]
+    fn spread_minus_two_maps_to_tif_post_only() {
+        let price = Decimal::new(2000, 0);
+        let tick = Decimal::new(1, 1); // 0.1
+        let (out_price, tif) = resolve_spread_to_tif_and_price(price, Some(-2), tick, TIF_GTT);
+        assert_eq!(out_price, price, "post-only must NOT adjust the price");
+        assert_eq!(tif, TIF_POST_ONLY);
+    }
+
+    /// `Some(-1)` is the IOC sentinel; Lighter degrades it to GTT
+    /// (lighter_connector cannot rest IOC orders) — keep that
+    /// behaviour wired so a caller asking for IOC doesn't silently
+    /// land as something else.
+    #[test]
+    fn spread_minus_one_degrades_ioc_to_gtt() {
+        let price = Decimal::new(2000, 0);
+        let tick = Decimal::new(1, 1);
+        let (out_price, tif) = resolve_spread_to_tif_and_price(price, Some(-1), tick, TIF_GTT);
+        assert_eq!(out_price, price);
+        assert_eq!(tif, TIF_GTT);
+    }
+
+    /// Other negative spreads are invalid sentinels — fall back to the
+    /// caller's default TIF without adjusting price.
+    #[test]
+    fn unknown_negative_spread_falls_back_to_default_tif() {
+        let price = Decimal::new(2000, 0);
+        let tick = Decimal::new(1, 1);
+        let (out_price, tif) = resolve_spread_to_tif_and_price(price, Some(-7), tick, TIF_IOC);
+        assert_eq!(out_price, price);
+        assert_eq!(tif, TIF_IOC);
+    }
+
+    /// Non-negative spread values are tick-based price adjustments;
+    /// TIF stays at the caller's default.
+    #[test]
+    fn positive_spread_adjusts_price_by_tick_size() {
+        let price = Decimal::new(2000, 0);
+        let tick = Decimal::new(1, 1); // 0.1
+        let (out_price, tif) = resolve_spread_to_tif_and_price(price, Some(3), tick, TIF_GTT);
+        assert_eq!(out_price, Decimal::new(20003, 1)); // 2000.3
+        assert_eq!(tif, TIF_GTT);
+    }
+
+    #[test]
+    fn no_spread_passes_through_default_tif_and_price() {
+        let price = Decimal::new(2000, 0);
+        let tick = Decimal::new(1, 1);
+        let (out_price, tif) = resolve_spread_to_tif_and_price(price, None, tick, TIF_GTT);
+        assert_eq!(out_price, price);
+        assert_eq!(tif, TIF_GTT);
     }
 
     #[test]
