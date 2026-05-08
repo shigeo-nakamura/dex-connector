@@ -29,8 +29,16 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+/// Outer bound on the gap between any inbound WS frame (data, ping, pong,
+/// close). Heartbeat detects a dead peer in ~40s under normal conditions
+/// (`PONG_TIMEOUT_SECS` × `PONG_MAX_MISSES` plus check granularity), so 60s
+/// is comfortably outside that window and only fires when the heartbeat
+/// path itself has failed. Defense in depth follow-up to bot-strategy#347
+/// (Extended saw a 28h silent fail with the same pattern).
+const WS_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Priority message system for WebSocket sending.
 #[derive(Debug)]
@@ -591,7 +599,24 @@ impl LighterConnector {
                         // Handle messages in this connection with performance tracking
                         log::debug!("Starting WebSocket message handling loop");
 
-                        while let Some(message) = read.next().await {
+                        loop {
+                            let next = match tokio::time::timeout(
+                                WS_STALL_TIMEOUT,
+                                read.next(),
+                            )
+                            .await
+                            {
+                                Ok(next) => next,
+                                Err(_elapsed) => {
+                                    log::warn!(
+                                        "Lighter WS stalled — no frame for {}s, forcing reconnect (conn={})",
+                                        WS_STALL_TIMEOUT.as_secs(),
+                                        conn_label
+                                    );
+                                    break;
+                                }
+                            };
+                            let Some(message) = next else { break };
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
@@ -1659,5 +1684,51 @@ impl LighterConnector {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    use futures::stream::{self, StreamExt};
+
+    #[test]
+    fn ws_stall_timeout_is_60s() {
+        // Locks the activated bound. The Lighter heartbeat path detects a
+        // dead peer in ~40s, so 60s gives one heartbeat cycle of headroom
+        // before the outer watchdog fires.
+        assert_eq!(WS_STALL_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_fires_on_silently_stalled_stream() {
+        // Reproduces the bot-strategy#347 silent-fail pattern: a Stream
+        // that never yields anything (server stops sending without
+        // closing). Tokio's auto-advance of paused time resolves the
+        // timeout once it's the only outstanding work.
+        let mut silent = stream::pending::<Result<&'static str, &'static str>>();
+
+        let result = tokio::time::timeout(WS_STALL_TIMEOUT, silent.next()).await;
+
+        assert!(
+            result.is_err(),
+            "expected stall timeout to fire on a silent stream, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_passes_through_when_message_ready() {
+        // Sanity check: a frame already queued resolves the timeout
+        // immediately, no false reconnect.
+        let mut ready = stream::iter(vec![Ok::<_, &str>("frame")]);
+
+        let result = tokio::time::timeout(WS_STALL_TIMEOUT, ready.next()).await;
+
+        assert!(
+            matches!(result, Ok(Some(Ok("frame")))),
+            "expected ready frame to pass through, got {:?}",
+            result
+        );
     }
 }
