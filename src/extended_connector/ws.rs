@@ -23,12 +23,20 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum interval between any inbound WS frame (data, ping, pong, close)
+/// before the stream is treated as silently stalled and force-reconnected
+/// via the spawn-loop. Healthy Extended streams emit ping at ~30s and data
+/// far more often, so 60s is well outside normal idle and tightly catches
+/// the bot-strategy#347 silent-stop pattern (server stops sending without
+/// closing the connection).
+const WS_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -288,7 +296,22 @@ pub(super) async fn stream_orderbooks(
         ws_state.context("orderbook", Some(symbol), url)
     );
     let result = loop {
-        let message = match ws.next().await {
+        let next = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+            Ok(next) => next,
+            Err(_elapsed) => {
+                log::warn!(
+                    "WebSocket stalled — no frame for {}s, forcing reconnect ({})",
+                    WS_STALL_TIMEOUT.as_secs(),
+                    ws_state.context("orderbook", Some(symbol), url)
+                );
+                break Err(DexError::Other(format!(
+                    "ws stalled: no frame in {}s ({})",
+                    WS_STALL_TIMEOUT.as_secs(),
+                    ws_state.context("orderbook", Some(symbol), url)
+                )));
+            }
+        };
+        let message = match next {
             Some(Ok(message)) => {
                 ws_state.on_message();
                 message
@@ -404,8 +427,24 @@ pub(super) async fn stream_trades(
         "WebSocket connected successfully ({})",
         ws_state.context("trades", Some(symbol), url)
     );
-    while let Some(message) = ws.next().await {
-        let message = match message {
+    loop {
+        let next = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                log::warn!(
+                    "WebSocket stalled — no frame for {}s, forcing reconnect ({})",
+                    WS_STALL_TIMEOUT.as_secs(),
+                    ws_state.context("trades", Some(symbol), url)
+                );
+                return Err(DexError::Other(format!(
+                    "ws stalled: no frame in {}s ({})",
+                    WS_STALL_TIMEOUT.as_secs(),
+                    ws_state.context("trades", Some(symbol), url)
+                )));
+            }
+        };
+        let message = match next {
             Ok(message) => {
                 ws_state.on_message();
                 message
@@ -511,8 +550,24 @@ pub(super) async fn stream_account(
         ws_state.context("account", None, url)
     );
     let mut logged_once = false;
-    while let Some(message) = ws.next().await {
-        let message = match message {
+    loop {
+        let next = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                log::warn!(
+                    "WebSocket stalled — no frame for {}s, forcing reconnect ({})",
+                    WS_STALL_TIMEOUT.as_secs(),
+                    ws_state.context("account", None, url)
+                );
+                return Err(DexError::Other(format!(
+                    "ws stalled: no frame in {}s ({})",
+                    WS_STALL_TIMEOUT.as_secs(),
+                    ws_state.context("account", None, url)
+                )));
+            }
+        };
+        let message = match next {
             Ok(message) => {
                 ws_state.on_message();
                 message
@@ -663,4 +718,50 @@ pub(super) async fn stream_account(
         ws_state.context("account", None, url)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    use futures::stream::{self, StreamExt};
+
+    #[test]
+    fn ws_stall_timeout_is_60s() {
+        // The activated bound is the contract — production sets it once and
+        // every stream re-uses the same value. Locking it down keeps the
+        // bot-strategy#347 fix's behavior obvious to future readers.
+        assert_eq!(WS_STALL_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_fires_on_silently_stalled_stream() {
+        // Reproduces the bot-strategy#347 silent-fail pattern: a Stream that
+        // never yields anything (server stops sending without closing).
+        // tokio's auto-advance of paused time lets the timeout resolve
+        // immediately once it's the only outstanding work.
+        let mut silent = stream::pending::<Result<&'static str, &'static str>>();
+
+        let result = tokio::time::timeout(WS_STALL_TIMEOUT, silent.next()).await;
+
+        assert!(
+            result.is_err(),
+            "expected stall timeout to fire on a silent stream, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_passes_through_when_message_ready() {
+        // Sanity check: a stream with a frame already queued resolves the
+        // timeout immediately, no false reconnect.
+        let mut ready = stream::iter(vec![Ok::<_, &str>("frame")]);
+
+        let result = tokio::time::timeout(WS_STALL_TIMEOUT, ready.next()).await;
+
+        assert!(
+            matches!(result, Ok(Some(Ok("frame")))),
+            "expected ready frame to pass through, got {:?}",
+            result
+        );
+    }
 }
