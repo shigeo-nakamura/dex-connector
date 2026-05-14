@@ -48,9 +48,10 @@ pub(super) static MARKET_CACHE_INIT_LOCK: std::sync::LazyLock<Arc<tokio::sync::M
 /// instance's first `get_ticker` call misses its own cache and fires a
 /// REST, producing an N-way burst at startup. See bot-strategy#135
 /// follow-up.
-pub(super) static CACHED_EXCHANGE_STATS: std::sync::LazyLock<
-    Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
-> = std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
+type CachedExchangeStats = Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>;
+
+pub(super) static CACHED_EXCHANGE_STATS: std::sync::LazyLock<CachedExchangeStats> =
+    std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
 
 impl LighterConnector {
     pub(super) async fn refresh_market_cache(&self) -> Result<(), DexError> {
@@ -242,6 +243,11 @@ impl LighterConnector {
         !cache.by_symbol.is_empty()
     }
 
+    // Leader-election lock: only one task per process loads the metadata.
+    // Held intentionally across REST + retry loop so a second caller arriving
+    // mid-load waits for the first to finish instead of issuing duplicate
+    // /info/markets requests (bot-strategy#391).
+    #[allow(clippy::await_holding_invalid_type)]
     pub(super) async fn ensure_market_metadata_loaded(&self) -> Result<(), DexError> {
         if self.has_market_metadata().await {
             return Ok(());

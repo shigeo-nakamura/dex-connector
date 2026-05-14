@@ -420,6 +420,10 @@ impl ExtendedConnector {
         Some(OrderBookSnapshot { bids, asks })
     }
 
+    // `ws_tasks` mutex is held across `.get_market().await` etc. This runs
+    // exactly once per connector instance (guarded by `ws_started`), so the
+    // lock is effectively single-threaded here (bot-strategy#391).
+    #[allow(clippy::await_holding_invalid_type)]
     async fn spawn_ws_tasks(&self) {
         if self.websocket_url.is_none() {
             return;

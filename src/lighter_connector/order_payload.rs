@@ -66,6 +66,7 @@ pub(super) struct OrderPayload {
 /// IOC / immediate TIF get `0` (NilOrderExpiry), matching the Go SDK
 /// contract. The default for resting (GTC-style) orders is 24h, and
 /// `now_ms` is sampled by the caller so the helper stays pure.
+#[allow(clippy::too_many_arguments)] // mirrors create_order_native_with_type signature.
 pub(super) fn build_order_payload_type_only(
     market_id: u32,
     side: u32,
@@ -109,6 +110,7 @@ pub(super) fn build_order_payload_type_only(
 /// the Go SDK's `MinOrderExpiry >= 1` rule, and default to 28 days when
 /// the caller doesn't supply one. Non-trigger types fall back to the
 /// 24h default.
+#[allow(clippy::too_many_arguments)] // mirrors create_order_native_with_trigger signature.
 pub(super) fn build_order_payload_trigger(
     market_id: u32,
     side: u32,

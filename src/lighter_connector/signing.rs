@@ -53,6 +53,7 @@ impl LighterConnector {
 
     /// Call Go shared library to generate signature for CreateOrder transaction
     #[cfg(feature = "lighter-sdk")]
+    #[allow(clippy::too_many_arguments)] // mirrors Go SDK SignCreateOrder FFI signature.
     pub(super) async fn call_go_sign_create_order(
         &self,
         market_index: i32,

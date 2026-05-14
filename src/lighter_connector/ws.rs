@@ -52,14 +52,20 @@ impl OutboundMessage {
     }
 
     pub(super) fn is_pong(&self) -> bool {
-        match self {
-            OutboundMessage::Control(tokio_tungstenite::tungstenite::Message::Pong(_)) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            OutboundMessage::Control(tokio_tungstenite::tungstenite::Message::Pong(_))
+        )
     }
 }
 
 impl LighterConnector {
+    // The WS writer mutex (`ws_writer_for_task` / `ws_writer_for_reader`) IS
+    // the per-stream write critical section — holding it across `.send().await`
+    // is the entire point. The inner `#[allow]` attributes document the
+    // intentional pattern; the function-level allow covers the lint
+    // (bot-strategy#391).
+    #[allow(clippy::await_holding_invalid_type)]
     pub(super) async fn start_websocket(&self) -> Result<(), DexError> {
         let ws_url = self
             .websocket_url
@@ -140,7 +146,7 @@ impl LighterConnector {
 
             async fn reconnect_backoff(attempt: u32) {
                 let pow = BACKOFF_BASE.powi(attempt.min(12) as i32);
-                let base_secs = (pow as f64).min(BACKOFF_MAX_SECS as f64);
+                let base_secs = pow.min(BACKOFF_MAX_SECS as f64);
                 let jitter_ms: i64 = rand::thread_rng().gen_range(0..=250);
                 let dur = std::time::Duration::from_secs_f64(base_secs)
                     + std::time::Duration::from_millis(jitter_ms as u64);
@@ -213,13 +219,13 @@ impl LighterConnector {
 
                 // Try to establish connection with optimized configuration
                 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-                let mut config = WebSocketConfig::default();
-
-                // Optimize WebSocket configuration for low latency
-                config.max_message_size = Some(64 * 1024 * 1024); // 64MB
-                config.max_frame_size = Some(16 * 1024 * 1024); // 16MB
-                config.write_buffer_size = 128 * 1024; // 128KB write buffer
-                config.max_write_buffer_size = 1024 * 1024; // 1MB max write buffer
+                let config = WebSocketConfig {
+                    max_message_size: Some(64 * 1024 * 1024), // 64MB
+                    max_frame_size: Some(16 * 1024 * 1024),   // 16MB
+                    write_buffer_size: 128 * 1024,            // 128KB write buffer
+                    max_write_buffer_size: 1024 * 1024,       // 1MB max write buffer
+                    ..Default::default()
+                };
 
                 let connection_result = tokio_tungstenite::connect_async_with_config(
                     &ws_url_clone,
@@ -428,7 +434,12 @@ impl LighterConnector {
                                 let send_start = std::time::Instant::now();
                                 let is_pong = msg.is_pong();
 
-                                // Use shared writer with short-lived lock
+                                // Use shared writer with short-lived lock.
+                                // The lock IS the WS-write critical section
+                                // (one writer at a time per stream); holding
+                                // it across `.send().await` is by design
+                                // (bot-strategy#391).
+                                #[allow(clippy::await_holding_invalid_type)]
                                 let mut ws_write = ws_writer_for_task.lock().await;
                                 if let Err(e) = ws_write.send(msg.into_message()).await {
                                     log::error!(
@@ -527,7 +538,7 @@ impl LighterConnector {
                                         if !ping_pending_client_ping.load(Ordering::SeqCst)
                                             && idle_tx >= IDLE_PING_SECS
                                         {
-                                            let payload: [u8; 8] = (now as u64).to_be_bytes();
+                                            let payload: [u8; 8] = now.to_be_bytes();
                                             *ping_last_client_ping_payload.lock() = payload.to_vec();
 
                                             let ping_msg = OutboundMessage::Control(
@@ -710,7 +721,10 @@ impl LighterConnector {
                                         // Get current epoch for race detection logging
                                         let current_epoch = connection_epoch.load(Ordering::SeqCst);
 
-                                        // Direct pong send - bypass writer task for immediate response
+                                        // Direct pong send - bypass writer task for immediate response.
+                                        // WS-writer mutex held across `.send().await` by design
+                                        // (bot-strategy#391).
+                                        #[allow(clippy::await_holding_invalid_type)]
                                         if let Ok(mut ws_write) = ws_writer_for_reader.try_lock() {
                                             if let Err(e) = ws_write
                                                 .send(
@@ -758,6 +772,9 @@ impl LighterConnector {
                                                     std::time::Duration::from_millis(50),
                                                 )
                                                 .await;
+                                                // WS-writer mutex held across `.send().await`
+                                                // by design (bot-strategy#391).
+                                                #[allow(clippy::await_holding_invalid_type)]
                                                 if let Ok(mut ws_write) =
                                                     ws_writer_for_reader.try_lock()
                                                 {
@@ -793,7 +810,10 @@ impl LighterConnector {
                                                     "Pong timeout, closing connection (conn={})",
                                                     conn_label
                                                 );
-                                                // Proactively close to trigger reconnect before server timeout
+                                                // Proactively close to trigger reconnect before server timeout.
+                                                // WS-writer mutex held across `.close().await` by design
+                                                // (bot-strategy#391).
+                                                #[allow(clippy::await_holding_invalid_type)]
                                                 let mut ws_write =
                                                     ws_writer_for_reader.lock().await;
                                                 let _ = ws_write.close().await;
@@ -1002,6 +1022,7 @@ impl LighterConnector {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // static dispatch needs all cross-task refs; refactor blocked by trait shape.
     pub(super) async fn handle_websocket_message(
         message: Value,
         current_price: &Arc<RwLock<HashMap<String, (Decimal, u64)>>>,
@@ -1035,7 +1056,7 @@ impl LighterConnector {
                             .unwrap_or_default();
                         // Server sometimes returns channel as "order_book:1" instead of "order_book/1"
                         let market_id = channel
-                            .rsplit(|c| c == '/' || c == ':')
+                            .rsplit(['/', ':'])
                             .next()
                             .and_then(|id| id.parse::<u32>().ok());
                         let symbol = match market_id {
@@ -1237,7 +1258,7 @@ impl LighterConnector {
                     positions_ready,
                     balance_cache,
                     cached_collateral,
-                    account_index as u64,
+                    account_index,
                     market_cache,
                     default_symbol,
                 )
@@ -1266,7 +1287,7 @@ impl LighterConnector {
         // The server accepts `market_stats/<id>` on subscribe but delivers
         // `market_stats:<id>` on the push, matching the order_book pattern.
         let market_id = channel
-            .rsplit(|c| c == '/' || c == ':')
+            .rsplit(['/', ':'])
             .next()
             .and_then(|id| id.parse::<u32>().ok());
         let Some(market_id) = market_id else {
@@ -1304,6 +1325,7 @@ impl LighterConnector {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // static dispatch needs all cross-task refs; refactor blocked by trait shape.
     pub(super) async fn handle_account_update(
         data: &Value,
         msg_type: &str,
@@ -1321,7 +1343,7 @@ impl LighterConnector {
         positions_ready.store(true, Ordering::SeqCst);
         log::trace!("handle_account_update called with data: {:?}", data);
         if std::env::var("LIGHTER_WS_ACCOUNT_DUMP").ok().as_deref() == Some("1") {
-            log::info!("[WS_ACCOUNT_DUMP] {}", data.to_string());
+            log::info!("[WS_ACCOUNT_DUMP] {}", data);
         }
 
         // Handle positions update (can be array or object). Track unrealized_pnl
@@ -1330,11 +1352,7 @@ impl LighterConnector {
         let positions_vals: Option<Vec<Value>> =
             if let Some(arr) = data.get("positions").and_then(|p| p.as_array()) {
                 Some(arr.clone())
-            } else if let Some(map) = data.get("positions").and_then(|p| p.as_object()) {
-                Some(map.values().cloned().collect())
-            } else {
-                None
-            };
+            } else { data.get("positions").and_then(|p| p.as_object()).map(|map| map.values().cloned().collect()) };
         // None when no positions field was carried in this message;
         // Some(sum) — possibly zero — when the message did carry positions.
         // The distinction matters: a missing positions field must NOT cause
@@ -1492,29 +1510,47 @@ impl LighterConnector {
             );
         }
 
-        // Handle filled orders - try both 'fills' and 'trades' fields
+        // Handle filled orders - try both 'fills' and 'trades' fields.
+        //
+        // Two-phase write: parse + insert under the `filled_orders` lock, then
+        // call `remove_tracked_order` (which takes `cached_open_orders.write()`)
+        // after the lock is released. Holding `filled_orders` across that
+        // second `.await` was a lock-ordering hazard against `get_filled_orders`
+        // readers and any caller that grabs `cached_open_orders` first. See
+        // bot-strategy#391.
         if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
             log::info!(
                 "✅ [FILL_DETECTION] Found {} fills in account update",
                 fills.len()
             );
             let default_symbol = default_symbol.to_string();
-            let mut filled_map = filled_orders.write().await;
-            for fill in fills {
-                log::debug!("🔍 [FILL_DETECTION] Processing fill: {:?}", fill);
-                if let Ok(filled_order) = parse_filled_order(fill, account_id) {
-                    let order_id = filled_order.order_id.clone();
-                    log::info!("✅ [FILL_DETECTION] Added filled order: order_id={}, size={:?}, value={:?}",
-                              filled_order.order_id, filled_order.filled_size, filled_order.filled_value);
-                    filled_map
-                        .entry(default_symbol.clone())
-                        .or_insert_with(Vec::new)
-                        .push(filled_order);
-                    Self::remove_tracked_order(cached_open_orders, &default_symbol, &order_id)
-                        .await;
-                } else {
-                    log::debug!("Failed to parse filled order: {:?}", fill);
+            let removals: Vec<String> = {
+                let mut filled_map = filled_orders.write().await;
+                let mut removals = Vec::with_capacity(fills.len());
+                for fill in fills {
+                    log::debug!("🔍 [FILL_DETECTION] Processing fill: {:?}", fill);
+                    match parse_filled_order(fill, account_id) {
+                        Ok(filled_order) => {
+                            let order_id = filled_order.order_id.clone();
+                            log::info!(
+                                "✅ [FILL_DETECTION] Added filled order: order_id={}, size={:?}, value={:?}",
+                                filled_order.order_id,
+                                filled_order.filled_size,
+                                filled_order.filled_value
+                            );
+                            filled_map
+                                .entry(default_symbol.clone())
+                                .or_insert_with(Vec::new)
+                                .push(filled_order);
+                            removals.push(order_id);
+                        }
+                        Err(_) => log::debug!("Failed to parse filled order: {:?}", fill),
+                    }
                 }
+                removals
+            };
+            for order_id in removals {
+                Self::remove_tracked_order(cached_open_orders, &default_symbol, &order_id).await;
             }
         }
 
@@ -1579,7 +1615,7 @@ impl LighterConnector {
                                 trade.get("bid_client_id").and_then(|v| v.as_u64())
                             };
                             let order_id =
-                                client_id.unwrap_or_else(|| if is_ask { ask_id } else { bid_id });
+                                client_id.unwrap_or(if is_ask { ask_id } else { bid_id });
 
                             log::info!(
                                 "✅ [FILL_DETECTION] Trade detected: order_id={}, size={}, price={}, market_id={}",

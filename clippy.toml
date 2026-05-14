@@ -1,0 +1,19 @@
+# bot-strategy#391: forbid holding tokio async lock guards across `.await`.
+#
+# Tokio's lock guards are `Send`, so the compiler will not refuse code that
+# does `let g = lock.read().await; other.await;`. The classic outcome is a
+# live hang under sidecar / REST congestion (see #391's `get_balance`
+# regression). The macro-with-debug-panic alternative the issue floats is
+# not expressible in stable Rust — there is no Drop hook that fires "before
+# the await suspends" — but `clippy::await_holding_invalid_types` catches
+# the same bug class at compile time, which is strictly stronger.
+#
+# When you legitimately need to hold a guard across `.await` (very rare —
+# almost always a sign the data should be copied/cloned out first), tag the
+# specific call site with `#[allow(clippy::await_holding_invalid_types)]`
+# and a comment explaining why.
+await-holding-invalid-types = [
+    { path = "tokio::sync::MutexGuard", reason = "async lock held across await — bot-strategy#391" },
+    { path = "tokio::sync::RwLockReadGuard", reason = "async lock held across await — bot-strategy#391" },
+    { path = "tokio::sync::RwLockWriteGuard", reason = "async lock held across await — bot-strategy#391" },
+]

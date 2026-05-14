@@ -20,16 +20,16 @@ lazy_static! {
 pub fn string_to_decimal(string_value: Option<String>) -> Result<Decimal, DexError> {
     match string_value {
         Some(value) => match parse_to_decimal(&value) {
-            Ok(v) => return Ok(v),
+            Ok(v) => Ok(v),
             Err(_) => {
-                return Err(DexError::InvalidInput {
+                Err(DexError::InvalidInput {
                     field: "string_to_decimal".to_string(),
                     value,
                 })
             }
         },
         None => {
-            return Err(DexError::InvalidInput {
+            Err(DexError::InvalidInput {
                 field: "string_to_decimal".to_string(),
                 value: "None".to_string(),
             })
@@ -47,6 +47,7 @@ pub fn slippage_price(price: Decimal, is_buy: bool) -> Decimal {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)] // trait IS the public API; signatures are stable.
 pub trait DexConnector: Send + Sync {
     async fn start(&self) -> Result<(), DexError>;
 

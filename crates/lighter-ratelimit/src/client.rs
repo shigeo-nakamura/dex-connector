@@ -174,6 +174,9 @@ impl RateLimitClient {
         self.acquire_via_fallback(weight as i64, policy).await
     }
 
+    // sidecar_write_lock is held across `write_all/flush.await` by design;
+    // it IS the unix-socket write critical section (bot-strategy#391).
+    #[allow(clippy::await_holding_invalid_type)]
     async fn acquire_via_sidecar(
         &self,
         path: &std::path::Path,
@@ -238,7 +241,7 @@ impl RateLimitClient {
                     let remaining_budget = max_ms - elapsed;
                     // Sleep at most `remaining_budget`, and at most 100ms to stay
                     // responsive to other drains/refills.
-                    let sleep_for = est.min(remaining_budget).min(100).max(1);
+                    let sleep_for = est.min(remaining_budget).clamp(1, 100);
                     sleep_ms(sleep_for).await;
                     if self.inner.fallback.try_acquire(weight) {
                         return AcquireOutcome::Granted {

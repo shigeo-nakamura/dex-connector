@@ -1005,6 +1005,7 @@ impl LighterConnector {
         Ok(server_pubkey)
     }
 
+    #[allow(clippy::too_many_arguments)] // params mirror the FFI signature; OrderPayload struct consolidates downstream.
     async fn create_order_native_with_type(
         &self,
         market_id: u32,
@@ -1068,7 +1069,7 @@ impl LighterConnector {
 
         let response = self
             .client
-            .post(&format!("{}/api/v1/sendTx", self.base_url))
+            .post(format!("{}/api/v1/sendTx", self.base_url))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_data)
             .send()
@@ -1100,6 +1101,7 @@ impl LighterConnector {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // params mirror the FFI signature; OrderPayload struct consolidates downstream.
     async fn create_order_native_with_trigger(
         &self,
         market_id: u32,
@@ -1164,7 +1166,7 @@ impl LighterConnector {
 
         let response = self
             .client
-            .post(&format!("{}/api/v1/sendTx", self.base_url))
+            .post(format!("{}/api/v1/sendTx", self.base_url))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_data)
             .send()
@@ -1251,14 +1253,14 @@ impl LighterConnector {
 
         let output = std::process::Command::new("./venv/bin/python")
             .arg("sdk_send_order.py")
-            .arg(&format!("--market-id={}", market_id))
-            .arg(&format!("--side={}", side))
-            .arg(&format!("--tif={}", tif))
-            .arg(&format!("--base-amt={}", base_amount))
-            .arg(&format!("--price={}", price))
-            .arg(&format!("--client-id={}", client_id))
-            .env("LIGHTER_ACCOUNT_INDEX", &self.account_index.to_string())
-            .env("LIGHTER_API_KEY_INDEX", &self.api_key_index.to_string())
+            .arg(format!("--market-id={}", market_id))
+            .arg(format!("--side={}", side))
+            .arg(format!("--tif={}", tif))
+            .arg(format!("--base-amt={}", base_amount))
+            .arg(format!("--price={}", price))
+            .arg(format!("--client-id={}", client_id))
+            .env("LIGHTER_ACCOUNT_INDEX", self.account_index.to_string())
+            .env("LIGHTER_API_KEY_INDEX", self.api_key_index.to_string())
             .env("LIGHTER_PRIVATE_API_KEY", &self.api_private_key_hex)
             .current_dir(".")
             .output()
@@ -1902,7 +1904,7 @@ impl DexConnector for LighterConnector {
 
         let market_info = self.resolve_market_info(symbol).await?;
         let canonical_symbol = market_info.canonical_symbol.clone();
-        let min_order = market_info.min_order.clone();
+        let min_order = market_info.min_order;
 
         // exchangeStats is dead data — populates TickerResponse.volume /
         // num_trades which no downstream consumer (pairtrade, slow-mm) reads.
@@ -1981,7 +1983,7 @@ impl DexConnector for LighterConnector {
                     symbol: symbol.to_string(),
                     price: ws_price,
                     min_tick: Some(min_tick),
-                    min_order: min_order.clone(),
+                    min_order,
                     size_decimals: Some(market_info.size_decimals),
                     volume,
                     num_trades,
@@ -2987,7 +2989,7 @@ impl DexConnector for LighterConnector {
 
         let response = self
             .client
-            .post(&format!("{}/api/v1/sendTx", self.base_url))
+            .post(format!("{}/api/v1/sendTx", self.base_url))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_data)
             .send()
@@ -3370,9 +3372,9 @@ impl DexConnector for LighterConnector {
         let now = Utc::now();
         let cached_start = {
             let info = self.maintenance.read().await;
-            info.next_start.clone()
+            info.next_start
         };
-        let res = maintenance_within_window(cached_start.clone(), &now, hours_ahead);
+        let res = maintenance_within_window(cached_start, &now, hours_ahead);
         log::debug!(
             "Lighter maintenance check (cached): start={:?} now={} result={}",
             cached_start,
@@ -3523,27 +3525,37 @@ impl LighterConnector {
     /// Returns `None` if the WS has not yet delivered an account update; the
     /// caller then decides whether to wait (see bot-strategy#148) or fall
     /// back to REST.
+    ///
+    /// Acquires each cache lock in its own scope so neither guard is held
+    /// across the other's `.await` (bot-strategy#391).
     async fn try_read_cached_balance(&self, symbol: Option<&str>) -> Option<BalanceResponse> {
         if let Some(token_symbol) = symbol {
-            let positions = self.cached_positions.read().await;
-            if let Some(pos) = positions.iter().find(|p| p.symbol == token_symbol) {
-                return Some(BalanceResponse {
-                    equity: pos.size,
-                    balance: pos.size,
-                    position_entry_price: pos.entry_price,
-                    position_sign: Some(pos.sign),
-                });
+            let (matched, positions_empty) = {
+                let positions = self.cached_positions.read().await;
+                let matched = positions
+                    .iter()
+                    .find(|p| p.symbol == token_symbol)
+                    .map(|pos| BalanceResponse {
+                        equity: pos.size,
+                        balance: pos.size,
+                        position_entry_price: pos.entry_price,
+                        position_sign: Some(pos.sign),
+                    });
+                (matched, positions.is_empty())
+            };
+            if matched.is_some() {
+                return matched;
             }
-            let has_ws_balance = self
-                .balance_cache
-                .read()
-                .await
-                .as_ref()
-                .map(|(_, fetched_at)| {
-                    fetched_at.elapsed() < Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS)
-                })
-                .unwrap_or(false);
-            if !positions.is_empty() || has_ws_balance {
+            let has_ws_balance = {
+                let cache = self.balance_cache.read().await;
+                cache
+                    .as_ref()
+                    .map(|(_, fetched_at)| {
+                        fetched_at.elapsed() < Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS)
+                    })
+                    .unwrap_or(false)
+            };
+            if !positions_empty || has_ws_balance {
                 return Some(BalanceResponse {
                     equity: Decimal::ZERO,
                     balance: Decimal::ZERO,
