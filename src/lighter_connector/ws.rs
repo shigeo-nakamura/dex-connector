@@ -18,7 +18,9 @@
 
 use super::market_cache::MarketCache;
 use super::parsing::{parse_canceled_order, parse_filled_order, value_to_decimal};
-use super::{LighterConnector, LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition};
+use super::{
+    AccountState, LighterConnector, LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition,
+};
 use crate::dex_connector::string_to_decimal;
 use crate::dex_request::DexError;
 use crate::{BalanceResponse, CanceledOrder, FilledOrder, OpenOrder, OrderSide, PositionSnapshot};
@@ -96,11 +98,11 @@ impl LighterConnector {
         let order_book = self.order_book.clone();
         let filled_orders = self.filled_orders.clone();
         let canceled_orders = self.canceled_orders.clone();
-        let cached_positions = self.cached_positions.clone();
         let cached_open_orders = self.cached_open_orders.clone();
         let positions_ready = self.positions_ready.clone();
-        let balance_cache = self.balance_cache.clone();
-        let cached_collateral = self.cached_collateral.clone();
+        // bot-strategy#392: positions + balance + collateral now share one
+        // RwLock; clone the bundle Arc instead of three independent caches.
+        let account_state = self.account_state.clone();
         let funding_rate_cache = self.funding_rate_cache.clone();
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
@@ -663,10 +665,8 @@ impl LighterConnector {
                                                 &filled_orders,
                                                 &canceled_orders,
                                                 &cached_open_orders,
-                                                &cached_positions,
+                                                &account_state,
                                                 &positions_ready,
-                                                &balance_cache,
-                                                &cached_collateral,
                                                 &funding_rate_cache,
                                                 account_index,
                                                 &market_cache,
@@ -1019,10 +1019,8 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
-        cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
+        account_state: &Arc<RwLock<AccountState>>,
         positions_ready: &Arc<AtomicBool>,
-        balance_cache: &Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
-        cached_collateral: &Arc<RwLock<Option<Decimal>>>,
         funding_rate_cache: &Arc<RwLock<HashMap<u32, Decimal>>>,
         account_index: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
@@ -1242,10 +1240,8 @@ impl LighterConnector {
                     filled_orders,
                     canceled_orders,
                     cached_open_orders,
-                    cached_positions,
+                    account_state,
                     positions_ready,
-                    balance_cache,
-                    cached_collateral,
                     account_index,
                     market_cache,
                     default_symbol,
@@ -1320,10 +1316,8 @@ impl LighterConnector {
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
         cached_open_orders: &Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
-        cached_positions: &Arc<RwLock<Vec<PositionSnapshot>>>,
+        account_state: &Arc<RwLock<AccountState>>,
         positions_ready: &Arc<AtomicBool>,
-        balance_cache: &Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
-        cached_collateral: &Arc<RwLock<Option<Decimal>>>,
         account_id: u64,
         market_cache: &Arc<RwLock<MarketCache>>,
         default_symbol: &str,
@@ -1347,6 +1341,10 @@ impl LighterConnector {
         // us to treat unrealized_pnl as 0 (which would corrupt the cached
         // equity); a present-but-all-flat positions field correctly means 0.
         let mut sum_unrealized_pnl: Option<Decimal> = None;
+        // bot-strategy#392: parse the positions field into a side buffer so
+        // the actual `account_state` write happens once below alongside
+        // collateral + balance updates.
+        let mut positions_updates: Option<Vec<(String, Option<PositionSnapshot>)>> = None;
         if let Some(vals) = positions_vals {
             let allow_empty = msg_type == "subscribed/account_all";
             if vals.is_empty() && !allow_empty {
@@ -1383,30 +1381,7 @@ impl LighterConnector {
                     }
                 }
                 sum_unrealized_pnl = Some(acc);
-                if msg_type == "subscribed/account_all" {
-                    let mut cache = cached_positions.write().await;
-                    *cache = updates.into_iter().filter_map(|(_, snap)| snap).collect();
-                    log::info!("Updated cached positions: {} positions", cache.len());
-                } else {
-                    let mut cache = cached_positions.write().await;
-                    let mut map: HashMap<String, PositionSnapshot> = cache
-                        .iter()
-                        .cloned()
-                        .map(|p| (p.symbol.clone(), p))
-                        .collect();
-                    for (symbol, maybe_snap) in updates {
-                        match maybe_snap {
-                            Some(snap) => {
-                                map.insert(symbol, snap);
-                            }
-                            None => {
-                                map.remove(&symbol);
-                            }
-                        }
-                    }
-                    *cache = map.into_values().collect();
-                    log::info!("Merged cached positions: {} positions", cache.len());
-                }
+                positions_updates = Some(updates);
             }
         }
 
@@ -1422,12 +1397,12 @@ impl LighterConnector {
         //
         // `subscribed/account_all` carries assets, so margin_balance gets
         // refreshed on (re)subscribe and after fills (which trigger a REST
-        // refresh that reseeds cached_collateral). `update/account_all` ships
-        // `assets:null` but does carry positions, so we recompute equity
-        // from the latest unrealized_pnl combined with the previously cached
-        // collateral. Fall back to the legacy direct-totals path if Lighter
-        // ever populates them on the parent account or returns to the older
-        // schema.
+        // refresh that reseeds `account_state.collateral`).
+        // `update/account_all` ships `assets:null` but does carry positions,
+        // so we recompute equity from the latest unrealized_pnl combined
+        // with the previously cached collateral. Fall back to the legacy
+        // direct-totals path if Lighter ever populates them on the parent
+        // account or returns to the older schema.
         let direct_total = data.get("total_asset_value").and_then(value_to_decimal);
         let direct_available = data.get("available_balance").and_then(value_to_decimal);
 
@@ -1443,59 +1418,100 @@ impl LighterConnector {
                     asset.get("margin_balance").and_then(value_to_decimal)
                 })
             });
-        if let Some(mb) = usdc_margin_balance {
-            let mut collateral = cached_collateral.write().await;
-            *collateral = Some(mb);
-        }
 
-        let derived_equity = if let Some(pnl_sum) = sum_unrealized_pnl {
-            let collateral = cached_collateral.read().await;
-            collateral.map(|c| (c, c + pnl_sum))
-        } else {
-            None
-        };
+        // bot-strategy#392: apply positions + collateral + balance updates
+        // under a single `account_state` write guard so a reader can never
+        // observe a fresh balance against a stale collateral (or vice versa).
+        // Replaces the three independent locks (`cached_positions`,
+        // `cached_collateral`, `balance_cache`) the audit flagged.
+        {
+            let mut state = account_state.write().await;
 
-        if direct_total.is_some() || direct_available.is_some() {
-            let equity = direct_total.or(direct_available).unwrap_or(Decimal::ZERO);
-            let balance = direct_available.or(direct_total).unwrap_or(equity);
-            let mut cache = balance_cache.write().await;
-            *cache = Some((
-                BalanceResponse {
+            // Position updates (formerly the `cached_positions.write()` branch).
+            if let Some(updates) = positions_updates {
+                if msg_type == "subscribed/account_all" {
+                    state.positions =
+                        updates.into_iter().filter_map(|(_, snap)| snap).collect();
+                    log::info!(
+                        "Updated cached positions: {} positions",
+                        state.positions.len()
+                    );
+                } else {
+                    let mut map: HashMap<String, PositionSnapshot> = state
+                        .positions
+                        .iter()
+                        .cloned()
+                        .map(|p| (p.symbol.clone(), p))
+                        .collect();
+                    for (symbol, maybe_snap) in updates {
+                        match maybe_snap {
+                            Some(snap) => {
+                                map.insert(symbol, snap);
+                            }
+                            None => {
+                                map.remove(&symbol);
+                            }
+                        }
+                    }
+                    state.positions = map.into_values().collect();
+                    log::info!(
+                        "Merged cached positions: {} positions",
+                        state.positions.len()
+                    );
+                }
+            }
+
+            // Collateral seed (formerly `cached_collateral.write()`).
+            if let Some(mb) = usdc_margin_balance {
+                state.collateral = Some(mb);
+            }
+
+            // Balance derivation. The previous code read `cached_collateral`
+            // after writing it; with the bundle we just read `state.collateral`
+            // inline.
+            let derived_equity = sum_unrealized_pnl
+                .and_then(|pnl_sum| state.collateral.map(|c| (c, c + pnl_sum)));
+
+            if direct_total.is_some() || direct_available.is_some() {
+                let equity = direct_total.or(direct_available).unwrap_or(Decimal::ZERO);
+                let balance = direct_available.or(direct_total).unwrap_or(equity);
+                state.balance = Some((
+                    BalanceResponse {
+                        equity,
+                        balance,
+                        position_entry_price: None,
+                        position_sign: None,
+                    },
+                    Instant::now(),
+                ));
+                log::debug!(
+                    "Updated cached balance from WS direct totals: equity={}, balance={}",
                     equity,
-                    balance,
-                    position_entry_price: None,
-                    position_sign: None,
-                },
-                Instant::now(),
-            ));
-            log::debug!(
-                "Updated cached balance from WS direct totals: equity={}, balance={}",
-                equity,
-                balance
-            );
-        } else if let Some((collateral, equity)) = derived_equity {
-            let mut cache = balance_cache.write().await;
-            *cache = Some((
-                BalanceResponse {
-                    equity,
-                    balance: collateral,
-                    position_entry_price: None,
-                    position_sign: None,
-                },
-                Instant::now(),
-            ));
-            log::debug!(
-                "Updated cached balance from WS derivation: collateral={} +unrealized_pnl_sum={} =equity={}",
-                collateral,
-                equity - collateral,
-                equity
-            );
-        } else {
-            log::debug!(
-                "Skipping WS balance update: no direct totals and no derivation inputs (collateral_cached={}, positions_in_msg={})",
-                cached_collateral.read().await.is_some(),
-                sum_unrealized_pnl.is_some(),
-            );
+                    balance
+                );
+            } else if let Some((collateral, equity)) = derived_equity {
+                state.balance = Some((
+                    BalanceResponse {
+                        equity,
+                        balance: collateral,
+                        position_entry_price: None,
+                        position_sign: None,
+                    },
+                    Instant::now(),
+                ));
+                log::debug!(
+                    "Updated cached balance from WS derivation: collateral={} +unrealized_pnl_sum={} =equity={}",
+                    collateral,
+                    equity - collateral,
+                    equity
+                );
+            } else {
+                log::debug!(
+                    "Skipping WS balance update: no direct totals and no derivation inputs (collateral_cached={}, positions_in_msg={})",
+                    state.collateral.is_some(),
+                    sum_unrealized_pnl.is_some(),
+                );
+            }
         }
 
         // Handle filled orders - try both 'fills' and 'trades' fields.
@@ -1669,8 +1685,8 @@ impl LighterConnector {
             // rather than returning pre-fill equity for up to a full TTL
             // window. See bot-strategy#155.
             if had_fills {
-                let mut cache = balance_cache.write().await;
-                *cache = None;
+                let mut state = account_state.write().await;
+                state.balance = None;
                 log::debug!("Invalidated balance_cache after WS fill");
             }
         } else {

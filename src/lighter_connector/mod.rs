@@ -166,6 +166,29 @@ use parsing::{
 };
 use rest::track_api_call;
 
+/// Bundled account-side cache shared between REST (`get_balance` /
+/// `get_positions`) and WS (`handle_account_update` / fill detection).
+///
+/// All three fields used to live behind their own `Arc<RwLock<...>>`.
+/// A WS fill (bot-strategy#155 / #239) has to invalidate `balance` and
+/// keep `collateral` consistent while positions update; bundling them
+/// under one lock makes that invalidation atomic and removes one variant
+/// of the lock-ordering hazard the bot-strategy#392 audit surfaced.
+#[derive(Default)]
+struct AccountState {
+    positions: Vec<PositionSnapshot>,
+    /// `(response, fetched_at)` — `Instant` so callers can expire
+    /// entries beyond `BALANCE_CACHE_TTL_SECS`. See bot-strategy#155.
+    balance: Option<(BalanceResponse, Instant)>,
+    /// Latest known `assets[USDC].margin_balance` (the perp sub-account
+    /// collateral). Seeded from REST `/account` + WS
+    /// `subscribed/account_all`, then combined with the live
+    /// `positions[*].unrealized_pnl` from `update/account_all` to derive
+    /// mark-to-market equity without further REST. Invalidated by
+    /// WS-fill (the next REST refresh reseeds it). See bot-strategy#239.
+    collateral: Option<Decimal>,
+}
+
 #[derive(Clone)]
 pub struct LighterConnector {
     api_key_public: String,      // X-API-KEY header (from Lighter UI)
@@ -203,19 +226,12 @@ pub struct LighterConnector {
     maintenance: Arc<RwLock<MaintenanceInfo>>,
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
-    cached_positions: Arc<RwLock<Vec<PositionSnapshot>>>,
+    /// Bundled positions + balance + collateral cache (bot-strategy#392).
+    /// One lock so WS-fill invalidation of `balance` and reseed of
+    /// `collateral` are atomic with the positions update that motivated
+    /// them. See `AccountState`.
+    account_state: Arc<RwLock<AccountState>>,
     positions_ready: Arc<AtomicBool>,
-    // (response, fetched_at) — Instant so we can expire entries beyond the
-    // BALANCE_CACHE_TTL_SECS window. See bot-strategy#155.
-    balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>>,
-    // Latest known `assets[USDC].margin_balance` (the perp sub-account
-    // collateral). Seeded from REST `/account` and from the initial
-    // `subscribed/account_all` WS snapshot, then combined with the live
-    // `positions[*].unrealized_pnl` from `update/account_all` to derive a
-    // mark-to-market equity without further REST calls. Invalidated by
-    // WS-fill (see balance_cache invalidation) so the next REST refresh
-    // reseeds it. See bot-strategy#239.
-    cached_collateral: Arc<RwLock<Option<Decimal>>>,
     // Connection epoch counter for race detection
     connection_epoch: Arc<AtomicU64>,
     // Market metadata cache for symbol↔market_id resolution
@@ -887,10 +903,8 @@ impl LighterConnector {
                 last_checked: None,
             })),
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
-            cached_positions: Arc::new(RwLock::new(Vec::new())),
+            account_state: Arc::new(RwLock::new(AccountState::default())),
             positions_ready: Arc::new(AtomicBool::new(false)),
-            balance_cache: Arc::new(RwLock::new(None)),
-            cached_collateral: Arc::new(RwLock::new(None)),
             // Connection epoch counter for race detection
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::clone(&MARKET_CACHE),
@@ -949,10 +963,8 @@ impl LighterConnector {
                 last_checked: None,
             })),
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
-            cached_positions: Arc::new(RwLock::new(Vec::new())),
+            account_state: Arc::new(RwLock::new(AccountState::default())),
             positions_ready: Arc::new(AtomicBool::new(false)),
-            balance_cache: Arc::new(RwLock::new(None)),
-            cached_collateral: Arc::new(RwLock::new(None)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
             market_cache: Arc::clone(&MARKET_CACHE),
             market_cache_init_lock: Arc::clone(&MARKET_CACHE_INIT_LOCK),
@@ -2293,24 +2305,26 @@ impl DexConnector for LighterConnector {
         // memory. A WS fill invalidates eagerly (handle_account_update) so
         // realized P&L / fees are picked up on the next caller. See
         // bot-strategy#155 (event-sourced equity tracking).
-        {
-            let mut cache = self.balance_cache.write().await;
-            *cache = Some((response.clone(), Instant::now()));
-        }
-
-        // Seed cached_collateral from REST so subsequent WS-only updates can
-        // recompute equity = collateral + sum(unrealized_pnl) without another
-        // REST. Use assets[USDC].margin_balance from the response when
-        // present; this matches `total_asset_value` minus
-        // sum(positions.unrealized_pnl). See bot-strategy#239.
-        if let Some(usdc) = account
+        //
+        // bot-strategy#392: balance + collateral now share a single
+        // RwLock so the seed is atomic — readers cannot observe the new
+        // balance against a stale collateral.
+        let collateral_seed = account
             .assets
             .iter()
             .find(|a| a.symbol == "USDC")
-            .and_then(|a| string_to_decimal(Some(a.margin_balance.clone())).ok())
+            .and_then(|a| string_to_decimal(Some(a.margin_balance.clone())).ok());
         {
-            let mut collateral = self.cached_collateral.write().await;
-            *collateral = Some(usdc);
+            let mut state = self.account_state.write().await;
+            state.balance = Some((response.clone(), Instant::now()));
+            // Seed collateral from REST so subsequent WS-only updates can
+            // recompute equity = collateral + sum(unrealized_pnl) without
+            // another REST. Use assets[USDC].margin_balance when present;
+            // matches `total_asset_value` minus sum(positions.unrealized_pnl).
+            // See bot-strategy#239.
+            if let Some(usdc) = collateral_seed {
+                state.collateral = Some(usdc);
+            }
         }
 
         Ok(response)
@@ -2318,8 +2332,8 @@ impl DexConnector for LighterConnector {
 
     async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
         let cached = {
-            let cache = self.balance_cache.read().await;
-            cache.as_ref().and_then(|(balance, fetched_at)| {
+            let state = self.account_state.read().await;
+            state.balance.as_ref().and_then(|(balance, fetched_at)| {
                 if fetched_at.elapsed() >= Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS) {
                     return None;
                 }
@@ -2440,8 +2454,8 @@ impl DexConnector for LighterConnector {
                 "positions not ready from websocket".to_string(),
             ));
         }
-        let positions_guard = self.cached_positions.read().await;
-        Ok(positions_guard.clone())
+        let state = self.account_state.read().await;
+        Ok(state.positions.clone())
     }
 
     async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
@@ -3526,35 +3540,34 @@ impl LighterConnector {
     /// caller then decides whether to wait (see bot-strategy#148) or fall
     /// back to REST.
     ///
-    /// Acquires each cache lock in its own scope so neither guard is held
-    /// across the other's `.await` (bot-strategy#391).
+    /// bot-strategy#392: positions + balance now share `account_state`, so
+    /// a single read guard covers both lookups instead of acquiring two
+    /// locks back-to-back (which #391 already kept from overlapping by
+    /// scoping each guard).
     async fn try_read_cached_balance(&self, symbol: Option<&str>) -> Option<BalanceResponse> {
+        let state = self.account_state.read().await;
         if let Some(token_symbol) = symbol {
-            let (matched, positions_empty) = {
-                let positions = self.cached_positions.read().await;
-                let matched = positions
-                    .iter()
-                    .find(|p| p.symbol == token_symbol)
-                    .map(|pos| BalanceResponse {
-                        equity: pos.size,
-                        balance: pos.size,
-                        position_entry_price: pos.entry_price,
-                        position_sign: Some(pos.sign),
-                    });
-                (matched, positions.is_empty())
-            };
+            let matched = state
+                .positions
+                .iter()
+                .find(|p| p.symbol == token_symbol)
+                .map(|pos| BalanceResponse {
+                    equity: pos.size,
+                    balance: pos.size,
+                    position_entry_price: pos.entry_price,
+                    position_sign: Some(pos.sign),
+                });
             if matched.is_some() {
                 return matched;
             }
-            let has_ws_balance = {
-                let cache = self.balance_cache.read().await;
-                cache
-                    .as_ref()
-                    .map(|(_, fetched_at)| {
-                        fetched_at.elapsed() < Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS)
-                    })
-                    .unwrap_or(false)
-            };
+            let positions_empty = state.positions.is_empty();
+            let has_ws_balance = state
+                .balance
+                .as_ref()
+                .map(|(_, fetched_at)| {
+                    fetched_at.elapsed() < Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS)
+                })
+                .unwrap_or(false);
             if !positions_empty || has_ws_balance {
                 return Some(BalanceResponse {
                     equity: Decimal::ZERO,
@@ -3565,8 +3578,7 @@ impl LighterConnector {
             }
             None
         } else {
-            let cache = self.balance_cache.read().await;
-            cache.as_ref().and_then(|(balance, fetched_at)| {
+            state.balance.as_ref().and_then(|(balance, fetched_at)| {
                 if fetched_at.elapsed() >= Duration::from_secs(Self::BALANCE_CACHE_TTL_SECS) {
                     return None;
                 }
@@ -3817,9 +3829,10 @@ mod tests {
     }
 
     // bot-strategy#155: event-sourced equity tracking. An update that carries
-    // explicit totals must land in balance_cache as (response, fetched_at) so
-    // TTL-aware readers can expire it. Verifies the tuple shape and non-zero
-    // timestamp (which matters for try_read_cached_balance staleness checks).
+    // explicit totals must land in `account_state.balance` as
+    // (response, fetched_at) so TTL-aware readers can expire it. Verifies
+    // the tuple shape and non-zero timestamp (which matters for
+    // try_read_cached_balance staleness checks).
     #[tokio::test]
     async fn account_update_with_explicit_totals_populates_cache_with_timestamp() {
         use serde_json::json;
@@ -3829,11 +3842,8 @@ mod tests {
         let filled_orders = Arc::new(RwLock::new(HashMap::new()));
         let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
         let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
-        let cached_positions = Arc::new(RwLock::new(Vec::new()));
+        let account_state = Arc::new(RwLock::new(AccountState::default()));
         let positions_ready = Arc::new(AtomicBool::new(false));
-        let balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>> =
-            Arc::new(RwLock::new(None));
-        let cached_collateral: Arc<RwLock<Option<Decimal>>> = Arc::new(RwLock::new(None));
         let market_cache = Arc::new(RwLock::new(MarketCache::default()));
 
         let data = json!({
@@ -3848,27 +3858,28 @@ mod tests {
             &filled_orders,
             &canceled_orders,
             &cached_open_orders,
-            &cached_positions,
+            &account_state,
             &positions_ready,
-            &balance_cache,
-            &cached_collateral,
             1,
             &market_cache,
             "BTC",
         )
         .await;
 
-        let guard = balance_cache.read().await;
-        let (resp, fetched_at) = guard.as_ref().expect("explicit totals must populate cache");
+        let guard = account_state.read().await;
+        let (resp, fetched_at) = guard
+            .balance
+            .as_ref()
+            .expect("explicit totals must populate cache");
         assert_eq!(resp.equity, Decimal::from_str("999.04").unwrap());
         assert_eq!(resp.balance, Decimal::from_str("800.00").unwrap());
         assert!(*fetched_at >= before, "fetched_at must be recent");
     }
 
-    // bot-strategy#155: a WS fill must invalidate balance_cache so the next
-    // get_balance(None) goes back to REST and picks up the post-fill
-    // realized P&L + fees. We simulate a pre-populated cache, deliver a
-    // trades payload, and verify the cache is cleared.
+    // bot-strategy#155: a WS fill must invalidate `account_state.balance`
+    // so the next get_balance(None) goes back to REST and picks up the
+    // post-fill realized P&L + fees. We simulate a pre-populated cache,
+    // deliver a trades payload, and verify the cache is cleared.
     #[tokio::test]
     async fn ws_fill_invalidates_balance_cache() {
         use serde_json::json;
@@ -3878,10 +3889,10 @@ mod tests {
         let filled_orders = Arc::new(RwLock::new(HashMap::new()));
         let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
         let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
-        let cached_positions = Arc::new(RwLock::new(Vec::new()));
         let positions_ready = Arc::new(AtomicBool::new(false));
-        let balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>> =
-            Arc::new(RwLock::new(Some((
+        let account_state = Arc::new(RwLock::new(AccountState {
+            positions: Vec::new(),
+            balance: Some((
                 BalanceResponse {
                     equity: Decimal::from_str("500.0").unwrap(),
                     balance: Decimal::from_str("500.0").unwrap(),
@@ -3889,8 +3900,9 @@ mod tests {
                     position_sign: None,
                 },
                 Instant::now(),
-            ))));
-        let cached_collateral: Arc<RwLock<Option<Decimal>>> = Arc::new(RwLock::new(None));
+            )),
+            collateral: None,
+        }));
 
         // Seed market_cache so the fill's market_id=0 resolves to a symbol
         // and the trade parse path engages (otherwise pending_inserts stays
@@ -3932,10 +3944,8 @@ mod tests {
             &filled_orders,
             &canceled_orders,
             &cached_open_orders,
-            &cached_positions,
+            &account_state,
             &positions_ready,
-            &balance_cache,
-            &cached_collateral,
             522842,
             &market_cache,
             "ETH",
@@ -3943,7 +3953,7 @@ mod tests {
         .await;
 
         assert!(
-            balance_cache.read().await.is_none(),
+            account_state.read().await.balance.is_none(),
             "WS fill must invalidate balance_cache so the next get_balance fetches fresh equity"
         );
     }
@@ -3962,11 +3972,8 @@ mod tests {
         let filled_orders = Arc::new(RwLock::new(HashMap::new()));
         let canceled_orders = Arc::new(RwLock::new(HashMap::new()));
         let cached_open_orders = Arc::new(RwLock::new(HashMap::new()));
-        let cached_positions = Arc::new(RwLock::new(Vec::new()));
         let positions_ready = Arc::new(AtomicBool::new(false));
-        let balance_cache: Arc<RwLock<Option<(BalanceResponse, Instant)>>> =
-            Arc::new(RwLock::new(None));
-        let cached_collateral: Arc<RwLock<Option<Decimal>>> = Arc::new(RwLock::new(None));
+        let account_state = Arc::new(RwLock::new(AccountState::default()));
         let market_cache = Arc::new(RwLock::new(MarketCache::default()));
 
         // Fixture mirrors Frankfurt 2026-04-25 00:11 UTC REST response (one
@@ -4014,10 +4021,8 @@ mod tests {
             &filled_orders,
             &canceled_orders,
             &cached_open_orders,
-            &cached_positions,
+            &account_state,
             &positions_ready,
-            &balance_cache,
-            &cached_collateral,
             281474976624818,
             &market_cache,
             "ETH",
@@ -4028,25 +4033,27 @@ mod tests {
         let pnl_sum = Decimal::from_str("0.179840").unwrap();
         let expected_equity = collateral + pnl_sum;
 
-        assert_eq!(
-            *cached_collateral.read().await,
-            Some(collateral),
-            "subscribed snapshot must seed cached_collateral from assets[USDC].margin_balance"
-        );
-        let guard = balance_cache.read().await;
-        let (resp, _) = guard
-            .as_ref()
-            .expect("subscribed snapshot must populate balance_cache");
-        assert_eq!(resp.balance, collateral, "balance reflects raw collateral");
-        assert_eq!(
-            resp.equity, expected_equity,
-            "equity = collateral + sum(unrealized_pnl)"
-        );
-        drop(guard);
+        {
+            let guard = account_state.read().await;
+            assert_eq!(
+                guard.collateral,
+                Some(collateral),
+                "subscribed snapshot must seed account_state.collateral from assets[USDC].margin_balance"
+            );
+            let (resp, _) = guard
+                .balance
+                .as_ref()
+                .expect("subscribed snapshot must populate account_state.balance");
+            assert_eq!(resp.balance, collateral, "balance reflects raw collateral");
+            assert_eq!(
+                resp.equity, expected_equity,
+                "equity = collateral + sum(unrealized_pnl)"
+            );
+        }
 
         // Now deliver an update with assets:null but updated positions
         // (mark-to-market drift). Equity must update using the SAME
-        // cached_collateral combined with the new pnl_sum.
+        // account_state.collateral combined with the new pnl_sum.
         let update = json!({
             "account": 281474976624818u64,
             "assets": null,
@@ -4079,10 +4086,8 @@ mod tests {
             &filled_orders,
             &canceled_orders,
             &cached_open_orders,
-            &cached_positions,
+            &account_state,
             &positions_ready,
-            &balance_cache,
-            &cached_collateral,
             281474976624818,
             &market_cache,
             "ETH",
@@ -4091,13 +4096,16 @@ mod tests {
 
         let new_pnl_sum = Decimal::from_str("3.000000").unwrap();
         let new_expected_equity = collateral + new_pnl_sum;
+        let guard = account_state.read().await;
         assert_eq!(
-            *cached_collateral.read().await,
+            guard.collateral,
             Some(collateral),
-            "update with assets:null must NOT reset cached_collateral"
+            "update with assets:null must NOT reset account_state.collateral"
         );
-        let guard = balance_cache.read().await;
-        let (resp, _) = guard.as_ref().expect("update must refresh balance_cache");
+        let (resp, _) = guard
+            .balance
+            .as_ref()
+            .expect("update must refresh account_state.balance");
         assert_eq!(resp.balance, collateral);
         assert_eq!(resp.equity, new_expected_equity);
     }
