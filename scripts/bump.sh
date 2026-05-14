@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bump dex-connector across pairtrade + slow-mm in one shot.
+# Bump dex-connector across pairtrade + xvenue-arb in one shot.
 #
 # Usage:
 #   scripts/bump.sh v4.2.42
@@ -10,12 +10,13 @@
 #   3. Creates the tag on dex-connector HEAD
 #   4. In pairtrade: sed-bumps `DEX_CONNECTOR_REF`, runs `cargo update -p
 #      dex-connector`, commits
-#   5. Same for slow-mm
+#   5. Same for xvenue-arb
 #   6. Prints the push commands for the user to run
 #
-# Assumes sibling layout: ~/bot/{dex-connector,pairtrade,slow-mm}
+# Assumes sibling layout: ~/bot/{dex-connector,pairtrade,xvenue-arb}
 #
-# Tracked in bot-strategy#119.
+# Tracked in bot-strategy#119. slow-mm support removed after engine retirement
+# (#102, 2026-04-25); xvenue-arb added as the second downstream consumer.
 
 set -euo pipefail
 
@@ -32,17 +33,9 @@ esac
 
 DEX_DIR="${DEX_DIR:-$HOME/bot/dex-connector}"
 PAIR_DIR="${PAIR_DIR:-$HOME/bot/pairtrade}"
-MM_DIR="${MM_DIR:-$HOME/bot/slow-mm}"
+ARB_DIR="${ARB_DIR:-$HOME/bot/xvenue-arb}"
 
-# slow-mm is archived (engine retired post-#102). Treat MM_DIR as
-# optional: bump only if a sibling checkout exists.
-HAS_MM=1
-if [ ! -d "$MM_DIR/.git" ]; then
-    HAS_MM=0
-    echo "Skipping slow-mm: $MM_DIR is not a git repo (archived engine)."
-fi
-
-for d in "$DEX_DIR" "$PAIR_DIR"; do
+for d in "$DEX_DIR" "$PAIR_DIR" "$ARB_DIR"; do
     if [ ! -d "$d/.git" ]; then
         echo "Not a git repo: $d"
         exit 1
@@ -74,9 +67,7 @@ require_clean() {
 }
 require_clean "$DEX_DIR" Cargo.toml
 require_clean "$PAIR_DIR" .github/workflows/ci.yml Cargo.lock
-if [ "$HAS_MM" -eq 1 ]; then
-    require_clean "$MM_DIR" .github/workflows/ci.yml Cargo.lock
-fi
+require_clean "$ARB_DIR" .github/workflows/ci.yml Cargo.lock
 
 echo "== dex-connector: bumping Cargo.toml version + tagging $TAG =="
 cd "$DEX_DIR"
@@ -111,9 +102,7 @@ bump_downstream() {
     git commit -m "Bump dex-connector to $TAG"
 }
 bump_downstream "$PAIR_DIR"
-if [ "$HAS_MM" -eq 1 ]; then
-    bump_downstream "$MM_DIR"
-fi
+bump_downstream "$ARB_DIR"
 
 cat <<EOM
 
@@ -121,9 +110,7 @@ Done locally. To roll out, push in this order:
 
   cd $DEX_DIR   && git push origin \$(git rev-parse --abbrev-ref HEAD) && git push origin $TAG
   cd $PAIR_DIR  && git push origin \$(git rev-parse --abbrev-ref HEAD)
+  cd $ARB_DIR   && git push origin \$(git rev-parse --abbrev-ref HEAD)
+
+The dex-connector tag must land first so downstream CI can resolve it.
 EOM
-if [ "$HAS_MM" -eq 1 ]; then
-    echo "  cd $MM_DIR    && git push origin \$(git rev-parse --abbrev-ref HEAD)"
-fi
-echo
-echo "The dex-connector tag must land first so downstream CI can resolve it."
