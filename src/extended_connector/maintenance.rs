@@ -139,7 +139,7 @@ impl ExtendedConnector {
         }
 
         let api_base = self.env.api_base().to_string();
-        let tracked: Vec<String> = self.tracked_symbols.iter().cloned().collect();
+        let tracked: Vec<String> = self.tracked_symbols.to_vec();
         let flag = Arc::clone(&self.maintenance_symbol_inactive);
 
         let client = match HttpClient::builder()

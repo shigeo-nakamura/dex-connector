@@ -6,8 +6,6 @@ use reqwest::{
     Client,
 };
 #[cfg(feature = "extended-sdk")]
-use serde::Serialize;
-#[cfg(feature = "extended-sdk")]
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
 
@@ -125,7 +123,7 @@ impl DexRequest {
         Ok(DexRequest { client, endpoint })
     }
 
-    pub async fn handle_request<T: serde::de::DeserializeOwned, U: Serialize + ?Sized>(
+    pub async fn handle_request<T: serde::de::DeserializeOwned>(
         &self,
         method: HttpMethod,
         request_url: String,

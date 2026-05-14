@@ -175,7 +175,7 @@ impl ExtendedApi {
         for attempt in 1..=max_attempts {
             let response_result: Result<WrappedApiResponse<T>, DexError> = self
                 .request
-                .handle_request::<WrappedApiResponse<T>, serde_json::Value>(
+                .handle_request::<WrappedApiResponse<T>>(
                     method,
                     path.clone(),
                     &headers,
