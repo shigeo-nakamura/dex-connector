@@ -62,10 +62,7 @@ fn optional(var: &str) -> Option<String> {
     env::var(var).ok().filter(|v| !v.is_empty())
 }
 
-async fn wait_for<F, Fut>(
-    timeout: std::time::Duration,
-    mut probe: F,
-) -> Option<std::time::Duration>
+async fn wait_for<F, Fut>(timeout: std::time::Duration, mut probe: F) -> Option<std::time::Duration>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<()>>,
@@ -178,8 +175,7 @@ async fn main() {
         tracked_symbols: vec![symbol.clone()],
         ob_stale_secs: None,
     };
-    let connector =
-        create_lighter_connector(cfg).expect("create_lighter_connector failed");
+    let connector = create_lighter_connector(cfg).expect("create_lighter_connector failed");
     println!("      ok");
 
     println!("\n[3/6] start() — WS + account stream…");
@@ -260,10 +256,7 @@ async fn main() {
         Ok(order) => {
             println!(
                 "      ok — order_id={} exch_id={:?} px={} sz={}",
-                order.order_id,
-                order.exchange_order_id,
-                order.ordered_price,
-                order.ordered_size
+                order.order_id, order.exchange_order_id, order.ordered_price, order.ordered_size
             );
 
             println!("\n[verify] polling get_open_orders for up to 5s…");
@@ -333,9 +326,11 @@ async fn main() {
                 filled, canceled, positions
             );
 
-            println!("\n[verify] post_only sanity check: filled count should be 0 \
+            println!(
+                "\n[verify] post_only sanity check: filled count should be 0 \
                       (post_only that crosses would be rejected by Lighter rather \
-                      than executing as taker; if you see filled>0 here, investigate).");
+                      than executing as taker; if you see filled>0 here, investigate)."
+            );
         }
         Err(e) => {
             eprintln!("      place FAILED: {:?}", e);

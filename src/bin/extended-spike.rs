@@ -22,10 +22,7 @@ fn optional(var: &str) -> Option<String> {
     env::var(var).ok().filter(|v| !v.is_empty())
 }
 
-async fn wait_for<F, Fut>(
-    timeout: std::time::Duration,
-    mut probe: F,
-) -> Option<std::time::Duration>
+async fn wait_for<F, Fut>(timeout: std::time::Duration, mut probe: F) -> Option<std::time::Duration>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<()>>,
@@ -76,7 +73,10 @@ async fn main() {
     println!("side             = {:?}", side);
     println!("offset_pct       = {}%", offset_pct);
     println!("vault            = {}", vault);
-    println!("public_key       = {}…", &public_key[..public_key.len().min(12)]);
+    println!(
+        "public_key       = {}…",
+        &public_key[..public_key.len().min(12)]
+    );
 
     println!("\n[1/6] decrypting EXTENDED_PRIVATE_KEY via KMS…");
     let private_key = decrypt_private_key().await;

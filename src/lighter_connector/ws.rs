@@ -21,9 +21,7 @@ use super::parsing::{parse_canceled_order, parse_filled_order, value_to_decimal}
 use super::{LighterConnector, LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition};
 use crate::dex_connector::string_to_decimal;
 use crate::dex_request::DexError;
-use crate::{
-    BalanceResponse, CanceledOrder, FilledOrder, OpenOrder, OrderSide, PositionSnapshot,
-};
+use crate::{BalanceResponse, CanceledOrder, FilledOrder, OpenOrder, OrderSide, PositionSnapshot};
 use rust_decimal::{prelude::FromStr, Decimal};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -191,14 +189,12 @@ impl LighterConnector {
                     // the same traffic over a window twice as wide, halving
                     // peak weight/s while staying well inside Lighter's 60s
                     // rolling window.
-                    let reconnect_jitter_secs: u64 =
-                        std::env::var("LIGHTER_RECONNECT_JITTER_SECS")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(30);
+                    let reconnect_jitter_secs: u64 = std::env::var("LIGHTER_RECONNECT_JITTER_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30);
                     if reconnect_jitter_secs > 0 {
-                        let jitter =
-                            rand::thread_rng().gen_range(0..=reconnect_jitter_secs);
+                        let jitter = rand::thread_rng().gen_range(0..=reconnect_jitter_secs);
                         log::info!(
                             "Reconnect jitter: sleeping {}s (max {}s)",
                             jitter,
@@ -460,11 +456,11 @@ impl LighterConnector {
                         // Server requires at least one frame every 2 minutes to keep connection alive.
                         // We send a control Ping every 20s which is well within that limit.
                         const IDLE_PING_SECS: u64 = 20; // Client ping interval
-                        // Pong timeout: tolerate transient RTT spikes (cross-region WS to AWS
-                        // can briefly stall under congestion). Combined with the 5s check
-                        // granularity and the 2-strike rule below, a real dead connection is
-                        // still detected within ~40s, while one-shot packet loss no longer
-                        // forces a reconnect (bot-strategy#47).
+                                                        // Pong timeout: tolerate transient RTT spikes (cross-region WS to AWS
+                                                        // can briefly stall under congestion). Combined with the 5s check
+                                                        // granularity and the 2-strike rule below, a real dead connection is
+                                                        // still detected within ~40s, while one-shot packet loss no longer
+                                                        // forces a reconnect (bot-strategy#47).
                         const PONG_TIMEOUT_SECS: u64 = 15;
                         const PONG_MAX_MISSES: u32 = 2; // Require N consecutive misses before reconnect
                         const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
@@ -600,11 +596,8 @@ impl LighterConnector {
                         log::debug!("Starting WebSocket message handling loop");
 
                         loop {
-                            let next = match tokio::time::timeout(
-                                WS_STALL_TIMEOUT,
-                                read.next(),
-                            )
-                            .await
+                            let next = match tokio::time::timeout(WS_STALL_TIMEOUT, read.next())
+                                .await
                             {
                                 Ok(next) => next,
                                 Err(_elapsed) => {
@@ -1146,7 +1139,11 @@ impl LighterConnector {
                                     ask_price,
                                     mid_price,
                                     timestamp,
-                                    if exchange_ts_ms.is_some() { " (exchange)" } else { " (local)" }
+                                    if exchange_ts_ms.is_some() {
+                                        " (exchange)"
+                                    } else {
+                                        " (local)"
+                                    }
                                 );
                                 current_price
                                     .write()
@@ -1293,15 +1290,8 @@ impl LighterConnector {
         };
         match string_to_decimal(Some(rate_str.to_string())) {
             Ok(rate) => {
-                funding_rate_cache
-                    .write()
-                    .await
-                    .insert(market_id, rate);
-                log::trace!(
-                    "[WS_FUNDING] market_id={} funding_rate={}",
-                    market_id,
-                    rate
-                );
+                funding_rate_cache.write().await.insert(market_id, rate);
+                log::trace!("[WS_FUNDING] market_id={} funding_rate={}", market_id, rate);
             }
             Err(e) => {
                 log::warn!(
@@ -1432,12 +1422,8 @@ impl LighterConnector {
         // collateral. Fall back to the legacy direct-totals path if Lighter
         // ever populates them on the parent account or returns to the older
         // schema.
-        let direct_total = data
-            .get("total_asset_value")
-            .and_then(value_to_decimal);
-        let direct_available = data
-            .get("available_balance")
-            .and_then(value_to_decimal);
+        let direct_total = data.get("total_asset_value").and_then(value_to_decimal);
+        let direct_available = data.get("available_balance").and_then(value_to_decimal);
 
         let usdc_margin_balance = data
             .get("assets")
@@ -1448,9 +1434,7 @@ impl LighterConnector {
                     if symbol != "USDC" {
                         return None;
                     }
-                    asset
-                        .get("margin_balance")
-                        .and_then(value_to_decimal)
+                    asset.get("margin_balance").and_then(value_to_decimal)
                 })
             });
         if let Some(mb) = usdc_margin_balance {
@@ -1466,9 +1450,7 @@ impl LighterConnector {
         };
 
         if direct_total.is_some() || direct_available.is_some() {
-            let equity = direct_total
-                .or(direct_available)
-                .unwrap_or(Decimal::ZERO);
+            let equity = direct_total.or(direct_available).unwrap_or(Decimal::ZERO);
             let balance = direct_available.or(direct_total).unwrap_or(equity);
             let mut cache = balance_cache.write().await;
             *cache = Some((

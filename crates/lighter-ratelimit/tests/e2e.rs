@@ -167,14 +167,15 @@ async fn wait_policy_queues_until_refill() {
 async fn unreachable_sidecar_falls_back_in_process() {
     // Point the client at a socket path that does not exist; the first
     // acquire should log a warning, flip to fallback, and then grant.
-    let bogus = std::env::temp_dir().join(format!(
-        "nonexistent-ratelimit-{}.sock",
-        std::process::id()
-    ));
+    let bogus =
+        std::env::temp_dir().join(format!("nonexistent-ratelimit-{}.sock", std::process::id()));
     if bogus.exists() {
         let _ = std::fs::remove_file(&bogus);
     }
-    std::env::set_var("LIGHTER_RATELIMIT_SOCKET", bogus.to_string_lossy().to_string());
+    std::env::set_var(
+        "LIGHTER_RATELIMIT_SOCKET",
+        bogus.to_string_lossy().to_string(),
+    );
     std::env::remove_var("LIGHTER_RATELIMIT_DISABLE");
     let client = RateLimitClient::from_env();
     let r = client.acquire(300, AcquirePolicy::Shed, None).await;

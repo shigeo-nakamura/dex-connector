@@ -98,8 +98,7 @@ impl TokenBucket {
         }
         let delta_nanos = now_nanos - last;
         // Integer math: nanos * refill_per_sec / 1e9, keeping precision.
-        let refill = (delta_nanos as i128 * self.config.refill_per_sec as i128)
-            / 1_000_000_000i128;
+        let refill = (delta_nanos as i128 * self.config.refill_per_sec as i128) / 1_000_000_000i128;
         if refill <= 0 {
             return;
         }
@@ -196,7 +195,10 @@ mod tests {
         assert_eq!(b.tokens_remaining(), 0);
         tokio::time::sleep(Duration::from_millis(600)).await;
         // After ~600ms at 1000/s, we should have ~600 tokens (allowing drift).
-        assert!(b.try_acquire(400), "expected at least 400 tokens after 600ms");
+        assert!(
+            b.try_acquire(400),
+            "expected at least 400 tokens after 600ms"
+        );
     }
 
     #[tokio::test]

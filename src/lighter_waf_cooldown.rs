@@ -311,7 +311,10 @@ mod tests {
     #[test]
     fn body_fallback_recognizes_aws_waf_html() {
         assert_eq!(
-            classify_rate_limit_body(StatusCode::METHOD_NOT_ALLOWED, "<html>...awsWafIntegration..."),
+            classify_rate_limit_body(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "<html>...awsWafIntegration..."
+            ),
             Some(RateLimitSource::WafCaptcha)
         );
         assert_eq!(
@@ -370,7 +373,10 @@ mod tests {
         write_deadline(far);
         let _ = engage_cooldown(RateLimitSource::WafCaptcha);
         let read_back = read_deadline().unwrap();
-        assert_eq!(read_back, far, "engage must not shorten an existing cooldown");
+        assert_eq!(
+            read_back, far,
+            "engage must not shorten an existing cooldown"
+        );
         clear();
     }
 

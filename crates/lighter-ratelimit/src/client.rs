@@ -183,12 +183,9 @@ impl RateLimitClient {
     ) -> std::io::Result<AcquireResponse> {
         // Short connect timeout — if the sidecar is gone we want to know fast
         // so the fallback kicks in before the REST call is due.
-        let stream = tokio::time::timeout(
-            Duration::from_millis(200),
-            UnixStream::connect(path),
-        )
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+        let stream = tokio::time::timeout(Duration::from_millis(200), UnixStream::connect(path))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
 
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -286,7 +283,10 @@ mod tests {
             capacity: 100,
             refill_per_sec: 500, // 500 tokens/sec — fast refill for a quick test
         });
-        assert!(client.acquire(100, AcquirePolicy::Shed, None).await.is_granted());
+        assert!(client
+            .acquire(100, AcquirePolicy::Shed, None)
+            .await
+            .is_granted());
         // Need 50 tokens @ 500/s ≈ 100ms wait; give 1s budget.
         let outcome = client
             .acquire(50, AcquirePolicy::Wait { max_ms: 1_000 }, None)
@@ -304,7 +304,10 @@ mod tests {
             capacity: 100,
             refill_per_sec: 1, // 1 token/sec — very slow refill
         });
-        assert!(client.acquire(100, AcquirePolicy::Shed, None).await.is_granted());
+        assert!(client
+            .acquire(100, AcquirePolicy::Shed, None)
+            .await
+            .is_granted());
         // Need 50 tokens @ 1/s = 50s, but budget is 50ms → must shed.
         let outcome = client
             .acquire(50, AcquirePolicy::Wait { max_ms: 50 }, None)

@@ -133,7 +133,15 @@ async fn main() {
     for i in 0..n {
         let t_place = Instant::now();
         let placed = connector
-            .create_order(&symbol, min_size, OrderSide::Long, Some(probe_price), Some(-2), false, None)
+            .create_order(
+                &symbol,
+                min_size,
+                OrderSide::Long,
+                Some(probe_price),
+                Some(-2),
+                false,
+                None,
+            )
             .await;
         let place_ms = t_place.elapsed().as_secs_f64() * 1000.0;
 

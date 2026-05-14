@@ -45,8 +45,7 @@ impl Stats {
             .fetch_add(weight as u64, Ordering::Relaxed);
         if waited_ms > 0 {
             self.wait_count.fetch_add(1, Ordering::Relaxed);
-            self.wait_total_ms
-                .fetch_add(waited_ms, Ordering::Relaxed);
+            self.wait_total_ms.fetch_add(waited_ms, Ordering::Relaxed);
         }
     }
 
@@ -58,11 +57,9 @@ impl Stats {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     // Simple stderr logger driven by RUST_LOG; systemd captures stderr.
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_secs()
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .try_init();
 
     let socket_path: PathBuf = std::env::var("LIGHTER_RATELIMIT_SOCKET")
         .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string())
@@ -93,10 +90,7 @@ async fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &socket_path,
-            std::fs::Permissions::from_mode(0o666),
-        );
+        let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666));
     }
 
     let bucket = Arc::new(TokenBucket::new(config));

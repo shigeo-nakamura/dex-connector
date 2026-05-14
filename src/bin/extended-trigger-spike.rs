@@ -65,11 +65,7 @@ async fn has_open_position(conn: &Box<dyn DexConnector>, symbol: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn open_orders_contains(
-    conn: &Box<dyn DexConnector>,
-    symbol: &str,
-    order_id: &str,
-) -> bool {
+async fn open_orders_contains(conn: &Box<dyn DexConnector>, symbol: &str, order_id: &str) -> bool {
     conn.get_open_orders(symbol)
         .await
         .map(|o| o.orders.iter().any(|x| x.order_id == order_id))
@@ -97,7 +93,10 @@ async fn main() {
     let confirm = env::var("TRIGGER_CONFIRM").unwrap_or_default() == "yes";
 
     println!("── Extended trigger-order end-to-end spike ──");
-    println!("symbol={} sl_offset_pct={}% slippage_bps={}", symbol, sl_offset_pct, slippage_bps);
+    println!(
+        "symbol={} sl_offset_pct={}% slippage_bps={}",
+        symbol, sl_offset_pct, slippage_bps
+    );
 
     let connector = create_extended_connector(
         api_key,
@@ -141,7 +140,10 @@ async fn main() {
         "  bid={} ask={} mid={} size={}",
         best_bid, best_ask, mid, min_size
     );
-    println!("  planned SL trigger={} (close via SELL, slippage {} bps)", trigger_px, slippage_bps);
+    println!(
+        "  planned SL trigger={} (close via SELL, slippage {} bps)",
+        trigger_px, slippage_bps
+    );
 
     if !confirm {
         println!("\nTRIGGER_CONFIRM!=yes → dry only. Re-run with TRIGGER_CONFIRM=yes.");
@@ -158,7 +160,15 @@ async fn main() {
         entry_px, best_ask
     );
     let entry = connector
-        .create_order(&symbol, min_size, OrderSide::Long, Some(entry_px), None, false, None)
+        .create_order(
+            &symbol,
+            min_size,
+            OrderSide::Long,
+            Some(entry_px),
+            None,
+            false,
+            None,
+        )
         .await
         .expect("entry order failed");
     println!("  ok — order_id={}", entry.order_id);
@@ -205,7 +215,15 @@ async fn main() {
             eprintln!("  ❌ SL place FAILED: {:?}", e);
             eprintln!("  → unwinding position before exit");
             let _ = connector
-                .create_order(&symbol, min_size, OrderSide::Short, Some(best_bid), None, true, None)
+                .create_order(
+                    &symbol,
+                    min_size,
+                    OrderSide::Short,
+                    Some(best_bid),
+                    None,
+                    true,
+                    None,
+                )
                 .await;
             let _ = connector.stop().await;
             std::process::exit(1);
@@ -240,7 +258,15 @@ async fn main() {
         close_px, best_bid
     );
     match connector
-        .create_order(&symbol, min_size, OrderSide::Short, Some(close_px), None, true, None)
+        .create_order(
+            &symbol,
+            min_size,
+            OrderSide::Short,
+            Some(close_px),
+            None,
+            true,
+            None,
+        )
         .await
     {
         Ok(c) => println!("  ok — close order_id={}", c.order_id),
