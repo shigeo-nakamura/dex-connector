@@ -1,9 +1,13 @@
 use debot_utils::ParseDecimalError;
+use reqwest::Method;
+#[cfg(feature = "extended-sdk")]
 use reqwest::{
     header::{HeaderMap, HeaderValue},
-    Client, Method,
+    Client,
 };
+#[cfg(feature = "extended-sdk")]
 use serde::Serialize;
+#[cfg(feature = "extended-sdk")]
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
 
@@ -28,6 +32,7 @@ impl From<HttpMethod> for Method {
     }
 }
 
+#[cfg(feature = "extended-sdk")]
 #[derive(Clone, Debug)]
 pub struct DexRequest {
     client: Client,
@@ -101,6 +106,7 @@ impl From<ParseDecimalError> for DexError {
     }
 }
 
+#[cfg(feature = "extended-sdk")]
 impl DexRequest {
     pub async fn new(endpoint: String) -> Result<Self, DexError> {
         // Bound REST calls so a hung server can't stall callers indefinitely.

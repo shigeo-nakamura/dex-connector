@@ -5,14 +5,18 @@ use crate::{
     TriggerOrderStyle,
 };
 use async_trait::async_trait;
+#[cfg(feature = "lighter-sdk")]
 use debot_utils::parse_to_decimal;
+#[cfg(feature = "extended-sdk")]
 use lazy_static::lazy_static;
 use rust_decimal::Decimal;
 
+#[cfg(feature = "extended-sdk")]
 lazy_static! {
     static ref DEFAULT_SLIPPAGE: Decimal = Decimal::new(5, 2);
 }
 
+#[cfg(feature = "lighter-sdk")]
 pub fn string_to_decimal(string_value: Option<String>) -> Result<Decimal, DexError> {
     match string_value {
         Some(value) => match parse_to_decimal(&value) {
@@ -33,6 +37,7 @@ pub fn string_to_decimal(string_value: Option<String>) -> Result<Decimal, DexErr
     }
 }
 
+#[cfg(feature = "extended-sdk")]
 pub fn slippage_price(price: Decimal, is_buy: bool) -> Decimal {
     if is_buy {
         price * (Decimal::new(1, 0) + *DEFAULT_SLIPPAGE)
