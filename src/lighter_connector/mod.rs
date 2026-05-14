@@ -146,6 +146,7 @@ use tokio::time::sleep;
 mod ffi;
 mod maintenance;
 mod market_cache;
+mod order_payload;
 mod parsing;
 mod rest;
 mod signing;
@@ -1016,147 +1017,43 @@ impl LighterConnector {
         reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let client_order_index = client_order_id
             .as_deref()
             .and_then(|id| id.parse::<u64>().ok())
-            .unwrap_or(timestamp);
+            .unwrap_or(now_ms as u64);
         let nonce = self.get_nonce().await?;
-
-        let (price_scale, size_scale, price_decimals, size_decimals) = {
+        let decimals = {
             let cache = self.market_cache.read().await;
-            if let Some(info) = cache.by_id.get(&market_id) {
-                (
-                    ten_pow(info.price_decimals),
-                    ten_pow(info.size_decimals),
-                    info.price_decimals.min(MAX_DECIMAL_PRECISION),
-                    info.size_decimals.min(MAX_DECIMAL_PRECISION),
-                )
-            } else {
-                (
-                    ten_pow(DEFAULT_PRICE_DECIMALS),
-                    ten_pow(DEFAULT_SIZE_DECIMALS),
-                    DEFAULT_PRICE_DECIMALS.min(MAX_DECIMAL_PRECISION),
-                    DEFAULT_SIZE_DECIMALS.min(MAX_DECIMAL_PRECISION),
-                )
-            }
+            order_payload::OrderDecimals::resolve(&cache.by_id, market_id)
         };
 
-        let approx_price = if price_scale > 0 {
-            price as f64 / price_scale as f64
-        } else {
-            price as f64
-        };
-
-        let approx_size = if size_scale > 0 {
-            base_amount as f64 / size_scale as f64
-        } else {
-            base_amount as f64
-        };
+        let payload = order_payload::build_order_payload_type_only(
+            market_id,
+            side,
+            tif,
+            base_amount,
+            price,
+            client_order_index,
+            order_type,
+            reduce_only,
+            expiry_secs,
+            nonce,
+            now_ms,
+        );
 
         log::debug!(
-            "Creating native order: market_id={}, side={}, base_amount={}, price={}, approx_price={}, approx_size={}, price_decimals={}, size_decimals={}",
+            "Creating native order: market_id={}, side={}, base_amount={}, price={}, price_decimals={}, size_decimals={}",
             market_id,
             side,
             base_amount,
             price,
-            approx_price,
-            approx_size,
-            price_decimals,
-            size_decimals
+            decimals.price_decimals,
+            decimals.size_decimals,
         );
 
-        let order_type_param = order_type as u64; // Use passed order type
-        let time_in_force = tif as u64; // Use passed time in force
-        let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
-        let trigger_price = 0u64; // no trigger
-                                  // For market or immediate TIF orders, use 0 (NilOrderExpiry). For GTC orders, use future timestamp
-        let is_immediate_tif = time_in_force == u64::from(TIF_IOC);
-        let order_expiry = if order_type == ORDER_TYPE_IOC || is_immediate_tif {
-            0i64 // NilOrderExpiry for immediate-or-cancel / fill-or-kill orders
-        } else {
-            // For GTC limit orders, use passed expiry_secs or default to 24 hours
-            let expiry_duration_ms = if let Some(expiry_secs) = expiry_secs {
-                expiry_secs * 1000 // Convert seconds to milliseconds
-            } else {
-                24 * 60 * 60 * 1000 // Default 24 hours in milliseconds
-            };
-
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            now_ms + (expiry_duration_ms as i64)
-        };
-
-        // Use actual parameters passed to function instead of hardcoded test values
-        let actual_market_id = market_id as u64;
-        let actual_base_amount = base_amount;
-        let actual_price = price;
-        let actual_side = side as u64;
-
-        let _tx_data = [
-            actual_market_id,    // market_index - actual parameter
-            client_order_index,  // client_order_index
-            actual_base_amount,  // base_amount - actual parameter
-            actual_price,        // price - actual parameter
-            actual_side,         // is_ask - actual parameter
-            order_type_param,    // order_type
-            time_in_force,       // time_in_force
-            reduce_only_param,   // reduce_only
-            trigger_price,       // trigger_price
-            order_expiry as u64, // order_expiry
-            nonce,               // nonce - use actual API nonce
-        ];
-
-        // Extract private key bytes (40 bytes for Goldilocks quintic extension)
-        let private_key_hex = self
-            .api_private_key_hex
-            .strip_prefix("0x")
-            .unwrap_or(&self.api_private_key_hex);
-        let private_key_bytes = hex::decode(private_key_hex)
-            .map_err(|e| DexError::Permanent(format!("Invalid private key hex: {}", e)))?;
-
-        // Lighter uses 40-byte private keys for Goldilocks quintic extension
-        let mut key_bytes = [0u8; 40];
-        let copy_len = std::cmp::min(private_key_bytes.len(), 40);
-        key_bytes[..copy_len].copy_from_slice(&private_key_bytes[..copy_len]);
-
-        // Call Go shared library to generate signature dynamically
-        let go_result = self
-            .call_go_sign_create_order(
-                actual_market_id as i32,
-                client_order_index as i64,
-                actual_base_amount as i64,
-                actual_price as i32,
-                actual_side as i32,
-                order_type_param as i32,
-                time_in_force as i32,
-                reduce_only_param as i32,
-                trigger_price as i32,
-                order_expiry as i64,
-                nonce as i64,
-            )
-            .await?;
-
-        log::debug!("=== GO SDK RESULT ===");
-        log::debug!("Go SDK JSON: {}", go_result);
-
-        // Use the exact JSON from Go SDK - it already contains everything correctly
-
-        // Use the complete transaction JSON from Go SDK directly
-        let tx_info = go_result;
-
-        // Send to Lighter API using application/x-www-form-urlencoded format (same as Go SDK)
-        let form_data = format!(
-            "tx_type=14&tx_info={}&price_protection=false",
-            urlencoding::encode(&tx_info)
-        );
-
-        log::debug!("=== REQUEST DEBUG ===");
-        log::debug!("Timestamp: {}", timestamp);
-        log::debug!("TX Info JSON: {}", tx_info);
-        log::debug!("Form data: {}", form_data);
+        let tx_info = self.call_go_sign_for_payload(&payload).await?;
+        let form_data = order_payload::build_send_tx_form(&tx_info);
 
         track_api_call("POST /api/v1/sendTx", "POST");
 
@@ -1169,7 +1066,6 @@ impl LighterConnector {
         )
         .await?;
 
-        // Use form-urlencoded format same as Go SDK, without X-API-KEY header
         let response = self
             .client
             .post(&format!("{}/api/v1/sendTx", self.base_url))
@@ -1192,34 +1088,9 @@ impl LighterConnector {
         );
 
         if status.is_success() {
-            log::debug!("Native order submitted successfully!");
-            // Use client_order_index as order_id for tracking
-            let order_id = client_order_index.to_string();
-
-            log::debug!(
-                "Created order: order_id={}, client_order_index={}, side={}, size={}",
-                order_id,
-                client_order_index,
-                side,
-                i64::try_from(base_amount)
-                    .ok()
-                    .map(|b| Decimal::new(b, size_decimals))
-                    .unwrap_or_else(|| Decimal::ZERO)
-            );
-
-            Ok(CreateOrderResponse {
-                order_id,
-                exchange_order_id: None,
-                ordered_price: i64::try_from(price)
-                    .ok()
-                    .map(|p| Decimal::new(p, price_decimals))
-                    .unwrap_or_else(|| Decimal::ZERO),
-                ordered_size: i64::try_from(base_amount)
-                    .ok()
-                    .map(|b| Decimal::new(b, size_decimals))
-                    .unwrap_or_else(|| Decimal::ZERO),
-                client_order_id: Some(client_order_index.to_string()),
-            })
+            Ok(order_payload::build_create_order_response(
+                &payload, decimals,
+            ))
         } else {
             self.invalidate_nonce_cache().await;
             Err(DexError::Transient(format!(
@@ -1242,146 +1113,47 @@ impl LighterConnector {
         reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
-        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let client_order_index = client_order_id
             .as_deref()
             .and_then(|id| id.parse::<u64>().ok())
-            .unwrap_or(timestamp);
+            .unwrap_or(now_ms as u64);
         let nonce = self.get_nonce().await?;
-
-        let (price_scale, size_scale, price_decimals, size_decimals) = {
+        let decimals = {
             let cache = self.market_cache.read().await;
-            if let Some(info) = cache.by_id.get(&market_id) {
-                (
-                    ten_pow(info.price_decimals),
-                    ten_pow(info.size_decimals),
-                    info.price_decimals.min(MAX_DECIMAL_PRECISION),
-                    info.size_decimals.min(MAX_DECIMAL_PRECISION),
-                )
-            } else {
-                (
-                    ten_pow(DEFAULT_PRICE_DECIMALS),
-                    ten_pow(DEFAULT_SIZE_DECIMALS),
-                    DEFAULT_PRICE_DECIMALS.min(MAX_DECIMAL_PRECISION),
-                    DEFAULT_SIZE_DECIMALS.min(MAX_DECIMAL_PRECISION),
-                )
-            }
+            order_payload::OrderDecimals::resolve(&cache.by_id, market_id)
         };
 
-        let approx_price = if price_scale > 0 {
-            price as f64 / price_scale as f64
-        } else {
-            price as f64
-        };
-        let approx_trigger = if price_scale > 0 {
-            trigger_price as f64 / price_scale as f64
-        } else {
-            trigger_price as f64
-        };
-        let approx_size = if size_scale > 0 {
-            base_amount as f64 / size_scale as f64
-        } else {
-            base_amount as f64
-        };
+        let payload = order_payload::build_order_payload_trigger(
+            market_id,
+            side,
+            tif,
+            base_amount,
+            price,
+            trigger_price,
+            client_order_index,
+            order_type,
+            reduce_only,
+            expiry_secs,
+            nonce,
+            now_ms,
+        );
 
         log::debug!(
-            "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}, approx_price={}, approx_trigger={}, approx_size={}",
+            "Creating trigger order: market_id={}, side={}, base_amount={}, price={}, trigger_price={}, order_type={}",
             market_id,
             side,
             base_amount,
             price,
             trigger_price,
             order_type,
-            approx_price,
-            approx_trigger,
-            approx_size
         );
 
-        let order_type_param = order_type as u64;
-        let time_in_force = tif as u64;
-        let reduce_only_param = if reduce_only { 1u64 } else { 0u64 };
-        let trigger_price_param = trigger_price;
-
-        // For trigger orders, use passed expiry_secs or default to 28 days
-        let order_expiry = if order_type == ORDER_TYPE_TRIGGER
-            || order_type == 4
-            || order_type == 3
-            || order_type == 5
-        {
-            // Use passed expiry_secs or default to 28 days for trigger orders
-            let expiry_duration_ms = if let Some(expiry_secs) = expiry_secs {
-                // Minimum 60 seconds for trigger orders as Go SDK requires MinOrderExpiry >= 1
-                let min_expiry_secs = 60;
-                std::cmp::max(min_expiry_secs, expiry_secs) * 1000
-            } else {
-                28 * 24 * 60 * 60 * 1000 // Default 28 days in milliseconds
-            };
-            (chrono::Utc::now().timestamp_millis() as u64 + expiry_duration_ms) as i64
-        } else {
-            // For regular orders, use passed expiry_secs or default
-            let expiry_duration_ms = if let Some(expiry_secs) = expiry_secs {
-                expiry_secs * 1000
-            } else {
-                24 * 60 * 60 * 1000 // Default 24 hours in milliseconds
-            };
-            (chrono::Utc::now().timestamp_millis() as u64 + expiry_duration_ms) as i64
-        };
-
-        let actual_market_id = market_id as u64;
-        let actual_base_amount = base_amount;
-        let actual_price = price;
-        let actual_side = side as u64;
-
-        // Extract private key bytes
-        let private_key_hex = self
-            .api_private_key_hex
-            .strip_prefix("0x")
-            .unwrap_or(&self.api_private_key_hex);
-        let private_key_bytes = hex::decode(private_key_hex)
-            .map_err(|e| DexError::Permanent(format!("Invalid private key hex: {}", e)))?;
-
-        let mut key_bytes = [0u8; 40];
-        let copy_len = std::cmp::min(private_key_bytes.len(), 40);
-        key_bytes[..copy_len].copy_from_slice(&private_key_bytes[..copy_len]);
-
-        // Call Go shared library for trigger order signature
-        let go_result = self
-            .call_go_sign_create_order(
-                actual_market_id as i32,
-                client_order_index as i64,
-                actual_base_amount as i64,
-                actual_price as i32,
-                actual_side as i32,
-                order_type_param as i32,
-                time_in_force as i32,
-                reduce_only_param as i32,
-                trigger_price_param as i32,
-                order_expiry,
-                nonce as i64,
-            )
-            .await;
-
-        let signature = match go_result {
-            Ok(sig) => sig,
-            Err(e) => {
-                log::error!("Failed to sign trigger order via Go SDK: {}", e);
-                return Err(DexError::Transient(format!(
-                    "Signature generation failed: {}",
-                    e
-                )));
-            }
-        };
-
-        // Use same form-urlencoded format as regular orders
-        let form_data = format!(
-            "tx_type=14&tx_info={}&price_protection=false",
-            urlencoding::encode(&signature)
-        );
-
-        log::debug!("Trigger order form data: {}", form_data);
-
-        let client = &self.client;
-        let url = format!("{}/api/v1/sendTx", self.base_url);
+        let tx_info = self.call_go_sign_for_payload(&payload).await.map_err(|e| {
+            log::error!("Failed to sign trigger order via Go SDK: {}", e);
+            DexError::Transient(format!("Signature generation failed: {}", e))
+        })?;
+        let form_data = order_payload::build_send_tx_form(&tx_info);
 
         // Protective orders (SL/TP) must not be dropped — wait for budget.
         self.acquire_rest_budget(
@@ -1390,8 +1162,9 @@ impl LighterConnector {
         )
         .await?;
 
-        let response = client
-            .post(&url)
+        let response = self
+            .client
+            .post(&format!("{}/api/v1/sendTx", self.base_url))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_data)
             .send()
@@ -1407,27 +1180,15 @@ impl LighterConnector {
         log::debug!("Trigger order response: HTTP {}, {}", status, response_text);
 
         if status.is_success() {
-            let order_id = client_order_index.to_string();
             log::info!(
                 "✅ [TRIGGER_ORDER] Successfully created trigger order: {} (type={}, trigger_price={})",
-                order_id,
+                client_order_index,
                 order_type,
-                trigger_price_param
+                trigger_price,
             );
-
-            Ok(CreateOrderResponse {
-                order_id,
-                exchange_order_id: None,
-                ordered_price: i64::try_from(price)
-                    .ok()
-                    .map(|p| Decimal::new(p, price_decimals))
-                    .unwrap_or_else(|| Decimal::ZERO),
-                ordered_size: i64::try_from(base_amount)
-                    .ok()
-                    .map(|b| Decimal::new(b, size_decimals))
-                    .unwrap_or_else(|| Decimal::ZERO),
-                client_order_id: Some(client_order_index.to_string()),
-            })
+            Ok(order_payload::build_create_order_response(
+                &payload, decimals,
+            ))
         } else {
             self.invalidate_nonce_cache().await;
             Err(DexError::Transient(format!(

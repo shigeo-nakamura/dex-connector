@@ -19,6 +19,7 @@
 //! never compile in practice.
 
 use super::ffi::{parse_signed_tx_response, CheckClient, SignCancelOrder, SignCreateOrder};
+use super::order_payload::OrderPayload;
 use super::LighterConnector;
 use crate::dex_request::DexError;
 use libc::{c_int, c_longlong};
@@ -27,6 +28,29 @@ use sha3::{Digest, Keccak256};
 use std::ffi::CStr;
 
 impl LighterConnector {
+    /// Marshal an [`OrderPayload`] into the C-shaped args expected by the
+    /// Go SDK signer. Centralises the i32/i64 casts so callers never have
+    /// to know the FFI shape. See bot-strategy#390.
+    pub(super) async fn call_go_sign_for_payload(
+        &self,
+        payload: &OrderPayload,
+    ) -> Result<String, DexError> {
+        self.call_go_sign_create_order(
+            payload.market_id as i32,
+            payload.client_order_index as i64,
+            payload.base_amount as i64,
+            payload.price as i32,
+            payload.side as i32,
+            payload.order_type as i32,
+            payload.time_in_force as i32,
+            if payload.reduce_only { 1 } else { 0 },
+            payload.trigger_price as i32,
+            payload.order_expiry_ms,
+            payload.nonce as i64,
+        )
+        .await
+    }
+
     /// Call Go shared library to generate signature for CreateOrder transaction
     #[cfg(feature = "lighter-sdk")]
     pub(super) async fn call_go_sign_create_order(
