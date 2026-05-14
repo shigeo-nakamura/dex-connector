@@ -1205,6 +1205,11 @@ impl ExtendedConnector {
         Ok(orders)
     }
 
+    // Internal recursive helper: `refreshed` is a one-shot reentry guard for
+    // the market-refresh retry, so the parameter list grows by one beyond the
+    // public order params. A struct refactor would obscure the recursion site
+    // for no real readability win.
+    #[allow(clippy::too_many_arguments)]
     async fn create_order_internal(
         &self,
         symbol: &str,
@@ -1285,6 +1290,7 @@ impl ExtendedConnector {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // mirrors the public order-param shape; struct wrapping adds no clarity here.
     async fn submit_order_with_market(
         &self,
         market: &MarketModel,
@@ -1690,7 +1696,7 @@ impl DexConnector for ExtendedConnector {
         let key = normalize_symbol(symbol);
         let orders = if self.websocket_url.is_some() {
             let cache = self.open_orders_cache.read().await;
-            cache.get(&key).cloned().unwrap_or_else(|| Vec::new())
+            cache.get(&key).cloned().unwrap_or_default()
         } else {
             let market_name = self.get_market(symbol).await?.name;
             let path = build_query("/user/orders", vec![("market".to_string(), market_name)]);
@@ -2260,7 +2266,7 @@ impl DexConnector for ExtendedConnector {
 
         let mut last_err: Option<DexError> = None;
         for position in positions {
-            if symbol.as_deref().map_or(false, |s| s != position.symbol) {
+            if symbol.as_deref().is_some_and(|s| s != position.symbol) {
                 continue;
             }
 
