@@ -7,9 +7,9 @@
 //! plus `MARKET_CACHE_INIT_LOCK` guard ensure a single fetch per process
 //! lifetime even under concurrent constructor calls. See bot-strategy#135.
 
+use super::models::LighterExchangeStats;
 use super::{
-    LighterConnector, LighterExchangeStats, DEFAULT_PRICE_DECIMALS, DEFAULT_SIZE_DECIMALS,
-    MAX_DECIMAL_PRECISION,
+    LighterConnector, DEFAULT_PRICE_DECIMALS, DEFAULT_SIZE_DECIMALS, MAX_DECIMAL_PRECISION,
 };
 use crate::dex_request::DexError;
 use rust_decimal::{prelude::FromStr, Decimal};

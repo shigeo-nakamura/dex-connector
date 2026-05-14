@@ -18,9 +18,8 @@
 
 use super::market_cache::MarketCache;
 use super::parsing::{parse_canceled_order, parse_filled_order, value_to_decimal};
-use super::{
-    AccountState, LighterConnector, LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition,
-};
+use super::models::{LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition};
+use super::{AccountState, LighterConnector};
 use crate::dex_connector::string_to_decimal;
 use crate::dex_request::DexError;
 use crate::{BalanceResponse, CanceledOrder, FilledOrder, OpenOrder, OrderSide, PositionSnapshot};
