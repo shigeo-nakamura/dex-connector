@@ -138,26 +138,9 @@ impl LighterConnector {
         tokio::spawn(async move {
             use rand::Rng;
 
-            const BACKOFF_MAX_SECS: u64 = 60;
-            const BACKOFF_BASE: f64 = 1.5;
-
+            let reconnect_policy = crate::ws_reconnect::WsReconnectPolicy::lighter();
             let mut reconnect_attempt = 0u32;
             let mut last_reconnect_time = std::time::SystemTime::now();
-
-            async fn reconnect_backoff(attempt: u32) {
-                let pow = BACKOFF_BASE.powi(attempt.min(12) as i32);
-                let base_secs = pow.min(BACKOFF_MAX_SECS as f64);
-                let jitter_ms: i64 = rand::thread_rng().gen_range(0..=250);
-                let dur = std::time::Duration::from_secs_f64(base_secs)
-                    + std::time::Duration::from_millis(jitter_ms as u64);
-
-                log::debug!(
-                    "Reconnect backoff: attempt={}, delay={:.1}s",
-                    attempt,
-                    dur.as_secs_f64()
-                );
-                tokio::time::sleep(dur).await;
-            }
 
             loop {
                 if !is_running.load(Ordering::SeqCst) {
@@ -168,8 +151,7 @@ impl LighterConnector {
                 // Reset attempt counter if enough time has passed since last reconnect
                 let now = std::time::SystemTime::now();
                 if let Ok(elapsed) = now.duration_since(last_reconnect_time) {
-                    if elapsed.as_secs() > 300 {
-                        // 5 minutes
+                    if reconnect_policy.should_reset_attempt(elapsed.as_secs()) {
                         reconnect_attempt = 0;
                         log::debug!("Reset reconnect attempt counter after successful period");
                     }
@@ -185,7 +167,13 @@ impl LighterConnector {
                 }
 
                 if reconnect_attempt > 0 {
-                    reconnect_backoff(reconnect_attempt).await;
+                    let dur = reconnect_policy.delay(reconnect_attempt);
+                    log::debug!(
+                        "Reconnect backoff: attempt={}, delay={:.1}s",
+                        reconnect_attempt,
+                        dur.as_secs_f64()
+                    );
+                    tokio::time::sleep(dur).await;
                 } else {
                     // Stagger initial reconnects across bot instances. Default
                     // widened from 15s to 30s (bot-strategy#121): during the

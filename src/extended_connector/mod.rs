@@ -434,6 +434,7 @@ impl ExtendedConnector {
 
         let mut handles = self.ws_tasks.lock().await;
         let symbols = self.tracked_symbols.clone();
+        let reconnect_policy = crate::ws_reconnect::WsReconnectPolicy::extended();
 
         for symbol in symbols.iter() {
             // Callers track bare tokens ("BTC") but Extended's stream paths
@@ -455,13 +456,14 @@ impl ExtendedConnector {
             if let Some(url) = self.build_ws_url(&orderbook_path) {
                 let order_book_cache = Arc::clone(&self.order_book_cache);
                 let symbol = symbol.clone();
+                let policy = reconnect_policy;
                 handles.push(tokio::spawn(async move {
                     loop {
                         if let Err(err) = stream_orderbooks(&url, &symbol, &order_book_cache).await
                         {
                             log::warn!("orderbook stream error: {err}");
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        policy.wait(0).await;
                     }
                 }));
             }
@@ -470,12 +472,13 @@ impl ExtendedConnector {
             if let Some(url) = self.build_ws_url(&trades_path) {
                 let last_trades = Arc::clone(&self.last_trades);
                 let symbol = symbol.clone();
+                let policy = reconnect_policy;
                 handles.push(tokio::spawn(async move {
                     loop {
                         if let Err(err) = stream_trades(&url, &symbol, &last_trades).await {
                             log::warn!("public trades stream error: {err}");
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        policy.wait(0).await;
                     }
                 }));
             }
@@ -488,6 +491,7 @@ impl ExtendedConnector {
             let order_id_map = Arc::clone(&self.order_id_map);
             let filled_orders = Arc::clone(&self.filled_orders);
             let positions_cache = Arc::clone(&self.positions_cache);
+            let policy = reconnect_policy;
             handles.push(tokio::spawn(async move {
                 loop {
                     if let Err(err) = stream_account(
@@ -507,7 +511,7 @@ impl ExtendedConnector {
                         }
                         log::warn!("account stream error: {err}");
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    policy.wait(0).await;
                 }
             }));
         }

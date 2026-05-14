@@ -20,6 +20,7 @@ pub mod lighter_ratelimit {
 }
 #[cfg(feature = "lighter-sdk")]
 pub mod lighter_waf_cooldown;
+pub mod ws_reconnect;
 
 pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
