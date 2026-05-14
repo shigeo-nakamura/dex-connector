@@ -254,10 +254,10 @@ pub(super) async fn fetch_next_maintenance_window_with(
         .get(url)
         .send()
         .await
-        .map_err(|e| DexError::Other(format!("Failed to fetch Lighter status feed: {}", e)))?;
+        .map_err(|e| DexError::Transient(format!("Failed to fetch Lighter status feed: {}", e)))?;
 
     if !response.status().is_success() {
-        return Err(DexError::Other(format!(
+        return Err(DexError::Transient(format!(
             "Lighter status feed returned HTTP {}",
             response.status()
         )));
@@ -266,7 +266,7 @@ pub(super) async fn fetch_next_maintenance_window_with(
     let body = response
         .text()
         .await
-        .map_err(|e| DexError::Other(format!("Failed to read Lighter status feed body: {}", e)))?;
+        .map_err(|e| DexError::Transient(format!("Failed to read Lighter status feed body: {}", e)))?;
 
     let items = parse_lighter_rss(&body);
     let now = Utc::now();

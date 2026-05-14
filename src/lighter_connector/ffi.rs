@@ -81,8 +81,8 @@ pub unsafe fn take_c_string(ptr: *mut c_char) -> Option<String> {
 }
 
 /// Convert a `SignedTxResponse` from the Go signer into either
-/// `(tx_info, message_to_sign)` or a `DexError::Other` carrying the Go-side
-/// error message. Always frees every C string the Go side allocated.
+/// `(tx_info, message_to_sign)` or a `DexError::Permanent` carrying the
+/// Go-side error message. Always frees every C string the Go side allocated.
 pub unsafe fn parse_signed_tx_response(
     resp: SignedTxResponse,
 ) -> Result<(String, Option<String>), DexError> {
@@ -91,11 +91,11 @@ pub unsafe fn parse_signed_tx_response(
         let _ = take_c_string(resp.tx_info);
         let _ = take_c_string(resp.tx_hash);
         let _ = take_c_string(resp.message_to_sign);
-        return Err(DexError::Other(format!("Go SDK error: {}", err_msg)));
+        return Err(DexError::Permanent(format!("Go SDK error: {}", err_msg)));
     }
 
     let tx_info = take_c_string(resp.tx_info)
-        .ok_or_else(|| DexError::Other("Go SDK returned null tx_info".to_string()))?;
+        .ok_or_else(|| DexError::Permanent("Go SDK returned null tx_info".to_string()))?;
     let message_to_sign = take_c_string(resp.message_to_sign);
     let _ = take_c_string(resp.tx_hash);
 

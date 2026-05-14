@@ -62,7 +62,7 @@ pub(super) fn scale_decimal_to_u64(
     let multiplier = Decimal::new(10i64.pow(safe_decimals), 0);
     let rounded = value.round_dp_with_strategy(safe_decimals, rounding);
     (rounded * multiplier).to_u64().ok_or_else(|| {
-        DexError::Other(format!(
+        DexError::Transient(format!(
             "Invalid {} value {} after scaling to {} decimals",
             context, value, safe_decimals
         ))
@@ -77,7 +77,7 @@ pub(super) fn scale_decimal_to_u32(
 ) -> Result<u32, DexError> {
     let scaled = scale_decimal_to_u64(value, decimals, rounding, context)?;
     if scaled > u64::from(u32::MAX) {
-        return Err(DexError::Other(format!(
+        return Err(DexError::Transient(format!(
             "Scaled {} value {} exceeds u32 maximum",
             context, scaled
         )));
@@ -141,7 +141,7 @@ pub(super) fn parse_filled_order(data: &Value, account_id: u64) -> Result<Filled
         });
 
     let order_id =
-        order_id.ok_or_else(|| DexError::Other("Missing order_id in fill".to_string()))?;
+        order_id.ok_or_else(|| DexError::Transient("Missing order_id in fill".to_string()))?;
 
     let trade_id = data
         .get("trade_id")
@@ -161,7 +161,7 @@ pub(super) fn parse_filled_order(data: &Value, account_id: u64) -> Result<Filled
         .or_else(|| data.get("base_amount"))
         .or_else(|| data.get("baseAmount"))
         .and_then(value_to_decimal)
-        .ok_or_else(|| DexError::Other("Missing filled size in fill".to_string()))?;
+        .ok_or_else(|| DexError::Transient("Missing filled size in fill".to_string()))?;
 
     let filled_price = data
         .get("price")

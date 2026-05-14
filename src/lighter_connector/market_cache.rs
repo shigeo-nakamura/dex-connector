@@ -63,10 +63,9 @@ impl LighterConnector {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64 + remaining.as_secs() as i64)
                 .unwrap_or(0);
-            return Err(DexError::Other(format!(
-                "Lighter WAF cooldown active until unix={} (rate-limited)",
-                deadline
-            )));
+            return Err(DexError::RateLimited {
+                until_unix: deadline,
+            });
         }
 
         let mut cache = MarketCache::default();
@@ -164,13 +163,16 @@ impl LighterConnector {
                         if normalized.is_empty() || cache.by_symbol.contains_key(&normalized) {
                             continue;
                         }
-                        let price_decimals = book.supported_price_decimals
+                        let price_decimals = book
+                            .supported_price_decimals
                             .unwrap_or(DEFAULT_PRICE_DECIMALS)
                             .min(MAX_DECIMAL_PRECISION);
-                        let size_decimals = book.supported_size_decimals
+                        let size_decimals = book
+                            .supported_size_decimals
                             .unwrap_or(DEFAULT_SIZE_DECIMALS)
                             .min(MAX_DECIMAL_PRECISION);
-                        let min_order = book.min_base_amount
+                        let min_order = book
+                            .min_base_amount
                             .as_deref()
                             .and_then(|v| Decimal::from_str(v).ok());
                         let info = MarketInfo {
@@ -226,7 +228,7 @@ impl LighterConnector {
         }
 
         if cache.by_symbol.is_empty() {
-            return Err(DexError::Other(
+            return Err(DexError::Transient(
                 "Unable to populate Lighter market metadata cache".to_string(),
             ));
         }
@@ -322,6 +324,6 @@ impl LighterConnector {
             .by_symbol
             .get(&normalized)
             .cloned()
-            .ok_or_else(|| DexError::Other(format!("Unknown symbol: {}", symbol)))
+            .ok_or_else(|| DexError::Permanent(format!("Unknown symbol: {}", symbol)))
     }
 }

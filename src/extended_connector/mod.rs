@@ -7,9 +7,9 @@ use crate::{
     TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
 #[cfg(test)]
 use chrono::DateTime;
+use chrono::{Duration, Utc};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Deserialize;
 use serde_json::json;
@@ -31,6 +31,8 @@ mod rest;
 mod signing;
 mod ws;
 
+#[cfg(test)]
+use maintenance::parse_maintenance_window;
 use maintenance::{
     extended_maintenance_disabled, parse_maintenance_windows_env, MaintenanceWindow,
 };
@@ -40,11 +42,9 @@ use parsing::{
 };
 use rest::{build_query, ExtendedApi, ExtendedEnvironment};
 use signing::{NewOrderModel, TpslLegModel};
-use ws::{fallback_price, stream_account, stream_orderbooks, stream_trades};
-#[cfg(test)]
-use maintenance::parse_maintenance_window;
 #[cfg(test)]
 use ws::{apply_orderbook_frame, StreamOrderbookUpdate, WrappedStreamResponse};
+use ws::{fallback_price, stream_account, stream_orderbooks, stream_trades};
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
@@ -532,10 +532,7 @@ impl ExtendedConnector {
 
         let mut last_err: Option<DexError> = None;
         for cand in &candidates {
-            let path = build_query(
-                "/info/markets",
-                vec![("market".to_string(), cand.clone())],
-            );
+            let path = build_query("/info/markets", vec![("market".to_string(), cand.clone())]);
             let markets: Result<Vec<MarketModel>, DexError> = self.api.get(path, true).await;
             let markets = match markets {
                 Ok(m) => m,
@@ -571,9 +568,7 @@ impl ExtendedConnector {
             return Ok(market);
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            DexError::Other(format!("Market not found: {}", symbol))
-        }))
+        Err(last_err.unwrap_or_else(|| DexError::Permanent(format!("Market not found: {}", symbol))))
     }
 
     #[allow(dead_code)]
@@ -586,7 +581,7 @@ impl ExtendedConnector {
         let market = markets
             .into_iter()
             .find(|m| m.name == symbol)
-            .ok_or_else(|| DexError::Other(format!("Market not found: {}", symbol)))?;
+            .ok_or_else(|| DexError::Permanent(format!("Market not found: {}", symbol)))?;
 
         let tc = &market.trading_config;
         log::info!(
@@ -610,7 +605,6 @@ impl ExtendedConnector {
         }
     }
 
-
     fn round_to_step(value: Decimal, step: Decimal, rounding: RoundingStrategy) -> Decimal {
         if step <= Decimal::ZERO {
             return value;
@@ -630,10 +624,13 @@ impl ExtendedConnector {
         let asset_precision = market.asset_precision.max(0).try_into().unwrap_or(0);
         rounded = rounded.round_dp_with_strategy(asset_precision, RoundingStrategy::ToZero);
         if rounded < market.trading_config.min_order_size {
-            return Err(DexError::Other(format!(
-                "Order size {} below min {} for {}",
-                rounded, market.trading_config.min_order_size, market.name
-            )));
+            return Err(DexError::InvalidInput {
+                field: "size".to_string(),
+                value: format!(
+                    "{} below min {} for {}",
+                    rounded, market.trading_config.min_order_size, market.name
+                ),
+            });
         }
         Ok(rounded)
     }
@@ -930,10 +927,7 @@ mod tests {
         let w = parse_maintenance_window("2026-05-01T10:00:00Z/45m").unwrap();
         assert_eq!(w.end.to_rfc3339(), "2026-05-01T10:45:00+00:00");
 
-        let w = parse_maintenance_window(
-            "2026-05-01T10:00:00Z/2026-05-01T11:30:00Z",
-        )
-        .unwrap();
+        let w = parse_maintenance_window("2026-05-01T10:00:00Z/2026-05-01T11:30:00Z").unwrap();
         assert_eq!(w.end.to_rfc3339(), "2026-05-01T11:30:00+00:00");
     }
 
@@ -958,18 +952,26 @@ mod tests {
 
         // 1h before start, hours_ahead=2 → upcoming hit.
         let now = start - Duration::hours(1);
-        assert!(ExtendedConnector::maintenance_within_window(&windows, &now, 2));
+        assert!(ExtendedConnector::maintenance_within_window(
+            &windows, &now, 2
+        ));
 
         // 1h before start, hours_ahead=0 → miss (not upcoming within horizon).
-        assert!(!ExtendedConnector::maintenance_within_window(&windows, &now, 0));
+        assert!(!ExtendedConnector::maintenance_within_window(
+            &windows, &now, 0
+        ));
 
         // 30min past start → active (within 90-min grace).
         let now = start + Duration::minutes(30);
-        assert!(ExtendedConnector::maintenance_within_window(&windows, &now, 2));
+        assert!(ExtendedConnector::maintenance_within_window(
+            &windows, &now, 2
+        ));
 
         // 2h past start → beyond grace → miss (grace is 90min, not window end).
         let now = start + Duration::hours(2);
-        assert!(!ExtendedConnector::maintenance_within_window(&windows, &now, 2));
+        assert!(!ExtendedConnector::maintenance_within_window(
+            &windows, &now, 2
+        ));
     }
 
     #[test]
@@ -1050,7 +1052,6 @@ mod tests {
         assert!(entry.bids.is_empty());
     }
 }
-
 
 impl ExtendedConnector {
     async fn get_order_book_rest(
@@ -1299,10 +1300,13 @@ impl ExtendedConnector {
             OrderSide::Short => "SELL",
         };
         if rounded_price <= Decimal::ZERO {
-            return Err(DexError::Other(format!(
-                "Rounded price {} is non-positive for {}",
-                rounded_price, market.name
-            )));
+            return Err(DexError::InvalidInput {
+                field: "price".to_string(),
+                value: format!(
+                    "rounded {} is non-positive for {}",
+                    rounded_price, market.name
+                ),
+            });
         }
         let tc = &market.trading_config;
         log::debug!(
@@ -1543,7 +1547,6 @@ impl ExtendedConnector {
         }
         Ok(())
     }
-
 }
 
 #[async_trait]
@@ -1682,10 +1685,7 @@ impl DexConnector for ExtendedConnector {
             cache.get(&key).cloned().unwrap_or_else(|| Vec::new())
         } else {
             let market_name = self.get_market(symbol).await?.name;
-            let path = build_query(
-                "/user/orders",
-                vec![("market".to_string(), market_name)],
-            );
+            let path = build_query("/user/orders", vec![("market".to_string(), market_name)]);
             let open_orders: Vec<OpenOrderModel> = self.api.get(path, true).await?;
             {
                 let mut map = self.order_id_map.write().await;
@@ -1716,16 +1716,19 @@ impl DexConnector for ExtendedConnector {
         let balance = if self.websocket_url.is_some() {
             let cache = self.balance_cache.read().await;
             cache.as_ref().map(copy_balance).ok_or_else(|| {
-                DexError::Other("balance unavailable: waiting for websocket data".to_string())
+                DexError::Transient("balance unavailable: waiting for websocket data".to_string())
             })?
         } else {
             let balance: BalanceModel = self.api.get("/user/balance".to_string(), true).await?;
             if let Some(symbol) = symbol {
                 if symbol != balance.collateral_name {
-                    return Err(DexError::Other(format!(
-                        "Unsupported balance symbol {} (collateral: {})",
-                        symbol, balance.collateral_name
-                    )));
+                    return Err(DexError::InvalidInput {
+                        field: "symbol".to_string(),
+                        value: format!(
+                            "{} unsupported (collateral: {})",
+                            symbol, balance.collateral_name
+                        ),
+                    });
                 }
             }
             BalanceResponse {
@@ -1745,7 +1748,7 @@ impl DexConnector for ExtendedConnector {
         let balance = if self.websocket_url.is_some() {
             let cache = self.balance_cache.read().await;
             cache.as_ref().map(copy_balance).ok_or_else(|| {
-                DexError::Other("balance unavailable: waiting for websocket data".to_string())
+                DexError::Transient("balance unavailable: waiting for websocket data".to_string())
             })?
         } else {
             let balance: BalanceModel = self.api.get("/user/balance".to_string(), true).await?;
@@ -1824,15 +1827,12 @@ impl DexConnector for ExtendedConnector {
         if self.websocket_url.is_some() {
             let cache = self.last_trades.read().await;
             let trades = cache.get(&key).cloned().ok_or_else(|| {
-                DexError::Other("last trades unavailable: waiting for websocket data".to_string())
+                DexError::Transient("last trades unavailable: waiting for websocket data".to_string())
             })?;
             Ok(LastTradesResponse { trades })
         } else {
             let market_name = self.get_market(symbol).await?.name;
-            let path = build_query(
-                "/user/trades",
-                vec![("market".to_string(), market_name)],
-            );
+            let path = build_query("/user/trades", vec![("market".to_string(), market_name)]);
             let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
             let last_trades = trades
                 .into_iter()
@@ -1864,7 +1864,7 @@ impl DexConnector for ExtendedConnector {
             self.get_cached_order_book(symbol, depth)
                 .await
                 .ok_or_else(|| {
-                    DexError::Other(
+                    DexError::Transient(
                         "order book unavailable: waiting for websocket data".to_string(),
                     )
                 })
@@ -1907,13 +1907,13 @@ impl DexConnector for ExtendedConnector {
             if orders.len() < initial_len {
                 Ok(())
             } else {
-                Err(DexError::Other(format!(
+                Err(DexError::Permanent(format!(
                     "Trade ID {} not found for symbol {}",
                     trade_id, symbol
                 )))
             }
         } else {
-            Err(DexError::Other(format!(
+            Err(DexError::Permanent(format!(
                 "No filled orders found for symbol {}",
                 symbol
             )))
@@ -1934,13 +1934,13 @@ impl DexConnector for ExtendedConnector {
             if orders.len() < initial_len {
                 Ok(())
             } else {
-                Err(DexError::Other(format!(
+                Err(DexError::Permanent(format!(
                     "Order ID {} not found for symbol {}",
                     order_id, symbol
                 )))
             }
         } else {
-            Err(DexError::Other(format!(
+            Err(DexError::Permanent(format!(
                 "No canceled orders found for symbol {}",
                 symbol
             )))
@@ -2023,25 +2023,26 @@ impl DexConnector for ExtendedConnector {
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
         if !matches!(tpsl, TpSl::Sl) {
-            return Err(DexError::Other(
+            return Err(DexError::Permanent(
                 "Extended trigger: only TpSl::Sl is implemented (TP not supported yet)".into(),
             ));
         }
         if !matches!(order_style, TriggerOrderStyle::MarketWithSlippageControl) {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Permanent(format!(
                 "Extended trigger: only MarketWithSlippageControl is implemented; got {:?}",
                 order_style
             )));
         }
-        let slippage_bps = slippage_bps.ok_or_else(|| {
-            DexError::Other(
-                "Extended trigger: slippage_bps required for MarketWithSlippageControl".into(),
-            )
+        let slippage_bps = slippage_bps.ok_or_else(|| DexError::InvalidInput {
+            field: "slippage_bps".to_string(),
+            value: "required for MarketWithSlippageControl".to_string(),
         })?;
         if !reduce_only {
-            return Err(DexError::Other(
-                "Extended TPSL orders must be reduce_only=true (Python SDK parity)".into(),
-            ));
+            return Err(DexError::InvalidInput {
+                field: "reduce_only".to_string(),
+                value: "Extended TPSL orders must be reduce_only=true (Python SDK parity)"
+                    .to_string(),
+            });
         }
 
         let market = self.get_market(symbol).await?;
@@ -2068,10 +2069,13 @@ impl DexConnector for ExtendedConnector {
         let trigger_px_rounded =
             Self::round_to_step(trigger_px, tick, RoundingStrategy::MidpointAwayFromZero);
         if leg_price <= Decimal::ZERO || trigger_px_rounded <= Decimal::ZERO {
-            return Err(DexError::Other(format!(
-                "Non-positive rounded price (trigger={} leg={}) for {}",
-                trigger_px_rounded, leg_price, market.name
-            )));
+            return Err(DexError::InvalidInput {
+                field: "price".to_string(),
+                value: format!(
+                    "non-positive rounded (trigger={} leg={}) for {}",
+                    trigger_px_rounded, leg_price, market.name
+                ),
+            });
         }
 
         // SL safety net usually outlives entry trades by minutes/hours at
@@ -2149,8 +2153,10 @@ impl DexConnector for ExtendedConnector {
             market.name, side_str, trigger_px_rounded, leg_price, rounded_size, slippage_bps
         );
 
-        let response: PlacedOrderModel =
-            self.api.post("/user/order".to_string(), order, true).await?;
+        let response: PlacedOrderModel = self
+            .api
+            .post("/user/order".to_string(), order, true)
+            .await?;
 
         Ok(CreateOrderResponse {
             order_id: response.external_id,
@@ -2386,7 +2392,7 @@ impl DexConnector for ExtendedConnector {
         if last_trades.remove(symbol).is_some() {
             Ok(())
         } else {
-            Err(DexError::Other(format!(
+            Err(DexError::Permanent(format!(
                 "No last trades found for symbol {}",
                 symbol
             )))
@@ -2437,11 +2443,8 @@ impl DexConnector for ExtendedConnector {
         }
         // Scheduled path: operator-declared windows from env var.
         let now = Utc::now();
-        let hit = Self::maintenance_within_window(
-            self.maintenance_windows.as_ref(),
-            &now,
-            hours_ahead,
-        );
+        let hit =
+            Self::maintenance_within_window(self.maintenance_windows.as_ref(), &now, hours_ahead);
         if hit {
             log::debug!(
                 "[EXTENDED_MAINTENANCE] is_upcoming_maintenance=true via declared window (hours_ahead={hours_ahead})"
@@ -2451,13 +2454,13 @@ impl DexConnector for ExtendedConnector {
     }
 
     async fn sign_evm_65b(&self, _message: &str) -> Result<String, DexError> {
-        Err(DexError::Other(
+        Err(DexError::Permanent(
             "sign_evm_65b not supported for Extended".to_string(),
         ))
     }
 
     async fn sign_evm_65b_with_eip191(&self, _message: &str) -> Result<String, DexError> {
-        Err(DexError::Other(
+        Err(DexError::Permanent(
             "sign_evm_65b_with_eip191 not supported for Extended".to_string(),
         ))
     }
@@ -2487,4 +2490,3 @@ pub async fn create_extended_connector(
     .await?;
     Ok(Box::new(connector))
 }
-

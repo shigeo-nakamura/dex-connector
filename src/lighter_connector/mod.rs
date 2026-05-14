@@ -84,10 +84,10 @@ pub struct LighterConnectorConfig {
 use crate::{
     dex_connector::{string_to_decimal, DexConnector},
     dex_request::DexError,
-    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse, SpotAssetBalance,
+    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
     CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
     OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
-    TickerResponse, TpSl, TriggerOrderStyle,
+    SpotAssetBalance, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -150,23 +150,20 @@ mod parsing;
 mod rest;
 mod signing;
 mod ws;
-pub use ffi::{SignedTxResponse, StrOrErr};
 use ffi::{parse_signed_tx_response, CheckClient, CreateClient, SignChangePubKey};
+pub use ffi::{SignedTxResponse, StrOrErr};
 use maintenance::{
     fetch_next_maintenance_window_with, maintenance_ttl_mins, maintenance_within_window,
     MaintenanceInfo, MAINTENANCE_BACKOFF_429_MINS, MAINTENANCE_BACKOFF_OTHER_MINS,
 };
-use market_cache::{
-    MarketCache, CACHED_EXCHANGE_STATS, MARKET_CACHE, MARKET_CACHE_INIT_LOCK,
-};
-use rest::track_api_call;
 #[cfg(test)]
 use market_cache::MarketInfo;
+use market_cache::{MarketCache, CACHED_EXCHANGE_STATS, MARKET_CACHE, MARKET_CACHE_INIT_LOCK};
 use parsing::{
     calculate_min_tick, map_side, parse_cancel_order_index, scale_decimal_to_u32,
     scale_decimal_to_u64, ten_pow,
 };
-
+use rest::track_api_call;
 
 #[derive(Clone)]
 pub struct LighterConnector {
@@ -481,13 +478,12 @@ struct LighterSignedEnvelope {
 // Lighter-specific cryptographic structures
 
 impl LighterConnector {
-
     /// Initialize Go client
     #[cfg(feature = "lighter-sdk")]
     async fn create_go_client(&self) -> Result<(), DexError> {
         unsafe {
             let url = CString::new(self.base_url.as_str())
-                .map_err(|e| DexError::Other(format!("Invalid URL: {}", e)))?;
+                .map_err(|e| DexError::Permanent(format!("Invalid URL: {}", e)))?;
 
             // Use API private key directly (should be 40 bytes / 80 hex chars)
             let private_key_hex = self
@@ -496,14 +492,17 @@ impl LighterConnector {
                 .unwrap_or(&self.api_private_key_hex);
 
             if private_key_hex.len() != 80 {
-                return Err(DexError::Other(format!(
-                    "API private key must be 40 bytes (80 hex chars), got: {}",
-                    private_key_hex.len()
-                )));
+                return Err(DexError::InvalidInput {
+                    field: "api_private_key_hex".to_string(),
+                    value: format!(
+                        "must be 40 bytes (80 hex chars), got: {}",
+                        private_key_hex.len()
+                    ),
+                });
             }
 
             let private_key = CString::new(private_key_hex)
-                .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
+                .map_err(|e| DexError::Permanent(format!("Invalid private key: {}", e)))?;
 
             let result = CreateClient(
                 url.as_ptr(),
@@ -517,7 +516,7 @@ impl LighterConnector {
                 let error_cstr = CStr::from_ptr(result);
                 let error_msg = error_cstr.to_string_lossy().to_string();
                 libc::free(result as *mut libc::c_void);
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "CreateClient error: {}",
                     error_msg
                 )));
@@ -556,8 +555,8 @@ impl LighterConnector {
                 // pre-check) and log at WARN, not ERROR — a transient 429 is
                 // not an auth failure and must not feed `auto-error` issue
                 // generators. See bot-strategy#151.
-                let is_rate_limited = error_msg.contains("Too Many Requests")
-                    || error_msg.contains("\"code\":23000");
+                let is_rate_limited =
+                    error_msg.contains("Too Many Requests") || error_msg.contains("\"code\":23000");
 
                 if is_rate_limited {
                     log::warn!(
@@ -607,14 +606,14 @@ impl LighterConnector {
                 if self.evm_wallet_private_key.is_some() {
                     return Err(DexError::ApiKeyRegistrationRequired);
                 } else {
-                    return Err(DexError::Other(format!(
+                    return Err(DexError::Transient(format!(
                         "API key validation failed: {}",
                         error_msg
                     )));
                 }
 
                 #[cfg(not(feature = "lighter-sdk"))]
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "API key validation failed: {}",
                     error_msg
                 )));
@@ -747,13 +746,14 @@ impl LighterConnector {
             std::env::var("LIGHTER_MAINTENANCE_DISABLED").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
         ) {
-            log::info!(
-                "[MAINTENANCE] LIGHTER_MAINTENANCE_DISABLED set, skipping refresher spawn"
-            );
+            log::info!("[MAINTENANCE] LIGHTER_MAINTENANCE_DISABLED set, skipping refresher spawn");
             return;
         }
 
-        if self.maintenance_refresher_started.swap(true, Ordering::SeqCst) {
+        if self
+            .maintenance_refresher_started
+            .swap(true, Ordering::SeqCst)
+        {
             log::debug!("[MAINTENANCE] refresher already started; ignoring.");
             return;
         }
@@ -818,8 +818,7 @@ impl LighterConnector {
                     }
                 };
 
-                let sleep_secs =
-                    (backoff_mins.max(1) as u64).saturating_mul(60);
+                let sleep_secs = (backoff_mins.max(1) as u64).saturating_mul(60);
                 let mut remaining = sleep_secs;
                 // Wake every 5s so a stop() flipping `is_running` doesn't
                 // wait the full TTL before the task exits.
@@ -837,7 +836,7 @@ impl LighterConnector {
     /// Initialize Go client (disabled when lighter-sdk feature is not enabled)
     #[cfg(not(feature = "lighter-sdk"))]
     async fn create_go_client(&self) -> Result<(), DexError> {
-        Err(DexError::Other(
+        Err(DexError::Transient(
             "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
                 .to_string(),
         ))
@@ -859,7 +858,7 @@ impl LighterConnector {
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
             .build()
-            .map_err(|e| DexError::Other(format!("Failed to build HTTP client: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to build HTTP client: {}", e)))?;
 
         Ok(Self {
             api_key_public: config.api_key_public,
@@ -922,7 +921,7 @@ impl LighterConnector {
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
             .build()
-            .map_err(|e| DexError::Other(format!("Failed to build HTTP client: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to build HTTP client: {}", e)))?;
 
         Ok(Self {
             api_key_public: config.api_key_public,
@@ -991,7 +990,7 @@ impl LighterConnector {
             .await?;
 
         if response.api_keys.is_empty() {
-            return Err(DexError::Other("No API keys found on server".to_string()));
+            return Err(DexError::Transient("No API keys found on server".to_string()));
         }
 
         let server_pubkey = response.api_keys[0].public_key.clone();
@@ -1116,7 +1115,7 @@ impl LighterConnector {
             .strip_prefix("0x")
             .unwrap_or(&self.api_private_key_hex);
         let private_key_bytes = hex::decode(private_key_hex)
-            .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("Invalid private key hex: {}", e)))?;
 
         // Lighter uses 40-byte private keys for Goldilocks quintic extension
         let mut key_bytes = [0u8; 40];
@@ -1178,13 +1177,13 @@ impl LighterConnector {
             .body(form_data)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("HTTP request failed: {}", e)))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
 
         log::debug!(
             "Native order response: HTTP {}, Body: {}",
@@ -1223,7 +1222,7 @@ impl LighterConnector {
             })
         } else {
             self.invalidate_nonce_cache().await;
-            Err(DexError::Other(format!(
+            Err(DexError::Transient(format!(
                 "Order failed: HTTP {}, {}",
                 status, response_text
             )))
@@ -1339,7 +1338,7 @@ impl LighterConnector {
             .strip_prefix("0x")
             .unwrap_or(&self.api_private_key_hex);
         let private_key_bytes = hex::decode(private_key_hex)
-            .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("Invalid private key hex: {}", e)))?;
 
         let mut key_bytes = [0u8; 40];
         let copy_len = std::cmp::min(private_key_bytes.len(), 40);
@@ -1366,7 +1365,7 @@ impl LighterConnector {
             Ok(sig) => sig,
             Err(e) => {
                 log::error!("Failed to sign trigger order via Go SDK: {}", e);
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "Signature generation failed: {}",
                     e
                 )));
@@ -1397,13 +1396,13 @@ impl LighterConnector {
             .body(form_data)
             .send()
             .await
-            .map_err(|e| DexError::Other(e.to_string()))?;
+            .map_err(|e| DexError::Transient(e.to_string()))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| DexError::Other(e.to_string()))?;
+            .map_err(|e| DexError::Transient(e.to_string()))?;
 
         log::debug!("Trigger order response: HTTP {}, {}", status, response_text);
 
@@ -1431,7 +1430,7 @@ impl LighterConnector {
             })
         } else {
             self.invalidate_nonce_cache().await;
-            Err(DexError::Other(format!(
+            Err(DexError::Transient(format!(
                 "Trigger order failed: HTTP {}, {}",
                 status, response_text
             )))
@@ -1502,14 +1501,14 @@ impl LighterConnector {
             .env("LIGHTER_PRIVATE_API_KEY", &self.api_private_key_hex)
             .current_dir(".")
             .output()
-            .map_err(|e| DexError::Other(format!("Failed to execute SDK script: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to execute SDK script: {}", e)))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !output.status.success() {
             log::error!("SDK delegation failed. stderr: {}", stderr);
-            return Err(DexError::Other(format!("SDK execution failed: {}", stderr)));
+            return Err(DexError::Transient(format!("SDK execution failed: {}", stderr)));
         }
 
         if !stderr.is_empty() {
@@ -1518,7 +1517,7 @@ impl LighterConnector {
 
         // Parse JSON response
         let response: serde_json::Value = serde_json::from_str(&stdout)
-            .map_err(|e| DexError::Other(format!("Failed to parse SDK response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse SDK response: {}", e)))?;
 
         if let Some(true) = response.get("success").and_then(|v| v.as_bool()) {
             log::debug!("Order successfully sent via SDK");
@@ -1544,9 +1543,9 @@ impl LighterConnector {
             })
         } else if let Some(error) = response.get("error") {
             log::error!("SDK order failed: {}", error);
-            Err(DexError::Other(format!("SDK order error: {}", error)))
+            Err(DexError::Transient(format!("SDK order error: {}", error)))
         } else {
-            Err(DexError::Other(
+            Err(DexError::Transient(
                 "Unexpected SDK response format".to_string(),
             ))
         }
@@ -1611,7 +1610,7 @@ impl LighterConnector {
             .header("X-API-KEY", api_key)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to get nonce: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to get nonce: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1624,7 +1623,7 @@ impl LighterConnector {
                 status,
                 error_body
             );
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "Failed to get nonce: HTTP {}, Body: {}",
                 status, error_body
             )));
@@ -1633,7 +1632,7 @@ impl LighterConnector {
         let nonce_response: LighterNonceResponse = response
             .json()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to parse nonce response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse nonce response: {}", e)))?;
 
         Ok(nonce_response.nonce)
     }
@@ -1666,28 +1665,27 @@ impl LighterConnector {
             .send()
             .await
             .map_err(|e| {
-                DexError::Other(format!("Failed to query accounts for discovery: {}", e))
+                DexError::Transient(format!("Failed to query accounts for discovery: {}", e))
             })?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            DexError::Other(format!("Failed to read accounts response: {}", e))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| DexError::Transient(format!("Failed to read accounts response: {}", e)))?;
 
         if !status.is_success() {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "Accounts API returned HTTP {}: {}",
                 status, body
             )));
         }
 
-        let account_resp: LighterAccountResponse =
-            serde_json::from_str(&body).map_err(|e| {
-                DexError::Other(format!("Failed to parse accounts response: {}", e))
-            })?;
+        let account_resp: LighterAccountResponse = serde_json::from_str(&body)
+            .map_err(|e| DexError::Transient(format!("Failed to parse accounts response: {}", e)))?;
 
         if account_resp.accounts.is_empty() {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "No accounts found for wallet {}",
                 wallet_address
             )));
@@ -1750,7 +1748,7 @@ impl LighterConnector {
             return Err(DexError::RateLimited { until_unix: until });
         }
 
-        Err(DexError::Other(format!(
+        Err(DexError::Transient(format!(
             "Could not find account for api_key_index={} in {} accounts for wallet {}. \
              Set LIGHTER_ACCOUNT_INDEX manually.",
             self.api_key_index,
@@ -1763,7 +1761,6 @@ impl LighterConnector {
         // Use cached version to reduce API calls
         self.get_server_public_key_cached().await
     }
-
 
     #[cfg(feature = "lighter-sdk")]
     async fn register_api_key(
@@ -1918,13 +1915,13 @@ impl LighterConnector {
             .header("X-API-KEY", &self.api_key_public)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to get account details: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to get account details: {}", e)))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
 
         log::debug!(
             "Account details response: HTTP {}, Body: {}",
@@ -1933,7 +1930,7 @@ impl LighterConnector {
         );
 
         if !status.is_success() {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "HTTP {}: {}",
                 status, response_text
             )));
@@ -1941,13 +1938,13 @@ impl LighterConnector {
 
         // Parse the response to extract L1 address
         let account_data: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse account response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse account response: {}", e)))?;
 
         // Look for l1Address field
         if let Some(l1_address) = account_data.get("l1Address").and_then(|v| v.as_str()) {
             Ok(l1_address.to_string())
         } else {
-            Err(DexError::Other(
+            Err(DexError::Transient(
                 "l1Address not found in account response".to_string(),
             ))
         }
@@ -2027,7 +2024,7 @@ impl DexConnector for LighterConnector {
                     #[cfg(feature = "lighter-sdk")]
                     if let Some(evm_key) = &self.evm_wallet_private_key {
                         let go_key = self.get_go_pubkey_from_check().map_err(|e| {
-                            DexError::Other(format!(
+                            DexError::Transient(format!(
                                 "Failed to derive Go public key from CheckClient: {}",
                                 e
                             ))
@@ -2037,13 +2034,13 @@ impl DexConnector for LighterConnector {
 
                         // Get server public key for ChangePubKey
                         let server_pubkey = self.get_server_public_key().await.map_err(|e| {
-                            DexError::Other(format!("Failed to get server public key: {}", e))
+                            DexError::Transient(format!("Failed to get server public key: {}", e))
                         })?;
 
                         self.register_api_key(evm_key, &go_key, &server_pubkey)
                             .await
                             .map_err(|e| {
-                                DexError::Other(format!("API key registration failed: {}", e))
+                                DexError::Transient(format!("API key registration failed: {}", e))
                             })?;
 
                         // Retry validation after registration
@@ -2188,8 +2185,7 @@ impl DexConnector for LighterConnector {
                 );
                 // Fall through to REST API fallback below
             } else {
-                let min_tick =
-                    calculate_min_tick(ws_price, market_info.price_decimals, false);
+                let min_tick = calculate_min_tick(ws_price, market_info.price_decimals, false);
 
                 let (volume, num_trades) = if let Some(stats) = &stats_data {
                     if let Some(market_stats) = stats
@@ -2247,14 +2243,12 @@ impl DexConnector for LighterConnector {
         let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=100", market_id);
         let url = format!("{}{}", self.base_url, endpoint);
 
-        let response_text = self
-            .fetch_text_with_waf_guard(&url, "recentTrades")
-            .await?;
+        let response_text = self.fetch_text_with_waf_guard(&url, "recentTrades").await?;
 
         log::trace!("Trades API response: {}", response_text);
 
         let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
 
         let price = if let Some(trade) = trades_response.trades.first() {
             string_to_decimal(Some(trade.price.clone()))?
@@ -2398,13 +2392,13 @@ impl DexConnector for LighterConnector {
                 .header("X-API-KEY", &self.api_key_public)
                 .send()
                 .await
-                .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+                .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
 
             let status = response.status();
             let response_text = response
                 .text()
                 .await
-                .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+                .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
 
             if status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 || attempt >= BALANCE_RETRY_BACKOFF_MS.len()
@@ -2444,17 +2438,17 @@ impl DexConnector for LighterConnector {
         );
 
         if !status.is_success() {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "HTTP {}: {}",
                 status, response_text
             )));
         }
 
         let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
 
         if account_response.accounts.is_empty() {
-            return Err(DexError::Other("No account found".to_string()));
+            return Err(DexError::Transient("No account found".to_string()));
         }
 
         let account = &account_response.accounts[0];
@@ -2604,26 +2598,26 @@ impl DexConnector for LighterConnector {
             .header("X-API-KEY", &self.api_key_public)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
 
         if !status.is_success() {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "HTTP {}: {}",
                 status, response_text
             )));
         }
 
         let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
 
         if account_response.accounts.is_empty() {
-            return Err(DexError::Other("No account found".to_string()));
+            return Err(DexError::Transient("No account found".to_string()));
         }
 
         let account = &account_response.accounts[0];
@@ -2679,7 +2673,7 @@ impl DexConnector for LighterConnector {
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
         if !self.positions_ready.load(Ordering::SeqCst) {
-            return Err(DexError::Other(
+            return Err(DexError::Transient(
                 "positions not ready from websocket".to_string(),
             ));
         }
@@ -2714,14 +2708,12 @@ impl DexConnector for LighterConnector {
         let endpoint = format!("/api/v1/recentTrades?market_id={}&limit=10", market_id);
 
         let url = format!("{}{}", self.base_url, endpoint);
-        let response_text = self
-            .fetch_text_with_waf_guard(&url, "recentTrades")
-            .await?;
+        let response_text = self.fetch_text_with_waf_guard(&url, "recentTrades").await?;
 
         log::debug!("Last trades API response: {}", response_text);
 
         let trades_response: LighterTradesResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
 
         let trades = trades_response
             .trades
@@ -2753,7 +2745,7 @@ impl DexConnector for LighterConnector {
                     market_id,
                     ob_guard.len()
                 );
-                return Err(DexError::Other(
+                return Err(DexError::Transient(
                     "order book snapshot unavailable (no recent update)".to_string(),
                 ));
             }
@@ -2762,7 +2754,7 @@ impl DexConnector for LighterConnector {
             // Don't remove stale entry from cache — it may be needed as a
             // baseline for delta merges after WS reconnection. The entry will
             // be replaced once a fresh update arrives. See: dex-connector#2
-            return Err(DexError::Other(
+            return Err(DexError::Transient(
                 "order book snapshot unavailable (no recent update)".to_string(),
             ));
         }
@@ -2800,13 +2792,13 @@ impl DexConnector for LighterConnector {
                 );
                 Ok(())
             } else {
-                Err(DexError::Other(format!(
+                Err(DexError::Transient(format!(
                     "Trade ID {} not found for symbol {}",
                     trade_id, symbol
                 )))
             }
         } else {
-            Err(DexError::Other(format!(
+            Err(DexError::Transient(format!(
                 "No filled orders found for symbol {}",
                 symbol
             )))
@@ -2825,13 +2817,13 @@ impl DexConnector for LighterConnector {
     }
 
     async fn clear_canceled_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
-        Err(DexError::Other(
+        Err(DexError::Transient(
             "clear_canceled_order not supported for Lighter - canceled orders are streamed via WebSocket only".to_string()
         ))
     }
 
     async fn clear_all_canceled_orders(&self) -> Result<(), DexError> {
-        Err(DexError::Other(
+        Err(DexError::Transient(
             "clear_all_canceled_orders not supported for Lighter - canceled orders are streamed via WebSocket only".to_string()
         ))
     }
@@ -3068,8 +3060,9 @@ impl DexConnector for LighterConnector {
                 }
             }
             TriggerOrderStyle::Limit => {
-                let limit_price = limit_px.ok_or_else(|| {
-                    DexError::Other("limit_px required for Limit order style".into())
+                let limit_price = limit_px.ok_or_else(|| DexError::InvalidInput {
+                    field: "limit_px".to_string(),
+                    value: "required for Limit order style".to_string(),
                 })?;
 
                 // Validate limit price vs trigger price for the order type
@@ -3078,33 +3071,41 @@ impl DexConnector for LighterConnector {
                     (OrderSide::Long, TpSl::Sl) => {
                         // Buy stop loss: limit should be >= trigger (worse price for buying)
                         if limit_price < trigger_px {
-                            return Err(DexError::Other(
-                                "For Buy Stop Loss, limit_px must be >= trigger_px".into(),
-                            ));
+                            return Err(DexError::InvalidInput {
+                                field: "limit_px".to_string(),
+                                value: "For Buy Stop Loss, limit_px must be >= trigger_px"
+                                    .to_string(),
+                            });
                         }
                     }
                     (OrderSide::Short, TpSl::Sl) => {
                         // Sell stop loss: limit should be <= trigger (worse price for selling)
                         if limit_price > trigger_px {
-                            return Err(DexError::Other(
-                                "For Sell Stop Loss, limit_px must be <= trigger_px".into(),
-                            ));
+                            return Err(DexError::InvalidInput {
+                                field: "limit_px".to_string(),
+                                value: "For Sell Stop Loss, limit_px must be <= trigger_px"
+                                    .to_string(),
+                            });
                         }
                     }
                     (OrderSide::Long, TpSl::Tp) => {
                         // Buy take profit: limit should be <= trigger (better price for buying)
                         if limit_price > trigger_px {
-                            return Err(DexError::Other(
-                                "For Buy Take Profit, limit_px must be <= trigger_px".into(),
-                            ));
+                            return Err(DexError::InvalidInput {
+                                field: "limit_px".to_string(),
+                                value: "For Buy Take Profit, limit_px must be <= trigger_px"
+                                    .to_string(),
+                            });
                         }
                     }
                     (OrderSide::Short, TpSl::Tp) => {
                         // Sell take profit: limit should be >= trigger (better price for selling)
                         if limit_price < trigger_px {
-                            return Err(DexError::Other(
-                                "For Sell Take Profit, limit_px must be >= trigger_px".into(),
-                            ));
+                            return Err(DexError::InvalidInput {
+                                field: "limit_px".to_string(),
+                                value: "For Sell Take Profit, limit_px must be >= trigger_px"
+                                    .to_string(),
+                            });
                         }
                     }
                 }
@@ -3230,17 +3231,17 @@ impl DexConnector for LighterConnector {
             .body(form_data)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("HTTP request failed: {}", e)))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
 
         if !status.is_success() {
             self.invalidate_nonce_cache().await;
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "Cancel order failed: HTTP {}, {}",
                 status, response_text
             )));
@@ -3311,7 +3312,7 @@ impl DexConnector for LighterConnector {
         let symbol = match symbol {
             Some(sym) => sym,
             None => {
-                return Err(DexError::Other(
+                return Err(DexError::Transient(
                     "cancel_orders requires a symbol on Lighter".to_string(),
                 ))
             }
@@ -3352,26 +3353,26 @@ impl DexConnector for LighterConnector {
             .header("X-API-KEY", &self.api_key_public)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
 
         if !status.is_success() {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "HTTP {}: {}",
                 status, response_text
             )));
         }
 
         let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
 
         if account_response.accounts.is_empty() {
-            return Err(DexError::Other("No account found".to_string()));
+            return Err(DexError::Transient("No account found".to_string()));
         }
 
         let account = &account_response.accounts[0];
@@ -3627,15 +3628,15 @@ impl DexConnector for LighterConnector {
         let private_key = self
             .evm_wallet_private_key
             .as_ref()
-            .ok_or_else(|| DexError::Other("EVM wallet private key not set".to_string()))?;
+            .ok_or_else(|| DexError::Permanent("EVM wallet private key not set".to_string()))?;
         let cleaned_key = private_key.strip_prefix("0x").unwrap_or(private_key);
         let wallet = LocalWallet::from_str(cleaned_key)
-            .map_err(|e| DexError::Other(format!("Invalid private key: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("Invalid private key: {}", e)))?;
 
         let signature = wallet
             .sign_message(message.as_bytes())
             .await
-            .map_err(|e| DexError::Other(format!("Signing failed: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("Signing failed: {}", e)))?;
 
         Ok(format!("0x{}", signature))
     }
@@ -3761,10 +3762,7 @@ impl LighterConnector {
     /// Returns `None` if the WS has not yet delivered an account update; the
     /// caller then decides whether to wait (see bot-strategy#148) or fall
     /// back to REST.
-    async fn try_read_cached_balance(
-        &self,
-        symbol: Option<&str>,
-    ) -> Option<BalanceResponse> {
+    async fn try_read_cached_balance(&self, symbol: Option<&str>) -> Option<BalanceResponse> {
         if let Some(token_symbol) = symbol {
             let positions = self.cached_positions.read().await;
             if let Some(pos) = positions.iter().find(|p| p.symbol == token_symbol) {
@@ -3835,7 +3833,7 @@ impl LighterConnector {
             .await?;
         log::trace!("Exchange stats response: {}", response_text);
         serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse exchange stats: {}", e)))
+            .map_err(|e| DexError::Transient(format!("Failed to parse exchange stats: {}", e)))
     }
 
     async fn get_order_book_details(&self) -> Result<LighterOrderBookDetailsResponse, DexError> {
@@ -3845,16 +3843,14 @@ impl LighterConnector {
             .await?;
         log::trace!("Order book details response: {}", response_text);
         serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse order book details: {}", e)))
+            .map_err(|e| DexError::Transient(format!("Failed to parse order book details: {}", e)))
     }
 
     async fn get_order_books_all(&self) -> Result<LighterOrderBooksResponse, DexError> {
         let url = format!("{}/api/v1/orderBooks?filter=all", self.base_url);
-        let response_text = self
-            .fetch_text_with_waf_guard(&url, "orderBooks")
-            .await?;
+        let response_text = self.fetch_text_with_waf_guard(&url, "orderBooks").await?;
         serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse orderBooks: {}", e)))
+            .map_err(|e| DexError::Transient(format!("Failed to parse orderBooks: {}", e)))
     }
 
     async fn get_funding_rates(&self) -> Result<LighterFundingRates, DexError> {
@@ -3864,10 +3860,8 @@ impl LighterConnector {
             .await?;
         log::trace!("Funding rates response: {}", response_text);
         serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Other(format!("Failed to parse funding rates: {}", e)))
+            .map_err(|e| DexError::Transient(format!("Failed to parse funding rates: {}", e)))
     }
-
-
 }
 
 pub fn create_lighter_connector(
@@ -3884,10 +3878,7 @@ mod tests {
 
     #[test]
     fn parses_plain_numeric_order_id_for_cancel() {
-        assert_eq!(
-            parse_cancel_order_index("12345"),
-            Some(12345)
-        );
+        assert_eq!(parse_cancel_order_index("12345"), Some(12345));
     }
 
     #[test]
@@ -3900,10 +3891,7 @@ mod tests {
 
     #[test]
     fn returns_none_for_unknown_cancel_format() {
-        assert_eq!(
-            parse_cancel_order_index("unknown-id"),
-            None
-        );
+        assert_eq!(parse_cancel_order_index("unknown-id"), None);
     }
 
     #[test]
@@ -4098,9 +4086,7 @@ mod tests {
         .await;
 
         let guard = balance_cache.read().await;
-        let (resp, fetched_at) = guard
-            .as_ref()
-            .expect("explicit totals must populate cache");
+        let (resp, fetched_at) = guard.as_ref().expect("explicit totals must populate cache");
         assert_eq!(resp.equity, Decimal::from_str("999.04").unwrap());
         assert_eq!(resp.balance, Decimal::from_str("800.00").unwrap());
         assert!(*fetched_at >= before, "fetched_at must be recent");
@@ -4275,9 +4261,14 @@ mod tests {
             "subscribed snapshot must seed cached_collateral from assets[USDC].margin_balance"
         );
         let guard = balance_cache.read().await;
-        let (resp, _) = guard.as_ref().expect("subscribed snapshot must populate balance_cache");
+        let (resp, _) = guard
+            .as_ref()
+            .expect("subscribed snapshot must populate balance_cache");
         assert_eq!(resp.balance, collateral, "balance reflects raw collateral");
-        assert_eq!(resp.equity, expected_equity, "equity = collateral + sum(unrealized_pnl)");
+        assert_eq!(
+            resp.equity, expected_equity,
+            "equity = collateral + sum(unrealized_pnl)"
+        );
         drop(guard);
 
         // Now deliver an update with assets:null but updated positions
@@ -4347,8 +4338,7 @@ mod tests {
         use serde_json::json;
         use std::str::FromStr;
 
-        let cache: Arc<RwLock<HashMap<u32, Decimal>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: Arc<RwLock<HashMap<u32, Decimal>>> = Arc::new(RwLock::new(HashMap::new()));
 
         let push_with_colon = json!({
             "channel": "market_stats:1",
@@ -4408,8 +4398,7 @@ mod tests {
     async fn market_stats_missing_fields_are_skipped() {
         use serde_json::json;
 
-        let cache: Arc<RwLock<HashMap<u32, Decimal>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: Arc<RwLock<HashMap<u32, Decimal>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Channel without a parseable trailing id.
         let bad_channel = json!({
@@ -4418,7 +4407,10 @@ mod tests {
             "market_stats": {"funding_rate": "0.001"}
         });
         LighterConnector::handle_market_stats_update(&bad_channel, &cache).await;
-        assert!(cache.read().await.is_empty(), "bad channel must not populate");
+        assert!(
+            cache.read().await.is_empty(),
+            "bad channel must not populate"
+        );
 
         // Payload missing funding_rate entirely.
         let missing_rate = json!({
@@ -4427,7 +4419,10 @@ mod tests {
             "market_stats": {"symbol": "SOL", "market_id": 3}
         });
         LighterConnector::handle_market_stats_update(&missing_rate, &cache).await;
-        assert!(cache.read().await.is_empty(), "missing funding_rate must not populate");
+        assert!(
+            cache.read().await.is_empty(),
+            "missing funding_rate must not populate"
+        );
 
         // Unparseable rate string.
         let bad_rate = json!({

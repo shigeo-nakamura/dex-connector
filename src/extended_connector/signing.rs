@@ -50,8 +50,8 @@ pub(super) struct StarkDebuggingOrderAmountsModel {
 pub(super) struct TpslLegModel {
     pub(super) trigger_price: Decimal,
     pub(super) trigger_price_type: String, // "LAST" | "MARK" | "INDEX"
-    pub(super) price: Decimal,             // execution price; for market-with-slippage this is slippage-adjusted
-    pub(super) price_type: String,         // "LIMIT" | "MARKET"
+    pub(super) price: Decimal, // execution price; for market-with-slippage this is slippage-adjusted
+    pub(super) price_type: String, // "LIMIT" | "MARKET"
     pub(super) settlement: StarkSettlementModel,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) debugging_amounts: Option<StarkDebuggingOrderAmountsModel>,
@@ -114,12 +114,12 @@ impl ExtendedConnector {
 
     pub(super) fn parse_private_key(&self) -> Result<Felt, DexError> {
         Felt::from_hex(&self.private_key)
-            .map_err(|e| DexError::Other(format!("Invalid private key hex: {}", e)))
+            .map_err(|e| DexError::Permanent(format!("Invalid private key hex: {}", e)))
     }
 
     pub(super) fn parse_public_key(&self) -> Result<Felt, DexError> {
         Felt::from_hex(&self.public_key)
-            .map_err(|e| DexError::Other(format!("Invalid public key hex: {}", e)))
+            .map_err(|e| DexError::Permanent(format!("Invalid public key hex: {}", e)))
     }
 
     pub(super) fn to_epoch_millis(value: DateTime<Utc>) -> i64 {
@@ -143,12 +143,12 @@ impl ExtendedConnector {
     ) -> Result<i64, DexError> {
         let scaled = value
             * Decimal::from_i64(resolution).ok_or_else(|| {
-                DexError::Other("Invalid resolution for amount conversion".to_string())
+                DexError::Permanent("Invalid resolution for amount conversion".to_string())
             })?;
         let rounded = scaled.round_dp_with_strategy(0, rounding);
         rounded
             .to_i64()
-            .ok_or_else(|| DexError::Other("Failed to convert amount to i64".to_string()))
+            .ok_or_else(|| DexError::Permanent("Failed to convert amount to i64".to_string()))
     }
 
     pub(super) fn compute_settlement(
@@ -205,11 +205,11 @@ impl ExtendedConnector {
             self.domain_chain_id().to_string(),
             DOMAIN_REVISION.to_string(),
         )
-        .map_err(|e| DexError::Other(format!("Failed to compute order hash: {}", e)))?;
+        .map_err(|e| DexError::Permanent(format!("Failed to compute order hash: {}", e)))?;
 
         let private_key = self.parse_private_key()?;
         let signature = sign_message(&order_hash, &private_key)
-            .map_err(|e| DexError::Other(format!("Failed to sign order: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("Failed to sign order: {}", e)))?;
 
         let settlement = StarkSettlementModel {
             signature: SettlementSignatureModel {

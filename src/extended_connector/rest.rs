@@ -157,7 +157,7 @@ impl ExtendedApi {
 
         let json_payload = match payload {
             Some(body) => serde_json::to_string(&body)
-                .map_err(|e| DexError::Other(format!("Failed to serialize payload: {}", e)))?,
+                .map_err(|e| DexError::Permanent(format!("Failed to serialize payload: {}", e)))?,
             None => String::new(),
         };
 
@@ -232,7 +232,7 @@ impl ExtendedApi {
 
             return response
                 .data
-                .ok_or_else(|| DexError::Other("Extended API returned empty data".to_string()));
+                .ok_or_else(|| DexError::Transient("Extended API returned empty data".to_string()));
         }
         unreachable!("extended send retry loop exited without Ok/Err")
     }
@@ -338,12 +338,21 @@ mod tests {
     fn rest_1010_bump_arms_grace_window() {
         let clear_at = AtomicI64::new(0);
         bump_rest_1010_clear_at(&clear_at, 1_000);
-        assert_eq!(clear_at.load(Ordering::SeqCst), 1_000 + REST_1010_GRACE_SECS);
+        assert_eq!(
+            clear_at.load(Ordering::SeqCst),
+            1_000 + REST_1010_GRACE_SECS
+        );
         assert!(rest_1010_active(&clear_at, 1_500));
-        assert!(rest_1010_active(&clear_at, 1_000 + REST_1010_GRACE_SECS - 1));
+        assert!(rest_1010_active(
+            &clear_at,
+            1_000 + REST_1010_GRACE_SECS - 1
+        ));
         // Boundary: at the deadline itself we're already clear.
         assert!(!rest_1010_active(&clear_at, 1_000 + REST_1010_GRACE_SECS));
-        assert!(!rest_1010_active(&clear_at, 1_000 + REST_1010_GRACE_SECS + 60));
+        assert!(!rest_1010_active(
+            &clear_at,
+            1_000 + REST_1010_GRACE_SECS + 60
+        ));
     }
 
     #[test]
@@ -352,9 +361,15 @@ mod tests {
         bump_rest_1010_clear_at(&clear_at, 1_000);
         bump_rest_1010_clear_at(&clear_at, 1_300);
         // Second bump from a later wall clock pushes the deadline forward.
-        assert_eq!(clear_at.load(Ordering::SeqCst), 1_300 + REST_1010_GRACE_SECS);
+        assert_eq!(
+            clear_at.load(Ordering::SeqCst),
+            1_300 + REST_1010_GRACE_SECS
+        );
         // Active at any `now` strictly less than the new deadline.
-        assert!(rest_1010_active(&clear_at, 1_300 + REST_1010_GRACE_SECS - 1));
+        assert!(rest_1010_active(
+            &clear_at,
+            1_300 + REST_1010_GRACE_SECS - 1
+        ));
         assert!(!rest_1010_active(&clear_at, 1_300 + REST_1010_GRACE_SECS));
     }
 
@@ -380,11 +395,20 @@ mod tests {
     fn rest_1011_bump_arms_grace_window() {
         let clear_at = AtomicI64::new(0);
         bump_rest_1011_clear_at(&clear_at, 1_000);
-        assert_eq!(clear_at.load(Ordering::SeqCst), 1_000 + REST_1011_GRACE_SECS);
+        assert_eq!(
+            clear_at.load(Ordering::SeqCst),
+            1_000 + REST_1011_GRACE_SECS
+        );
         assert!(rest_1011_active(&clear_at, 1_030));
-        assert!(rest_1011_active(&clear_at, 1_000 + REST_1011_GRACE_SECS - 1));
+        assert!(rest_1011_active(
+            &clear_at,
+            1_000 + REST_1011_GRACE_SECS - 1
+        ));
         assert!(!rest_1011_active(&clear_at, 1_000 + REST_1011_GRACE_SECS));
-        assert!(!rest_1011_active(&clear_at, 1_000 + REST_1011_GRACE_SECS + 60));
+        assert!(!rest_1011_active(
+            &clear_at,
+            1_000 + REST_1011_GRACE_SECS + 60
+        ));
     }
 
     #[test]
@@ -392,8 +416,14 @@ mod tests {
         let clear_at = AtomicI64::new(0);
         bump_rest_1011_clear_at(&clear_at, 1_000);
         bump_rest_1011_clear_at(&clear_at, 1_030);
-        assert_eq!(clear_at.load(Ordering::SeqCst), 1_030 + REST_1011_GRACE_SECS);
-        assert!(rest_1011_active(&clear_at, 1_030 + REST_1011_GRACE_SECS - 1));
+        assert_eq!(
+            clear_at.load(Ordering::SeqCst),
+            1_030 + REST_1011_GRACE_SECS
+        );
+        assert!(rest_1011_active(
+            &clear_at,
+            1_030 + REST_1011_GRACE_SECS - 1
+        ));
         assert!(!rest_1011_active(&clear_at, 1_030 + REST_1011_GRACE_SECS));
     }
 

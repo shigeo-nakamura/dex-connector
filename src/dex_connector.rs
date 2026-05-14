@@ -17,9 +17,19 @@ pub fn string_to_decimal(string_value: Option<String>) -> Result<Decimal, DexErr
     match string_value {
         Some(value) => match parse_to_decimal(&value) {
             Ok(v) => return Ok(v),
-            Err(_) => return Err(DexError::Other(format!("Invalid value: {}", value))),
+            Err(_) => {
+                return Err(DexError::InvalidInput {
+                    field: "string_to_decimal".to_string(),
+                    value,
+                })
+            }
         },
-        None => return Err(DexError::Other("Value is None".to_owned())),
+        None => {
+            return Err(DexError::InvalidInput {
+                field: "string_to_decimal".to_string(),
+                value: "None".to_string(),
+            })
+        }
     }
 }
 
@@ -114,7 +124,7 @@ pub trait DexConnector: Send + Sync {
     ///   `time_in_force=IOC` so the venue terminates the order on first
     ///   match (filled or zero-fill cancel) within ~ms.
     ///
-    /// Default impl returns `DexError::Other(...)` so this is opt-in
+    /// Default impl returns `DexError::Permanent(...)` so this is opt-in
     /// per connector. bot-strategy#302 — Extended impl reuses the IOC
     /// path that `close_all_positions` already exercises.
     async fn create_order_taker_ioc(
@@ -125,7 +135,7 @@ pub trait DexConnector: Send + Sync {
         _slippage_bps: u32,
         _reduce_only: bool,
     ) -> Result<CreateOrderResponse, DexError> {
-        Err(DexError::Other(
+        Err(DexError::Permanent(
             "create_order_taker_ioc not implemented for this connector".into(),
         ))
     }
@@ -156,7 +166,7 @@ pub trait DexConnector: Send + Sync {
     fn subscribe_price_updates(
         &self,
     ) -> Result<tokio::sync::broadcast::Receiver<PriceUpdate>, DexError> {
-        Err(DexError::Other(
+        Err(DexError::Permanent(
             "subscribe_price_updates not supported by this connector".to_string(),
         ))
     }

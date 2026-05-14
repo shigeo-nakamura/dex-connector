@@ -148,9 +148,7 @@ impl ExtendedConnector {
         {
             Ok(c) => c,
             Err(e) => {
-                log::warn!(
-                    "[EXTENDED_MAINTENANCE] failed to build refresher HTTP client: {e}"
-                );
+                log::warn!("[EXTENDED_MAINTENANCE] failed to build refresher HTTP client: {e}");
                 return;
             }
         };
@@ -169,9 +167,7 @@ impl ExtendedConnector {
                             // symbols may be either bare ("BTC") or qualified.
                             // Try both.
                             let qualified = format!("{sym}-USD");
-                            let status = statuses
-                                .get(sym)
-                                .or_else(|| statuses.get(&qualified));
+                            let status = statuses.get(sym).or_else(|| statuses.get(&qualified));
                             if let Some(s) = status {
                                 if s != "ACTIVE" {
                                     inactive_hits.push((sym.clone(), s.clone()));
@@ -186,9 +182,7 @@ impl ExtendedConnector {
                                 inactive_hits
                             );
                         } else if !any_inactive && prev {
-                            log::info!(
-                                "[EXTENDED_MAINTENANCE] all tracked symbols back to ACTIVE"
-                            );
+                            log::info!("[EXTENDED_MAINTENANCE] all tracked symbols back to ACTIVE");
                         }
                     }
                     Err(e) => {
@@ -210,9 +204,9 @@ async fn fetch_extended_market_statuses(
         .get(&url)
         .send()
         .await
-        .map_err(|e| DexError::Other(format!("extended market status fetch: {e}")))?;
+        .map_err(|e| DexError::Transient(format!("extended market status fetch: {e}")))?;
     if !resp.status().is_success() {
-        return Err(DexError::Other(format!(
+        return Err(DexError::Transient(format!(
             "extended market status HTTP {}",
             resp.status()
         )));
@@ -220,11 +214,11 @@ async fn fetch_extended_market_statuses(
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| DexError::Other(format!("extended market status parse: {e}")))?;
+        .map_err(|e| DexError::Transient(format!("extended market status parse: {e}")))?;
     let arr = body
         .get("data")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| DexError::Other("extended market status: no data array".into()))?;
+        .ok_or_else(|| DexError::Transient("extended market status: no data array".into()))?;
     let mut out = HashMap::with_capacity(arr.len());
     for item in arr {
         if let (Some(name), Some(status)) = (

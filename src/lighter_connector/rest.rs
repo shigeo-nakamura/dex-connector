@@ -87,7 +87,7 @@ impl LighterConnector {
             .header("X-API-KEY", &self.api_key_public)
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("{}: {}", err_label, e)))?;
+            .map_err(|e| DexError::Transient(format!("{}: {}", err_label, e)))?;
 
         let status = response.status();
         let headers = response.headers().clone();
@@ -102,7 +102,7 @@ impl LighterConnector {
         let response_text = response
             .text()
             .await
-            .map_err(|e| DexError::Other(format!("{} read body: {}", err_label, e)))?;
+            .map_err(|e| DexError::Transient(format!("{} read body: {}", err_label, e)))?;
 
         if !status.is_success() {
             if let Some(src) =
@@ -113,7 +113,7 @@ impl LighterConnector {
                     until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
                 });
             }
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "{} HTTP {}: {}",
                 err_label, status, response_text
             )));
@@ -197,7 +197,7 @@ impl LighterConnector {
         let response = request
             .send()
             .await
-            .map_err(|e| DexError::Other(format!("Request failed: {}", e)))?;
+            .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
 
         let status = response.status();
         let headers = response.headers().clone();
@@ -225,12 +225,12 @@ impl LighterConnector {
                     until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
                 });
             }
-            return Err(DexError::Other(format!("HTTP {}: {}", status, error_text)));
+            return Err(DexError::Transient(format!("HTTP {}: {}", status, error_text)));
         }
 
         response
             .json()
             .await
-            .map_err(|e| DexError::Other(format!("Failed to parse response: {}", e)))
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))
     }
 }

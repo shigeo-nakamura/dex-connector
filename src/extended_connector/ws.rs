@@ -12,9 +12,7 @@ use super::{
     OpenOrderModel, OrderBookCacheEntry, PositionModel,
 };
 use crate::dex_request::DexError;
-use crate::{
-    BalanceResponse, FilledOrder, LastTrade, OpenOrder, OrderSide, PositionSnapshot,
-};
+use crate::{BalanceResponse, FilledOrder, LastTrade, OpenOrder, OrderSide, PositionSnapshot};
 use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -219,7 +217,7 @@ pub(super) async fn connect_ws(
 > {
     let mut request = url
         .into_client_request()
-        .map_err(|e| DexError::Other(format!("Invalid websocket url: {e}")))?;
+        .map_err(|e| DexError::Permanent(format!("Invalid websocket url: {e}")))?;
     {
         let headers = request.headers_mut();
         headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0"));
@@ -227,13 +225,13 @@ pub(super) async fn connect_ws(
             headers.insert(
                 "X-Api-Key",
                 HeaderValue::from_str(key)
-                    .map_err(|e| DexError::Other(format!("Invalid API key header: {e}")))?,
+                    .map_err(|e| DexError::Permanent(format!("Invalid API key header: {e}")))?,
             );
         }
     }
     let (stream, _) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| DexError::Other(format!("Websocket connect failed: {e}")))?;
+        .map_err(|e| DexError::Transient(format!("Websocket connect failed: {e}")))?;
     Ok(stream)
 }
 
@@ -285,7 +283,7 @@ pub(super) async fn stream_orderbooks(
             // `ORDERBOOK_STALE_AFTER` gate. Wiping eagerly just forces
             // callers to see "unavailable" during the reconnect window
             // even though the spawn loop is back up within ~2 s.
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "ws connect error: {err} (stream=orderbook symbol={symbol} url={url} conn={conn_id})"
             )));
         }
@@ -304,7 +302,7 @@ pub(super) async fn stream_orderbooks(
                     WS_STALL_TIMEOUT.as_secs(),
                     ws_state.context("orderbook", Some(symbol), url)
                 );
-                break Err(DexError::Other(format!(
+                break Err(DexError::Transient(format!(
                     "ws stalled: no frame in {}s ({})",
                     WS_STALL_TIMEOUT.as_secs(),
                     ws_state.context("orderbook", Some(symbol), url)
@@ -318,7 +316,7 @@ pub(super) async fn stream_orderbooks(
             }
             Some(Err(err)) => {
                 log_ws_error_detail("orderbook", Some(symbol), ws_state.conn_id, &err);
-                break Err(DexError::Other(format!(
+                break Err(DexError::Transient(format!(
                     "ws error: {err} ({})",
                     ws_state.context("orderbook", Some(symbol), url)
                 )));
@@ -333,7 +331,7 @@ pub(super) async fn stream_orderbooks(
                     .await
                 {
                     log_ws_error_detail("orderbook", Some(symbol), ws_state.conn_id, &err);
-                    break Err(DexError::Other(format!(
+                    break Err(DexError::Transient(format!(
                         "ws error: {err} ({})",
                         ws_state.context("orderbook", Some(symbol), url)
                     )));
@@ -361,7 +359,7 @@ pub(super) async fn stream_orderbooks(
         let payload: WrappedStreamResponse<StreamOrderbookUpdate> =
             match serde_json::from_str(message.to_text().unwrap_or("")) {
                 Ok(payload) => payload,
-                Err(err) => break Err(DexError::Other(format!("orderbook parse error: {err}"))),
+                Err(err) => break Err(DexError::Transient(format!("orderbook parse error: {err}"))),
             };
         let Some(update) = payload.data else {
             continue;
@@ -402,7 +400,7 @@ pub(super) async fn fallback_price(
     } else if market.market_stats.last_price > Decimal::ZERO {
         Ok(market.market_stats.last_price)
     } else {
-        Err(DexError::Other(
+        Err(DexError::Transient(
             "ticker unavailable: no orderbook, trade cache, or market stats".to_string(),
         ))
     }
@@ -417,7 +415,7 @@ pub(super) async fn stream_trades(
     let mut ws = match connect_ws(url, None).await {
         Ok(ws) => ws,
         Err(err) => {
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "ws connect error: {err} (stream=trades symbol={symbol} url={url} conn={conn_id})"
             )));
         }
@@ -437,7 +435,7 @@ pub(super) async fn stream_trades(
                     WS_STALL_TIMEOUT.as_secs(),
                     ws_state.context("trades", Some(symbol), url)
                 );
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "ws stalled: no frame in {}s ({})",
                     WS_STALL_TIMEOUT.as_secs(),
                     ws_state.context("trades", Some(symbol), url)
@@ -451,7 +449,7 @@ pub(super) async fn stream_trades(
             }
             Err(err) => {
                 log_ws_error_detail("trades", Some(symbol), ws_state.conn_id, &err);
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "ws error: {err} ({})",
                     ws_state.context("trades", Some(symbol), url)
                 )));
@@ -465,7 +463,7 @@ pub(super) async fn stream_trades(
                     .await
                 {
                     log_ws_error_detail("trades", Some(symbol), ws_state.conn_id, &err);
-                    return Err(DexError::Other(format!(
+                    return Err(DexError::Transient(format!(
                         "ws error: {err} ({})",
                         ws_state.context("trades", Some(symbol), url)
                     )));
@@ -492,7 +490,7 @@ pub(super) async fn stream_trades(
         }
         let payload: WrappedStreamResponse<Vec<StreamTradeModel>> =
             serde_json::from_str(message.to_text().unwrap_or(""))
-                .map_err(|e| DexError::Other(format!("trade parse error: {e}")))?;
+                .map_err(|e| DexError::Transient(format!("trade parse error: {e}")))?;
         if let Some(trades) = payload.data {
             let mut mapped = Vec::new();
             for trade in trades {
@@ -539,7 +537,7 @@ pub(super) async fn stream_account(
             if err.to_string().contains("401 Unauthorized") {
                 return Err(DexError::ApiKeyRegistrationRequired);
             }
-            return Err(DexError::Other(format!(
+            return Err(DexError::Transient(format!(
                 "ws connect error: {err} (stream=account url={url} conn={conn_id})"
             )));
         }
@@ -560,7 +558,7 @@ pub(super) async fn stream_account(
                     WS_STALL_TIMEOUT.as_secs(),
                     ws_state.context("account", None, url)
                 );
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "ws stalled: no frame in {}s ({})",
                     WS_STALL_TIMEOUT.as_secs(),
                     ws_state.context("account", None, url)
@@ -574,7 +572,7 @@ pub(super) async fn stream_account(
             }
             Err(err) => {
                 log_ws_error_detail("account", None, ws_state.conn_id, &err);
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "ws error: {err} ({})",
                     ws_state.context("account", None, url)
                 )));
@@ -588,7 +586,7 @@ pub(super) async fn stream_account(
                     .await
                 {
                     log_ws_error_detail("account", None, ws_state.conn_id, &err);
-                    return Err(DexError::Other(format!(
+                    return Err(DexError::Transient(format!(
                         "ws error: {err} ({})",
                         ws_state.context("account", None, url)
                     )));
@@ -615,7 +613,7 @@ pub(super) async fn stream_account(
         }
         let payload: WrappedStreamResponse<AccountStreamData> =
             serde_json::from_str(message.to_text().unwrap_or(""))
-                .map_err(|e| DexError::Other(format!("account parse error: {e}")))?;
+                .map_err(|e| DexError::Transient(format!("account parse error: {e}")))?;
         if let Some(data) = payload.data {
             if !logged_once {
                 let orders_len = data.orders.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -649,9 +647,7 @@ pub(super) async fn stream_account(
                 let mut cache = open_orders_cache.write().await;
                 cache.clear();
                 for order in orders {
-                    let entry = cache
-                        .entry(normalize_symbol(&order.market))
-                        .or_default();
+                    let entry = cache.entry(normalize_symbol(&order.market)).or_default();
                     entry.push(OpenOrder {
                         order_id: order.external_id.clone(),
                         symbol: order.market.clone(),
@@ -681,9 +677,7 @@ pub(super) async fn stream_account(
                 }
                 let mut cache = filled_orders.write().await;
                 for (trade, order_id) in mapped_trades {
-                    let entry = cache
-                        .entry(normalize_symbol(&trade.market))
-                        .or_default();
+                    let entry = cache.entry(normalize_symbol(&trade.market)).or_default();
                     entry.push(FilledOrder {
                         order_id,
                         is_rejected: false,

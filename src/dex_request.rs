@@ -4,12 +4,8 @@ use reqwest::{
     Client, Method,
 };
 use serde::Serialize;
-use std::{
-    collections::HashMap,
-    error::Error as StdError,
-    fmt::{self, Display},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
+use thiserror::Error;
 
 #[derive(Clone, Copy)]
 pub enum HttpMethod {
@@ -38,69 +34,70 @@ pub struct DexRequest {
     endpoint: String,
 }
 
-#[derive(Debug)]
+/// Errors emitted by `DexConnector` implementations.
+///
+/// Variants are split so callers can choose retry policy without
+/// regex-matching error strings (bot-strategy#389). The categories are:
+///
+/// - [`Transient`](Self::Transient) — retry with backoff.
+/// - [`Permanent`](Self::Permanent) — surface; retry will not help.
+/// - [`InvalidInput`](Self::InvalidInput) — caller-side validation failure.
+/// - [`RateLimited`](Self::RateLimited) — do NOT retry until `until_unix`.
+/// - Wrapped underlying errors ([`Serde`](Self::Serde),
+///   [`Reqwest`](Self::Reqwest)) carry the original error for diagnostics.
+#[derive(Debug, Error)]
 pub enum DexError {
-    Serde(serde_json::Error),
-    Reqwest(reqwest::Error),
+    #[error("Serde JSON error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("Reqwest error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+
+    /// Venue returned an application-level rejection (typically a 4xx with a
+    /// parsed business message such as Extended's 1136/1137 reduce-only codes).
+    #[error("Server response error: {0}")]
     ServerResponse(String),
+
+    #[error("WebSocket error: {0}")]
     WebSocketError(String),
-    Other(String),
+
+    #[error("No running WebSocketConnection")]
     NoConnection,
+
+    #[error("Network upgrade scheduled in < 2h")]
     UpcomingMaintenance,
+
+    #[error("API key registration is required")]
     ApiKeyRegistrationRequired,
+
     /// Lighter WAF / per-IP rate-limit cooldown is currently active.
     /// `until_unix` is the unix-epoch second at which the cooldown expires.
     /// Callers must NOT retry while this error is being returned — every
     /// additional Lighter REST call refreshes the WAF rolling window and
     /// extends the block. See bot-strategy#35.
+    #[error("Lighter WAF cooldown active until unix={until_unix} (rate-limited)")]
     RateLimited { until_unix: i64 },
+
+    /// Transient I/O / parse / dependency failure. Caller may retry with
+    /// backoff.
+    #[error("Transient error: {0}")]
+    Transient(String),
+
+    /// Permanent failure — caller should surface or give up. Examples:
+    /// signing-key parse failures, "market not found", unimplemented
+    /// connector methods.
+    #[error("Permanent error: {0}")]
+    Permanent(String),
+
+    /// Caller-side input validation failure. `field` is the parameter
+    /// name; `value` is the rejected stringified value.
+    #[error("Invalid input: {field}={value}")]
+    InvalidInput { field: String, value: String },
 }
 
 impl From<ParseDecimalError> for DexError {
     fn from(e: ParseDecimalError) -> Self {
-        DexError::Other(format!("{:?}", e))
-    }
-}
-
-impl Display for DexError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            DexError::Serde(ref e) => write!(f, "Serde JSON error: {}", e),
-            DexError::Reqwest(ref e) => write!(f, "Reqwest error: {}", e),
-            DexError::ServerResponse(ref e) => write!(f, "Server response error: {}", e),
-            DexError::Other(ref e) => write!(f, "Other error: {}", e),
-            DexError::NoConnection => write!(f, "No running WebSocketConnection"),
-            DexError::WebSocketError(ref e) => write!(f, "WebSocket error: {}", e),
-            DexError::UpcomingMaintenance => write!(f, "Network upgrade scheduled in < 2h"),
-            DexError::ApiKeyRegistrationRequired => write!(f, "API key registration is required"),
-            DexError::RateLimited { until_unix } => write!(
-                f,
-                "Lighter WAF cooldown active until unix={} (rate-limited)",
-                until_unix
-            ),
-        }
-    }
-}
-
-impl StdError for DexError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match *self {
-            DexError::Serde(ref e) => Some(e),
-            DexError::Reqwest(ref e) => Some(e),
-            DexError::ServerResponse(_) => None,
-            DexError::Other(_) => None,
-            DexError::NoConnection => None,
-            DexError::WebSocketError(_) => None,
-            DexError::UpcomingMaintenance => None,
-            DexError::ApiKeyRegistrationRequired => None,
-            DexError::RateLimited { .. } => None,
-        }
-    }
-}
-
-impl From<reqwest::Error> for DexError {
-    fn from(error: reqwest::Error) -> Self {
-        DexError::Reqwest(error)
+        DexError::Transient(format!("{:?}", e))
     }
 }
 

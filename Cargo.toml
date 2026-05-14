@@ -53,6 +53,7 @@ libc = { version = "0.2", optional = true }
 rand = "0.8"
 parking_lot = "0.12"
 env_logger = "0.10"
+thiserror = "1.0"
 
 # Split-out sub-crate (bot-strategy#118). Used only from `lighter_connector`
 # so it can be optional and carried by the lighter-sdk feature — this drops

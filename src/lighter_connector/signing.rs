@@ -18,9 +18,7 @@
 //! parent module is itself `#![cfg(feature = "lighter-sdk")]` and they
 //! never compile in practice.
 
-use super::ffi::{
-    parse_signed_tx_response, CheckClient, SignCancelOrder, SignCreateOrder,
-};
+use super::ffi::{parse_signed_tx_response, CheckClient, SignCancelOrder, SignCreateOrder};
 use super::LighterConnector;
 use crate::dex_request::DexError;
 use libc::{c_int, c_longlong};
@@ -86,7 +84,7 @@ impl LighterConnector {
         _order_expiry: i64,
         _nonce: i64,
     ) -> Result<String, DexError> {
-        Err(DexError::Other(
+        Err(DexError::Permanent(
             "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
                 .to_string(),
         ))
@@ -123,7 +121,7 @@ impl LighterConnector {
         _order_index: i64,
         _nonce: i64,
     ) -> Result<String, DexError> {
-        Err(DexError::Other(
+        Err(DexError::Permanent(
             "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
                 .to_string(),
         ))
@@ -290,7 +288,7 @@ impl LighterConnector {
             );
 
             if result.is_null() {
-                return Err(DexError::Other(
+                return Err(DexError::Permanent(
                     "CheckClient succeeded; no pubkey mismatch detected".to_string(),
                 ));
             }
@@ -300,7 +298,7 @@ impl LighterConnector {
             libc::free(result as *mut libc::c_void);
 
             Self::extract_own_pubkey_from_error(&error_msg).ok_or_else(|| {
-                DexError::Other(format!(
+                DexError::Permanent(format!(
                     "Failed to extract public key from CheckClient error: {}",
                     error_msg
                 ))
