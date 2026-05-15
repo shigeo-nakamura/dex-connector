@@ -1257,8 +1257,17 @@ impl LighterConnector {
     /// store it in the shared cache. Lighter's payload carries both
     /// `funding_rate` (realized at the most recent funding_timestamp) and
     /// `current_funding_rate` (running estimate for the next payment); we keep
-    /// the realized value to match what `/funding-rates` REST exposed and what
-    /// the strategy is calibrated against. See bot-strategy#162.
+    /// the realized value. See bot-strategy#162.
+    ///
+    /// **Unit normalization (bot-strategy#414).** The wire value is delivered
+    /// in **percent per hour** (e.g. `"0.0007"` ≈ 7e-3 percent/h ≈ 7e-6
+    /// fraction/h, matching what the funding-history CSV export and
+    /// `/api/v1/fundings?resolution=1h` settle at the boundary). The cache —
+    /// and everything downstream (`TickerResponse.funding_rate`, pairtrade's
+    /// `funding_history` / `compute_carry_usd`) — expects **fraction per
+    /// hour**, the same scale `/api/v1/funding-rates` already uses. We
+    /// normalize at parse time by dividing by 100 so the rest of the bot can
+    /// stay venue-agnostic (Extended already pushes fraction-scale rates).
     pub(super) async fn handle_market_stats_update(
         message: &Value,
         funding_rate_cache: &Arc<RwLock<HashMap<u32, Decimal>>>,
@@ -1293,9 +1302,17 @@ impl LighterConnector {
             return;
         };
         match string_to_decimal(Some(rate_str.to_string())) {
-            Ok(rate) => {
+            Ok(rate_pct_per_hour) => {
+                // Wire value is percent-per-hour; cache fraction-per-hour
+                // (bot-strategy#414).
+                let rate = rate_pct_per_hour / Decimal::from(100);
                 funding_rate_cache.write().await.insert(market_id, rate);
-                log::trace!("[WS_FUNDING] market_id={} funding_rate={}", market_id, rate);
+                log::trace!(
+                    "[WS_FUNDING] market_id={} funding_rate={} (wire pct/h={})",
+                    market_id,
+                    rate,
+                    rate_pct_per_hour
+                );
             }
             Err(e) => {
                 log::warn!(

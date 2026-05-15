@@ -3417,6 +3417,9 @@ mod tests {
     // must populate the per-market cache keyed by the market_id parsed out of
     // the channel string. Both delimiter shapes the server uses (`/` on
     // subscribe, `:` on push) must resolve to the same market_id.
+    //
+    // bot-strategy#414: the wire value is percent-per-hour and the cache
+    // stores fraction-per-hour, so every assertion below uses `wire / 100`.
     #[tokio::test]
     async fn market_stats_push_populates_funding_rate_cache() {
         use serde_json::json;
@@ -3438,8 +3441,8 @@ mod tests {
         LighterConnector::handle_market_stats_update(&push_with_colon, &cache).await;
         assert_eq!(
             cache.read().await.get(&1).copied(),
-            Some(Decimal::from_str("-0.0017").unwrap()),
-            "push with ':' delimiter must store the realized funding_rate"
+            Some(Decimal::from_str("-0.000017").unwrap()),
+            "push with ':' delimiter must store fraction-per-hour (wire pct/h / 100)"
         );
 
         let sub_with_slash = json!({
@@ -3454,8 +3457,8 @@ mod tests {
         LighterConnector::handle_market_stats_update(&sub_with_slash, &cache).await;
         assert_eq!(
             cache.read().await.get(&2).copied(),
-            Some(Decimal::from_str("0.00001").unwrap()),
-            "subscribed push with '/' delimiter must also resolve and cache"
+            Some(Decimal::from_str("0.0000001").unwrap()),
+            "subscribed push with '/' delimiter must also resolve and cache (fraction/h)"
         );
 
         // A later push for market_id=1 must overwrite (most recent wins).
@@ -3471,8 +3474,36 @@ mod tests {
         LighterConnector::handle_market_stats_update(&overwrite, &cache).await;
         assert_eq!(
             cache.read().await.get(&1).copied(),
-            Some(Decimal::from_str("0.00005").unwrap()),
-            "later push must replace the stored value"
+            Some(Decimal::from_str("0.0000005").unwrap()),
+            "later push must replace the stored value (fraction/h)"
+        );
+    }
+
+    // bot-strategy#414: regression for the wire-to-cache scale conversion.
+    // Anchor on the actual 2026-05-15 BTC observation — wire pushed
+    // "0.0007" (percent/h), CSV settled 7e-6 fraction/h — so any future
+    // refactor that drops the /100 will fail this test before reaching prod.
+    #[tokio::test]
+    async fn market_stats_funding_rate_is_normalized_to_fraction_per_hour() {
+        use serde_json::json;
+        use std::str::FromStr;
+
+        let cache: Arc<RwLock<HashMap<u32, Decimal>>> = Arc::new(RwLock::new(HashMap::new()));
+        let push = json!({
+            "channel": "market_stats:1",
+            "type": "update/market_stats",
+            "market_stats": {
+                "symbol": "BTC",
+                "market_id": 1,
+                "funding_rate": "0.0007"
+            }
+        });
+        LighterConnector::handle_market_stats_update(&push, &cache).await;
+        let cached = cache.read().await.get(&1).copied().expect("cache populated");
+        assert_eq!(
+            cached,
+            Decimal::from_str("0.000007").unwrap(),
+            "0.0007 pct/h must normalize to 7e-6 fraction/h to match CSV-settled rate"
         );
     }
 
