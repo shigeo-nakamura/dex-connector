@@ -230,9 +230,9 @@ impl ExtendedApi {
                 return Err(DexError::ServerResponse(message));
             }
 
-            return response
-                .data
-                .ok_or_else(|| DexError::Transient("Extended API returned empty data".to_string()));
+            return response.data.ok_or_else(|| {
+                DexError::Transient("Extended API returned empty data".to_string())
+            });
         }
         unreachable!("extended send retry loop exited without Ok/Err")
     }

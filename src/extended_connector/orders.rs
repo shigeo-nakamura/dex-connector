@@ -17,6 +17,7 @@ use crate::{CreateOrderResponse, FilledOrder, OrderBookLevel, OrderBookSnapshot,
 use super::models::{
     AccountTradeModel, MarketModel, OpenOrderModel, OrderbookUpdateModel, PlacedOrderModel,
 };
+use super::parsing::normalize_symbol;
 use super::pricing;
 use super::rest::build_query;
 use super::signing::NewOrderModel;
@@ -466,6 +467,29 @@ impl ExtendedConnector {
             .api
             .post("/user/order".to_string(), order, true)
             .await?;
+
+        // bot-strategy#432: invalidate the `filled_orders` WS cache for
+        // this symbol so the immediately-following `get_filled_orders`
+        // poll falls back to REST instead of returning stale WS-cached
+        // data. Background: Extended's WS feed has been observed taking
+        // ≥3 s to propagate IOC fill events into `filled_orders`. The
+        // existing cache-miss → REST fallback in `get_filled_orders`
+        // only fires when the symbol-key is absent entirely; once any
+        // earlier fill has populated the entry, subsequent polls hit
+        // the (now-stale) cache and report the just-submitted IOC as
+        // filled=0. By dropping the symbol entry post-submit we force
+        // the next read to REST exactly once, after which the WS feed
+        // and the cache resume normally. Only fires when WS is wired
+        // (matches existing cache-population gating).
+        if self.websocket_url.is_some() {
+            let mut cache = self.filled_orders.write().await;
+            cache.remove(&normalize_symbol(symbol));
+            log::debug!(
+                "[filled_orders][extended] invalidated cache for {} post-IOC submit \
+                 (bot-strategy#432: force REST on next poll)",
+                symbol
+            );
+        }
 
         Ok(CreateOrderResponse {
             order_id: response.external_id,

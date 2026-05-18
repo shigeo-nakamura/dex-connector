@@ -239,9 +239,7 @@ mod tests {
     use crate::OrderSide;
     use std::str::FromStr;
 
-    use super::super::models::{
-        L2ConfigModel, MarketModel, MarketStatsModel, TradingConfigModel,
-    };
+    use super::super::models::{L2ConfigModel, MarketModel, MarketStatsModel, TradingConfigModel};
 
     fn dec(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()

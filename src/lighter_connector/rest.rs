@@ -225,7 +225,10 @@ impl LighterConnector {
                     until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
                 });
             }
-            return Err(DexError::Transient(format!("HTTP {}: {}", status, error_text)));
+            return Err(DexError::Transient(format!(
+                "HTTP {}: {}",
+                status, error_text
+            )));
         }
 
         response

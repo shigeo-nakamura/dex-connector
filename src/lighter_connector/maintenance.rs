@@ -250,11 +250,10 @@ pub(super) async fn fetch_next_maintenance_window_with(
 ) -> Result<Option<DateTime<Utc>>, DexError> {
     let url = LIGHTER_STATUS_FEED_URL;
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| DexError::Transient(format!("Failed to fetch Lighter status feed: {}", e)))?;
+    let response =
+        client.get(url).send().await.map_err(|e| {
+            DexError::Transient(format!("Failed to fetch Lighter status feed: {}", e))
+        })?;
 
     if !response.status().is_success() {
         return Err(DexError::Transient(format!(
@@ -263,10 +262,9 @@ pub(super) async fn fetch_next_maintenance_window_with(
         )));
     }
 
-    let body = response
-        .text()
-        .await
-        .map_err(|e| DexError::Transient(format!("Failed to read Lighter status feed body: {}", e)))?;
+    let body = response.text().await.map_err(|e| {
+        DexError::Transient(format!("Failed to read Lighter status feed body: {}", e))
+    })?;
 
     let items = parse_lighter_rss(&body);
     let now = Utc::now();

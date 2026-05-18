@@ -17,8 +17,8 @@
 //! `handle_*` helpers are called via `Self::*` inside this file.
 
 use super::market_cache::MarketCache;
-use super::parsing::{parse_canceled_order, parse_filled_order, value_to_decimal};
 use super::models::{LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition};
+use super::parsing::{parse_canceled_order, parse_filled_order, value_to_decimal};
 use super::{AccountState, LighterConnector};
 use crate::dex_connector::string_to_decimal;
 use crate::dex_request::DexError;
@@ -1350,7 +1350,11 @@ impl LighterConnector {
         let positions_vals: Option<Vec<Value>> =
             if let Some(arr) = data.get("positions").and_then(|p| p.as_array()) {
                 Some(arr.clone())
-            } else { data.get("positions").and_then(|p| p.as_object()).map(|map| map.values().cloned().collect()) };
+            } else {
+                data.get("positions")
+                    .and_then(|p| p.as_object())
+                    .map(|map| map.values().cloned().collect())
+            };
         // None when no positions field was carried in this message;
         // Some(sum) — possibly zero — when the message did carry positions.
         // The distinction matters: a missing positions field must NOT cause
@@ -1446,8 +1450,7 @@ impl LighterConnector {
             // Position updates (formerly the `cached_positions.write()` branch).
             if let Some(updates) = positions_updates {
                 if msg_type == "subscribed/account_all" {
-                    state.positions =
-                        updates.into_iter().filter_map(|(_, snap)| snap).collect();
+                    state.positions = updates.into_iter().filter_map(|(_, snap)| snap).collect();
                     log::info!(
                         "Updated cached positions: {} positions",
                         state.positions.len()
@@ -1485,8 +1488,8 @@ impl LighterConnector {
             // Balance derivation. The previous code read `cached_collateral`
             // after writing it; with the bundle we just read `state.collateral`
             // inline.
-            let derived_equity = sum_unrealized_pnl
-                .and_then(|pnl_sum| state.collateral.map(|c| (c, c + pnl_sum)));
+            let derived_equity =
+                sum_unrealized_pnl.and_then(|pnl_sum| state.collateral.map(|c| (c, c + pnl_sum)));
 
             if direct_total.is_some() || direct_available.is_some() {
                 let equity = direct_total.or(direct_available).unwrap_or(Decimal::ZERO);

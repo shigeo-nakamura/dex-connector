@@ -162,8 +162,8 @@ use market_cache::MarketInfo;
 use market_cache::{MarketCache, CACHED_EXCHANGE_STATS, MARKET_CACHE, MARKET_CACHE_INIT_LOCK};
 use models::{
     ApiKeyResponse, LighterAccountResponse, LighterExchangeStats, LighterFundingRates,
-    LighterOrderBookCacheEntry, LighterOrderBookDetailsResponse,
-    LighterOrderBooksResponse, LighterTradesResponse,
+    LighterOrderBookCacheEntry, LighterOrderBookDetailsResponse, LighterOrderBooksResponse,
+    LighterTradesResponse,
 };
 use parsing::{
     calculate_min_tick, map_side, parse_cancel_order_index, scale_decimal_to_u32,
@@ -783,7 +783,9 @@ impl LighterConnector {
             .await?;
 
         if response.api_keys.is_empty() {
-            return Err(DexError::Transient("No API keys found on server".to_string()));
+            return Err(DexError::Transient(
+                "No API keys found on server".to_string(),
+            ));
         }
 
         let server_pubkey = response.api_keys[0].public_key.clone();
@@ -796,7 +798,6 @@ impl LighterConnector {
 
         Ok(server_pubkey)
     }
-
 
     /// Discover account_index by querying the API with wallet_address and api_key_index.
     /// Fetches all accounts for the wallet's l1_address, then probes each account's
@@ -837,8 +838,9 @@ impl LighterConnector {
             )));
         }
 
-        let account_resp: LighterAccountResponse = serde_json::from_str(&body)
-            .map_err(|e| DexError::Transient(format!("Failed to parse accounts response: {}", e)))?;
+        let account_resp: LighterAccountResponse = serde_json::from_str(&body).map_err(|e| {
+            DexError::Transient(format!("Failed to parse accounts response: {}", e))
+        })?;
 
         if account_resp.accounts.is_empty() {
             return Err(DexError::Transient(format!(
@@ -3499,7 +3501,12 @@ mod tests {
             }
         });
         LighterConnector::handle_market_stats_update(&push, &cache).await;
-        let cached = cache.read().await.get(&1).copied().expect("cache populated");
+        let cached = cache
+            .read()
+            .await
+            .get(&1)
+            .copied()
+            .expect("cache populated");
         assert_eq!(
             cached,
             Decimal::from_str("0.000007").unwrap(),

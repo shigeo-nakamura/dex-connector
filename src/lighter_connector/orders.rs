@@ -28,8 +28,8 @@ use super::order_payload;
 use super::parsing::ten_pow;
 use super::rest::track_api_call;
 use super::{
-    normalize_symbol, LighterConnector, NonceCache, DEFAULT_PRICE_DECIMALS,
-    DEFAULT_SIZE_DECIMALS, MAX_DECIMAL_PRECISION,
+    normalize_symbol, LighterConnector, NonceCache, DEFAULT_PRICE_DECIMALS, DEFAULT_SIZE_DECIMALS,
+    MAX_DECIMAL_PRECISION,
 };
 use crate::dex_request::DexError;
 use crate::{CreateOrderResponse, OpenOrder, OrderSide};
@@ -301,7 +301,10 @@ impl LighterConnector {
 
         if !output.status.success() {
             log::error!("SDK delegation failed. stderr: {}", stderr);
-            return Err(DexError::Transient(format!("SDK execution failed: {}", stderr)));
+            return Err(DexError::Transient(format!(
+                "SDK execution failed: {}",
+                stderr
+            )));
         }
 
         if !stderr.is_empty() {

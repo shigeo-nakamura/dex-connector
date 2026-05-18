@@ -43,9 +43,7 @@ use models::{
     AccountTradeModel, BalanceModel, MarketModel, OpenOrderModel, OrderbookUpdateModel,
     PlacedOrderModel, PositionModel,
 };
-use parsing::{
-    copy_balance, default_taker_fee, normalize_symbol, position_snapshot_from_model,
-};
+use parsing::{copy_balance, default_taker_fee, normalize_symbol, position_snapshot_from_model};
 use rest::{build_query, ExtendedApi, ExtendedEnvironment};
 use signing::{NewOrderModel, TpslLegModel};
 #[cfg(test)]
@@ -423,7 +421,8 @@ impl ExtendedConnector {
             return Ok(market);
         }
 
-        Err(last_err.unwrap_or_else(|| DexError::Permanent(format!("Market not found: {}", symbol))))
+        Err(last_err
+            .unwrap_or_else(|| DexError::Permanent(format!("Market not found: {}", symbol))))
     }
 
     #[allow(dead_code)]
@@ -451,7 +450,6 @@ impl ExtendedConnector {
         cache.insert(symbol.to_string(), market.clone());
         Ok(market)
     }
-
 }
 
 #[cfg(test)]
@@ -894,7 +892,9 @@ impl DexConnector for ExtendedConnector {
         if self.websocket_url.is_some() {
             let cache = self.last_trades.read().await;
             let trades = cache.get(&key).cloned().ok_or_else(|| {
-                DexError::Transient("last trades unavailable: waiting for websocket data".to_string())
+                DexError::Transient(
+                    "last trades unavailable: waiting for websocket data".to_string(),
+                )
             })?;
             Ok(LastTradesResponse { trades })
         } else {
@@ -1373,7 +1373,8 @@ impl DexConnector for ExtendedConnector {
                     side,
                 );
             }
-            let rounded_price = pricing::round_price_for_market_aggressive(order_price, &market, side);
+            let rounded_price =
+                pricing::round_price_for_market_aggressive(order_price, &market, side);
             let rounded_size = pricing::round_size_for_market(position.size, &market)?;
 
             let settlement = self.compute_settlement(

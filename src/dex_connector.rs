@@ -21,19 +21,15 @@ pub fn string_to_decimal(string_value: Option<String>) -> Result<Decimal, DexErr
     match string_value {
         Some(value) => match parse_to_decimal(&value) {
             Ok(v) => Ok(v),
-            Err(_) => {
-                Err(DexError::InvalidInput {
-                    field: "string_to_decimal".to_string(),
-                    value,
-                })
-            }
-        },
-        None => {
-            Err(DexError::InvalidInput {
+            Err(_) => Err(DexError::InvalidInput {
                 field: "string_to_decimal".to_string(),
-                value: "None".to_string(),
-            })
-        }
+                value,
+            }),
+        },
+        None => Err(DexError::InvalidInput {
+            field: "string_to_decimal".to_string(),
+            value: "None".to_string(),
+        }),
     }
 }
 

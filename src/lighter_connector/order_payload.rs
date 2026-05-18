@@ -125,10 +125,8 @@ pub(super) fn build_order_payload_trigger(
     nonce: u64,
     now_ms: i64,
 ) -> OrderPayload {
-    let is_trigger_kind = order_type == ORDER_TYPE_TRIGGER
-        || order_type == 4
-        || order_type == 3
-        || order_type == 5;
+    let is_trigger_kind =
+        order_type == ORDER_TYPE_TRIGGER || order_type == 4 || order_type == 3 || order_type == 5;
     let expiry_duration_ms: u64 = if is_trigger_kind {
         expiry_secs
             .map(|s| std::cmp::max(60, s).saturating_mul(1_000))
@@ -236,7 +234,17 @@ mod tests {
     #[test]
     fn type_only_ioc_order_type_yields_nil_expiry() {
         let p = build_order_payload_type_only(
-            1, 1, 1, 1_000, 100, 42, ORDER_TYPE_IOC, false, Some(60), 7, NOW_MS,
+            1,
+            1,
+            1,
+            1_000,
+            100,
+            42,
+            ORDER_TYPE_IOC,
+            false,
+            Some(60),
+            7,
+            NOW_MS,
         );
         assert_eq!(p.order_expiry_ms, 0);
         assert_eq!(p.trigger_price, 0);
@@ -246,32 +254,37 @@ mod tests {
     #[test]
     fn type_only_immediate_tif_yields_nil_expiry_regardless_of_order_type() {
         let p = build_order_payload_type_only(
-            1, 1, TIF_IOC, 1_000, 100, 42, 0, false, Some(60), 7, NOW_MS,
+            1,
+            1,
+            TIF_IOC,
+            1_000,
+            100,
+            42,
+            0,
+            false,
+            Some(60),
+            7,
+            NOW_MS,
         );
         assert_eq!(p.order_expiry_ms, 0);
     }
 
     #[test]
     fn type_only_gtc_uses_supplied_expiry_seconds() {
-        let p = build_order_payload_type_only(
-            1, 1, 1, 1_000, 100, 42, 0, false, Some(45), 7, NOW_MS,
-        );
+        let p =
+            build_order_payload_type_only(1, 1, 1, 1_000, 100, 42, 0, false, Some(45), 7, NOW_MS);
         assert_eq!(p.order_expiry_ms, NOW_MS + 45_000);
     }
 
     #[test]
     fn type_only_gtc_defaults_to_24h_when_no_expiry_supplied() {
-        let p = build_order_payload_type_only(
-            1, 1, 1, 1_000, 100, 42, 0, false, None, 7, NOW_MS,
-        );
+        let p = build_order_payload_type_only(1, 1, 1, 1_000, 100, 42, 0, false, None, 7, NOW_MS);
         assert_eq!(p.order_expiry_ms, NOW_MS + 24 * 60 * 60 * 1_000);
     }
 
     #[test]
     fn type_only_carries_reduce_only_flag() {
-        let p = build_order_payload_type_only(
-            1, 1, 1, 1_000, 100, 42, 0, true, None, 7, NOW_MS,
-        );
+        let p = build_order_payload_type_only(1, 1, 1, 1_000, 100, 42, 0, true, None, 7, NOW_MS);
         assert!(p.reduce_only);
     }
 

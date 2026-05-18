@@ -359,7 +359,9 @@ pub(super) async fn stream_orderbooks(
         let payload: WrappedStreamResponse<StreamOrderbookUpdate> =
             match serde_json::from_str(message.to_text().unwrap_or("")) {
                 Ok(payload) => payload,
-                Err(err) => break Err(DexError::Transient(format!("orderbook parse error: {err}"))),
+                Err(err) => {
+                    break Err(DexError::Transient(format!("orderbook parse error: {err}")))
+                }
             };
         let Some(update) = payload.data else {
             continue;
