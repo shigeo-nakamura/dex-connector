@@ -717,8 +717,17 @@ impl DexConnector for ExtendedConnector {
         }
 
         let orders = self.fetch_filled_orders_via_http(symbol).await?;
-        let mut cache = self.filled_orders.write().await;
-        cache.insert(key, orders.clone());
+        // bot-strategy#459: do NOT write REST results back to the cache
+        // when WS is configured. `stream_account` owns the cache; a
+        // post-REST insert here can clobber a fill that WS pushed
+        // between the #432 cache-invalidate and this REST round-trip,
+        // re-introducing the false `filled=0` poll that #432 set out to
+        // fix. Non-WS environments (tests / dev) still cache REST
+        // results to avoid pathological re-fetching.
+        if self.websocket_url.is_none() {
+            let mut cache = self.filled_orders.write().await;
+            cache.insert(key, orders.clone());
+        }
         Ok(FilledOrdersResponse { orders })
     }
 

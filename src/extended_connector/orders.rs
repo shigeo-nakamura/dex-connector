@@ -23,6 +23,90 @@ use super::rest::build_query;
 use super::signing::NewOrderModel;
 use super::ExtendedConnector;
 
+/// Pure synthesis: build the `FilledOrder` list returned by `get_filled_orders`
+/// from the two REST sources (`/user/trades` + `/user/orders/history`) and the
+/// connector's `order_id_map` (Extended internal id → external_id).
+///
+/// `/user/trades` is the canonical fill source (per-trade rows with fee and
+/// trade_id). `/user/orders/history` covers the bot-strategy#459 rescue case:
+/// for ≤ ~3 s after IOC termination the venue may have set `status=FILLED`
+/// on the order but not yet indexed the trades. We synthesize a `FilledOrder`
+/// for any FILLED history row whose order-level `filled_qty` is not already
+/// fully accounted for in trades, using `filled_qty - sum(trades for order)`
+/// to avoid double-counting partials that straddle the indexing boundary.
+pub(super) fn synthesize_filled_orders(
+    trades: &[AccountTradeModel],
+    history: &[OpenOrderModel],
+    order_id_map: &std::collections::HashMap<i64, String>,
+) -> Vec<FilledOrder> {
+    let mut orders: Vec<FilledOrder> = trades
+        .iter()
+        .map(|trade| {
+            let order_id = order_id_map
+                .get(&trade.order_id)
+                .cloned()
+                .unwrap_or_else(|| trade.order_id.to_string());
+            FilledOrder {
+                order_id,
+                is_rejected: false,
+                trade_id: trade.id.to_string(),
+                filled_side: match trade.side.as_str() {
+                    "BUY" => Some(OrderSide::Long),
+                    "SELL" => Some(OrderSide::Short),
+                    _ => None,
+                },
+                filled_size: Some(trade.qty),
+                filled_value: Some(trade.value),
+                filled_fee: Some(trade.fee),
+                filled_ts_ms: Some(trade.created_time),
+            }
+        })
+        .collect();
+
+    for order in history {
+        if order.status != "FILLED" {
+            continue;
+        }
+        let order_filled_qty = match order.filled_qty {
+            Some(q) if q > Decimal::ZERO => q,
+            _ => continue,
+        };
+        let trade_qty_for_order: Decimal = orders
+            .iter()
+            .filter(|o| o.order_id == order.external_id)
+            .filter_map(|o| o.filled_size)
+            .sum();
+        let missing_qty = order_filled_qty - trade_qty_for_order;
+        if missing_qty <= Decimal::ZERO {
+            continue;
+        }
+        // Per-trade fees aren't in the order-history payload; leave
+        // `filled_fee` as None so #435's fee-aware PnL falls back to
+        // mid-based until /user/trades catches up. `filled_value` uses
+        // the order-level VWAP when present.
+        let filled_value = order
+            .average_price
+            .filter(|p| *p > Decimal::ZERO)
+            .map(|p| missing_qty * p);
+        orders.push(FilledOrder {
+            order_id: order.external_id.clone(),
+            is_rejected: false,
+            trade_id: String::new(),
+            filled_side: match order.side.as_str() {
+                "BUY" => Some(OrderSide::Long),
+                "SELL" => Some(OrderSide::Short),
+                _ => None,
+            },
+            filled_size: Some(missing_qty),
+            filled_value,
+            filled_fee: None,
+            filled_ts_ms: Some(order.updated_time),
+        });
+    }
+
+    orders
+}
+
 impl ExtendedConnector {
     pub(super) async fn get_order_book_rest(
         &self,
@@ -114,57 +198,38 @@ impl ExtendedConnector {
         // collateral-qualified market name ("BTC-USD"). Callers across
         // pairtrade use bare tokens.
         let market_name = self.get_market(symbol).await?.name;
-        let path = build_query(
+        let trades_path = build_query(
             "/user/trades",
             vec![("market".to_string(), market_name.clone())],
         );
-        let trades: Vec<AccountTradeModel> = self.api.get(path, true).await?;
-        let mut needs_history = false;
+        // bot-strategy#459: query /user/orders/history in parallel with
+        // /user/trades. /user/trades has an Extended-side indexing lag
+        // of 1-3 s for fresh IOC fills; /user/orders/history surfaces
+        // the order-level `status=FILLED` + `filled_qty` immediately
+        // on IOC termination. The history endpoint is also our existing
+        // source for refreshing order_id_map, so this consolidates the
+        // two prior conditional reads into one always-parallel pair.
+        let history_path = build_query(
+            "/user/orders/history",
+            vec![("market".to_string(), market_name.clone())],
+        );
+        let (trades_res, history_res): (
+            Result<Vec<AccountTradeModel>, DexError>,
+            Result<Vec<OpenOrderModel>, DexError>,
+        ) = tokio::join!(
+            self.api.get(trades_path, true),
+            self.api.get(history_path, true),
+        );
+        let trades = trades_res?;
+        let history = history_res?;
         {
-            let map = self.order_id_map.read().await;
-            for trade in &trades {
-                if !map.contains_key(&trade.order_id) {
-                    needs_history = true;
-                    break;
-                }
-            }
-        }
-        if needs_history {
-            let history_path = build_query(
-                "/user/orders/history",
-                vec![("market".to_string(), market_name.clone())],
-            );
-            let orders_history: Vec<OpenOrderModel> = self.api.get(history_path, true).await?;
             let mut map = self.order_id_map.write().await;
-            for order in orders_history {
+            for order in &history {
                 map.insert(order.id, order.external_id.clone());
             }
         }
         let map = self.order_id_map.read().await;
-        let orders = trades
-            .into_iter()
-            .map(|trade| {
-                let order_id = map
-                    .get(&trade.order_id)
-                    .cloned()
-                    .unwrap_or_else(|| trade.order_id.to_string());
-                FilledOrder {
-                    order_id,
-                    is_rejected: false,
-                    trade_id: trade.id.to_string(),
-                    filled_side: match trade.side.as_str() {
-                        "BUY" => Some(OrderSide::Long),
-                        "SELL" => Some(OrderSide::Short),
-                        _ => None,
-                    },
-                    filled_size: Some(trade.qty),
-                    filled_value: Some(trade.value),
-                    filled_fee: Some(trade.fee),
-                    filled_ts_ms: Some(trade.created_time),
-                }
-            })
-            .collect::<Vec<_>>();
-        Ok(orders)
+        Ok(synthesize_filled_orders(&trades, &history, &map))
     }
 
     // Internal recursive helper: `refreshed` is a one-shot reentry guard for
@@ -543,5 +608,224 @@ impl ExtendedConnector {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod synthesize_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    fn trade(
+        id: i64,
+        order_id: i64,
+        side: &str,
+        qty: &str,
+        value: &str,
+        fee: &str,
+    ) -> AccountTradeModel {
+        AccountTradeModel {
+            id,
+            account_id: 1,
+            market: "ETH-USD".to_string(),
+            order_id,
+            side: side.to_string(),
+            price: dec(value) / dec(qty),
+            qty: dec(qty),
+            value: dec(value),
+            fee: dec(fee),
+            is_taker: true,
+            trade_type: "TRADE".to_string(),
+            created_time: 1_779_204_076_822,
+        }
+    }
+
+    fn history_order(
+        internal_id: i64,
+        external_id: &str,
+        status: &str,
+        side: &str,
+        qty: &str,
+        filled_qty: Option<&str>,
+        avg_price: Option<&str>,
+    ) -> OpenOrderModel {
+        OpenOrderModel {
+            id: internal_id,
+            account_id: 1,
+            external_id: external_id.to_string(),
+            market: "ETH-USD".to_string(),
+            order_type: "LIMIT".to_string(),
+            side: side.to_string(),
+            status: status.to_string(),
+            status_reason: None,
+            price: Some(dec("2107.0")),
+            average_price: avg_price.map(dec),
+            qty: dec(qty),
+            filled_qty: filled_qty.map(dec),
+            reduce_only: true,
+            post_only: false,
+            created_time: 1_779_204_076_000,
+            updated_time: 1_779_204_076_822,
+            expiry_time: None,
+        }
+    }
+
+    /// Phase A of bot-strategy#459: when `/user/trades` is empty (1-3 s
+    /// indexing lag for fresh IOCs) but `/user/orders/history` reports the
+    /// order as `FILLED` with a non-zero `filled_qty`, the rescue path
+    /// must synthesize a `FilledOrder` from the history row so callers
+    /// see the actual fill instead of `filled=0`.
+    #[test]
+    fn synthesize_from_history_when_trades_empty() {
+        let trades: Vec<AccountTradeModel> = vec![];
+        let history = vec![history_order(
+            42,
+            "1471473462697106648726622901138969625593445590025860931474300236538595408494",
+            "FILLED",
+            "BUY",
+            "0.023",
+            Some("0.023"),
+            Some("2107.0"),
+        )];
+        let mut map = HashMap::new();
+        map.insert(42, history[0].external_id.clone());
+
+        let orders = synthesize_filled_orders(&trades, &history, &map);
+
+        assert_eq!(orders.len(), 1);
+        let fo = &orders[0];
+        assert_eq!(fo.order_id, history[0].external_id);
+        assert_eq!(fo.is_rejected, false);
+        assert_eq!(fo.trade_id, "");
+        assert_eq!(fo.filled_side, Some(OrderSide::Long));
+        assert_eq!(fo.filled_size, Some(dec("0.023")));
+        assert_eq!(fo.filled_value, Some(dec("0.023") * dec("2107.0")));
+        assert_eq!(fo.filled_fee, None);
+        assert_eq!(fo.filled_ts_ms, Some(1_779_204_076_822));
+    }
+
+    /// Trades source is canonical when present: don't synthesize a duplicate
+    /// from history because the trade already covers the full filled_qty.
+    #[test]
+    fn no_synthesis_when_trades_already_cover_filled_qty() {
+        let trades = vec![trade(7777, 42, "BUY", "0.023", "48.461", "0.012115")];
+        let history = vec![history_order(
+            42,
+            "extid-42",
+            "FILLED",
+            "BUY",
+            "0.023",
+            Some("0.023"),
+            Some("2107.0"),
+        )];
+        let mut map = HashMap::new();
+        map.insert(42, "extid-42".to_string());
+
+        let orders = synthesize_filled_orders(&trades, &history, &map);
+
+        assert_eq!(
+            orders.len(),
+            1,
+            "exactly one FilledOrder — the trade row, not a synthesized duplicate"
+        );
+        let fo = &orders[0];
+        assert_eq!(fo.trade_id, "7777", "row came from /user/trades");
+        assert_eq!(
+            fo.filled_fee,
+            Some(dec("0.012115")),
+            "fee preserved from trade source"
+        );
+    }
+
+    /// Partial straddling the indexing boundary: one fill leg in /user/trades,
+    /// the rest only visible in /user/orders/history. The synthesized row must
+    /// cover the missing delta only, not the entire order-level filled_qty.
+    #[test]
+    fn synthesizes_partial_delta_not_total() {
+        let trades = vec![trade(7777, 42, "SELL", "0.010", "21.07", "0.0053")];
+        let history = vec![history_order(
+            42,
+            "extid-42",
+            "FILLED",
+            "SELL",
+            "0.023",
+            Some("0.023"),
+            Some("2107.0"),
+        )];
+        let mut map = HashMap::new();
+        map.insert(42, "extid-42".to_string());
+
+        let orders = synthesize_filled_orders(&trades, &history, &map);
+
+        assert_eq!(orders.len(), 2);
+        let summed_qty: Decimal = orders.iter().filter_map(|o| o.filled_size).sum();
+        assert_eq!(
+            summed_qty,
+            dec("0.023"),
+            "total fill sums to order-level filled_qty"
+        );
+        let synth = orders
+            .iter()
+            .find(|o| o.trade_id.is_empty())
+            .expect("synthesized row present");
+        assert_eq!(synth.filled_size, Some(dec("0.013")), "delta only");
+        assert_eq!(synth.filled_side, Some(OrderSide::Short));
+    }
+
+    /// History rows with status != FILLED are ignored. CANCELLED / REJECTED
+    /// orders shouldn't surface as FilledOrder; their handling lives in
+    /// `get_canceled_orders` and `get_open_orders`.
+    #[test]
+    fn ignores_non_filled_status() {
+        let trades: Vec<AccountTradeModel> = vec![];
+        let history = vec![
+            history_order(1, "a", "CANCELLED", "BUY", "0.023", Some("0.000"), None),
+            history_order(2, "b", "EXPIRED", "BUY", "0.023", Some("0.000"), None),
+            history_order(
+                3,
+                "c",
+                "FILLED",
+                "BUY",
+                "0.023",
+                Some("0.0"),
+                Some("2107.0"),
+            ),
+        ];
+        let map = HashMap::new();
+
+        let orders = synthesize_filled_orders(&trades, &history, &map);
+        assert!(
+            orders.is_empty(),
+            "filled_qty=0 is also filtered (no actual fill); non-FILLED status filtered"
+        );
+    }
+
+    /// average_price=0 means we can't derive filled_value; the synthesized
+    /// row must still carry filled_size so size-based logic (e.g.
+    /// poll_fill_status terminal detection) works, but filled_value=None.
+    #[test]
+    fn synthesizes_size_without_value_when_avg_price_missing() {
+        let trades: Vec<AccountTradeModel> = vec![];
+        let history = vec![history_order(
+            5,
+            "ext-5",
+            "FILLED",
+            "BUY",
+            "0.023",
+            Some("0.023"),
+            None,
+        )];
+        let map = HashMap::new();
+
+        let orders = synthesize_filled_orders(&trades, &history, &map);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].filled_size, Some(dec("0.023")));
+        assert_eq!(orders[0].filled_value, None);
+        assert_eq!(orders[0].filled_fee, None);
     }
 }
