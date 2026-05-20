@@ -12,7 +12,7 @@
 //! 3. `crate::lighter_ratelimit` — proactive per-IP budget. Reads default
 //!    to `Shed` policy; sendTx / nonce paths use `Wait`. (bot-strategy#79.)
 
-use super::LighterConnector;
+use super::{outage_detector::OutageSignal, LighterConnector};
 use crate::dex_request::{DexError, HttpMethod};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -81,13 +81,19 @@ impl LighterConnector {
             });
         }
 
-        let response = self
+        let response = match self
             .client
             .get(url)
             .header("X-API-KEY", &self.api_key_public)
             .send()
             .await
-            .map_err(|e| DexError::Transient(format!("{}: {}", err_label, e)))?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                self.record_outage_failure(OutageSignal::Rest);
+                return Err(DexError::Transient(format!("{}: {}", err_label, e)));
+            }
+        };
 
         let status = response.status();
         let headers = response.headers().clone();
@@ -113,12 +119,16 @@ impl LighterConnector {
                     until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
                 });
             }
+            if status.is_server_error() {
+                self.record_outage_failure(OutageSignal::Rest);
+            }
             return Err(DexError::Transient(format!(
                 "{} HTTP {}: {}",
                 err_label, status, response_text
             )));
         }
 
+        self.record_outage_success(OutageSignal::Rest);
         Ok(response_text)
     }
 
@@ -194,10 +204,13 @@ impl LighterConnector {
                 .body(body_content.to_string());
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                self.record_outage_failure(OutageSignal::Rest);
+                return Err(DexError::Transient(format!("Request failed: {}", e)));
+            }
+        };
 
         let status = response.status();
         let headers = response.headers().clone();
@@ -225,15 +238,22 @@ impl LighterConnector {
                     until_unix: chrono::Utc::now().timestamp() + dur.as_secs() as i64,
                 });
             }
+            if status.is_server_error() {
+                self.record_outage_failure(OutageSignal::Rest);
+            }
             return Err(DexError::Transient(format!(
                 "HTTP {}: {}",
                 status, error_text
             )));
         }
 
-        response
+        let parsed = response
             .json()
             .await
-            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)));
+        if parsed.is_ok() {
+            self.record_outage_success(OutageSignal::Rest);
+        }
+        parsed
     }
 }
