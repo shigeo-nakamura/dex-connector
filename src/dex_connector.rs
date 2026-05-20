@@ -158,6 +158,14 @@ pub trait DexConnector: Send + Sync {
 
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool;
 
+    async fn maintenance_status(&self, hours_ahead: i64) -> Option<String> {
+        if self.is_upcoming_maintenance(hours_ahead).await {
+            Some("upcoming_or_active".to_string())
+        } else {
+            None
+        }
+    }
+
     async fn sign_evm_65b(&self, message: &str) -> Result<String, DexError>;
 
     async fn sign_evm_65b_with_eip191(&self, message: &str) -> Result<String, DexError>;

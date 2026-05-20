@@ -147,6 +147,7 @@ mod market_cache;
 mod models;
 mod order_payload;
 mod orders;
+mod outage_detector;
 mod parsing;
 mod rest;
 mod signing;
@@ -165,6 +166,7 @@ use models::{
     LighterOrderBookCacheEntry, LighterOrderBookDetailsResponse, LighterOrderBooksResponse,
     LighterTradesResponse,
 };
+use outage_detector::{OutageDetector, OutageSignal, OutageTransition};
 use parsing::{
     calculate_min_tick, map_side, parse_cancel_order_index, scale_decimal_to_u32,
     scale_decimal_to_u64,
@@ -229,6 +231,7 @@ pub struct LighterConnector {
     current_volume: Arc<RwLock<Option<Decimal>>>,
     order_book: Arc<RwLock<HashMap<u32, LighterOrderBookCacheEntry>>>,
     maintenance: Arc<RwLock<MaintenanceInfo>>,
+    outage_detector: Arc<std::sync::Mutex<OutageDetector>>,
     // WebSocket-based order tracking (no API calls)
     cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>, // symbol -> orders
     /// Bundled positions + balance + collateral cache (bot-strategy#392).
@@ -527,6 +530,38 @@ impl LighterConnector {
         });
     }
 
+    fn record_outage_failure(&self, signal: OutageSignal) {
+        let transition = {
+            let mut detector = self
+                .outage_detector
+                .lock()
+                .expect("outage detector poisoned");
+            detector.record_failure(signal, Instant::now())
+        };
+        if let Some(OutageTransition::Latched { reason }) = transition {
+            log::warn!(
+                "[MAINTENANCE] Lighter degraded-mode latched via observed {} failures",
+                reason
+            );
+        }
+    }
+
+    fn record_outage_success(&self, signal: OutageSignal) {
+        let transition = {
+            let mut detector = self
+                .outage_detector
+                .lock()
+                .expect("outage detector poisoned");
+            detector.record_success(signal, Instant::now())
+        };
+        if let Some(OutageTransition::Cleared { reason }) = transition {
+            log::info!(
+                "[MAINTENANCE] Lighter degraded-mode cleared after {} recovery",
+                reason
+            );
+        }
+    }
+
     /// Start the background refresher for the Lighter status-page maintenance
     /// feed. The previous design awaited `fetch_next_maintenance_window`
     /// inline from `is_upcoming_maintenance` (which is on the strategy's hot
@@ -682,6 +717,7 @@ impl LighterConnector {
                 next_start: None,
                 last_checked: None,
             })),
+            outage_detector: Arc::new(std::sync::Mutex::new(OutageDetector::default())),
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             account_state: Arc::new(RwLock::new(AccountState::default())),
             positions_ready: Arc::new(AtomicBool::new(false)),
@@ -742,6 +778,7 @@ impl LighterConnector {
                 next_start: None,
                 last_checked: None,
             })),
+            outage_detector: Arc::new(std::sync::Mutex::new(OutageDetector::default())),
             cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
             account_state: Arc::new(RwLock::new(AccountState::default())),
             positions_ready: Arc::new(AtomicBool::new(false)),
@@ -1905,6 +1942,7 @@ impl DexConnector for LighterConnector {
                     market_id,
                     ob_guard.len()
                 );
+                self.record_outage_failure(OutageSignal::ReadMid);
                 return Err(DexError::Transient(
                     "order book snapshot unavailable (no recent update)".to_string(),
                 ));
@@ -1914,6 +1952,7 @@ impl DexConnector for LighterConnector {
             // Don't remove stale entry from cache — it may be needed as a
             // baseline for delta merges after WS reconnection. The entry will
             // be replaced once a fresh update arrives. See: dex-connector#2
+            self.record_outage_failure(OutageSignal::ReadMid);
             return Err(DexError::Transient(
                 "order book snapshot unavailable (no recent update)".to_string(),
             ));
@@ -1936,6 +1975,7 @@ impl DexConnector for LighterConnector {
                 asks.push(OrderBookLevel { price, size });
             }
         }
+        self.record_outage_success(OutageSignal::ReadMid);
         Ok(OrderBookSnapshot { bids, asks })
     }
 
@@ -2779,6 +2819,32 @@ impl DexConnector for LighterConnector {
             res
         );
         res
+    }
+
+    async fn maintenance_status(&self, hours_ahead: i64) -> Option<String> {
+        if matches!(
+            std::env::var("LIGHTER_MAINTENANCE_DISABLED").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) {
+            return None;
+        }
+
+        let degraded_reason = {
+            let detector = self
+                .outage_detector
+                .lock()
+                .expect("outage detector poisoned");
+            detector.reason()
+        };
+        if degraded_reason.is_some() {
+            return Some("degraded_observed".to_string());
+        }
+
+        if self.is_upcoming_maintenance(hours_ahead).await {
+            Some("upcoming_or_active".to_string())
+        } else {
+            None
+        }
     }
 
     async fn sign_evm_65b(&self, message: &str) -> Result<String, DexError> {

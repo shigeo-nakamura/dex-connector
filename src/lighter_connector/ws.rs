@@ -19,7 +19,10 @@
 use super::market_cache::MarketCache;
 use super::models::{LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition};
 use super::parsing::{parse_canceled_order, parse_filled_order, value_to_decimal};
-use super::{AccountState, LighterConnector};
+use super::{
+    outage_detector::{OutageDetector, OutageSignal, OutageTransition},
+    AccountState, LighterConnector,
+};
 use crate::dex_connector::string_to_decimal;
 use crate::dex_request::DexError;
 use crate::{BalanceResponse, CanceledOrder, FilledOrder, OpenOrder, OrderSide, PositionSnapshot};
@@ -38,6 +41,32 @@ use tokio::sync::RwLock;
 /// path itself has failed. Defense in depth follow-up to bot-strategy#347
 /// (Extended saw a 28h silent fail with the same pattern).
 const WS_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn record_outage_failure(detector: &Arc<std::sync::Mutex<OutageDetector>>, signal: OutageSignal) {
+    let transition = {
+        let mut detector = detector.lock().expect("outage detector poisoned");
+        detector.record_failure(signal, Instant::now())
+    };
+    if let Some(OutageTransition::Latched { reason }) = transition {
+        log::warn!(
+            "[MAINTENANCE] Lighter degraded-mode latched via observed {} failures",
+            reason
+        );
+    }
+}
+
+fn record_outage_success(detector: &Arc<std::sync::Mutex<OutageDetector>>, signal: OutageSignal) {
+    let transition = {
+        let mut detector = detector.lock().expect("outage detector poisoned");
+        detector.record_success(signal, Instant::now())
+    };
+    if let Some(OutageTransition::Cleared { reason }) = transition {
+        log::info!(
+            "[MAINTENANCE] Lighter degraded-mode cleared after {} recovery",
+            reason
+        );
+    }
+}
 
 // Priority message system for WebSocket sending.
 #[derive(Debug)]
@@ -103,6 +132,7 @@ impl LighterConnector {
         // RwLock; clone the bundle Arc instead of three independent caches.
         let account_state = self.account_state.clone();
         let funding_rate_cache = self.funding_rate_cache.clone();
+        let outage_detector = Arc::clone(&self.outage_detector);
         let is_running = self.is_running.clone();
         let connection_epoch = self.connection_epoch.clone();
         let account_index = self.account_index;
@@ -316,6 +346,7 @@ impl LighterConnector {
                             peer_addr,
                             stream_kind
                         );
+                        record_outage_success(&outage_detector, OutageSignal::Ws);
 
                         // Send subscription messages
                         let subscribe_account = serde_json::json!({
@@ -606,10 +637,14 @@ impl LighterConnector {
                                         WS_STALL_TIMEOUT.as_secs(),
                                         conn_label
                                     );
+                                    record_outage_failure(&outage_detector, OutageSignal::Ws);
                                     break;
                                 }
                             };
-                            let Some(message) = next else { break };
+                            let Some(message) = next else {
+                                record_outage_failure(&outage_detector, OutageSignal::Ws);
+                                break;
+                            };
                             if !is_running.load(Ordering::SeqCst) {
                                 log::info!("WebSocket stopping due to is_running flag");
                                 break;
@@ -673,6 +708,10 @@ impl LighterConnector {
                                                 &price_update_tx,
                                             )
                                             .await;
+                                            record_outage_success(
+                                                &outage_detector,
+                                                OutageSignal::Ws,
+                                            );
 
                                             let total_duration = msg_start.elapsed();
 
@@ -854,6 +893,7 @@ impl LighterConnector {
                                             idle_tx,
                                             pending_client_ping.load(Ordering::SeqCst),
                                         );
+                                        record_outage_failure(&outage_detector, OutageSignal::Ws);
                                         break;
                                     }
                                     tokio_tungstenite::tungstenite::Message::Binary(data) => {
@@ -922,6 +962,7 @@ impl LighterConnector {
                                             pending_client_ping.load(Ordering::SeqCst),
                                         );
                                     }
+                                    record_outage_failure(&outage_detector, OutageSignal::Ws);
                                     match &e {
                                         tokio_tungstenite::tungstenite::Error::Protocol(
                                             protocol_err,
@@ -985,6 +1026,7 @@ impl LighterConnector {
                     }
                     Err(e) => {
                         reconnect_attempt += 1;
+                        record_outage_failure(&outage_detector, OutageSignal::Ws);
 
                         // Check for 429 Too Many Requests
                         let error_str = e.to_string();
