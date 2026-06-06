@@ -1039,6 +1039,26 @@ impl DexConnector for ExtendedConnector {
         reduce_only: bool,
         expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
+        // bot-strategy#480: `price=None` is the contract for "market" — every
+        // pairtrade caller (entry / exit / hedge recovery / partial-fill
+        // reissue, 9 sites) passes None to mean "cross now". Matches Lighter's
+        // `create_order(price=None)` which already routes to IOC with a 20 %
+        // protection price. Pre-#480, Extended ran this through
+        // `choose_base_price` → touch → `submit_order_with_market` which
+        // emits LIMIT GTT (1 h passive maker). In fast markets the touch
+        // moves by ≥ 1 tick before the order lands, the limit becomes
+        // non-crossing maker, sits for the next 5 s reconcile tick, gets
+        // cancelled, and the cycle repeats — observed on `debot-pair-btceth-
+        // extended` 2026-06-03..06-06 as a 54 k-retry order/cancel loop that
+        // burned no capital but blocked all entries / exits. Route the
+        // `price=None` case to `submit_taker_ioc` (touch ± 1 tick + IOC) so
+        // the order always either fills or is venue-cancelled on first match,
+        // never sitting as a maker.
+        if price.is_none() {
+            return self
+                .submit_taker_ioc(symbol, size, side, 0, reduce_only)
+                .await;
+        }
         let post_only = matches!(spread, Some(-2));
         self.create_order_internal(
             symbol,
