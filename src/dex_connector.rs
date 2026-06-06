@@ -84,6 +84,21 @@ pub trait DexConnector: Send + Sync {
     async fn clear_canceled_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
     async fn clear_all_canceled_orders(&self) -> Result<(), DexError>;
 
+    /// Place an order on the exchange.
+    ///
+    /// `price` semantics:
+    /// - `Some(p)`: LIMIT order at price `p` with the venue's default
+    ///   resting time-in-force (typically GTT). `spread = Some(-2)` flips
+    ///   it to post-only.
+    /// - `None`: **market / IOC** — the venue must execute against best
+    ///   available liquidity and never leave the order resting. Lighter
+    ///   already routes here through its native IOC + 20 % protection
+    ///   price; Extended routes through `submit_taker_ioc` (touch ± 1
+    ///   tick + IOC). All pairtrade callers (entry / exit / hedge
+    ///   recovery / partial-fill reissue) pass `None` to mean "cross
+    ///   now". See bot-strategy#480 — Extended previously emitted
+    ///   `time_in_force=GTT` LIMIT at touch on `price=None` and produced
+    ///   an unbounded reissue / cancel loop on partial-fill recovery.
     async fn create_order(
         &self,
         symbol: &str,
