@@ -99,37 +99,6 @@ pub(super) struct LighterTrade {
     pub(super) side: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-pub(super) struct LighterExchangeStats {
-    pub(super) code: i32,
-    pub(super) order_book_stats: Vec<LighterOrderBookStats>,
-    pub(super) daily_usd_volume: f64,
-    pub(super) daily_trades_count: u32,
-}
-
-impl Clone for LighterExchangeStats {
-    fn clone(&self) -> Self {
-        Self {
-            code: self.code,
-            order_book_stats: self.order_book_stats.clone(),
-            daily_usd_volume: self.daily_usd_volume,
-            daily_trades_count: self.daily_trades_count,
-        }
-    }
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-pub(super) struct LighterOrderBookStats {
-    pub(super) symbol: String,
-    pub(super) last_trade_price: f64,
-    pub(super) daily_trades_count: u32,
-    pub(super) daily_base_token_volume: f64,
-    pub(super) daily_quote_token_volume: f64,
-    pub(super) daily_price_change: f64,
-}
-
 #[derive(Deserialize, Debug, Clone)]
 #[allow(dead_code)]
 pub(super) struct LighterFundingRates {

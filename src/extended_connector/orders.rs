@@ -23,6 +23,16 @@ use super::rest::build_query;
 use super::signing::NewOrderModel;
 use super::ExtendedConnector;
 
+/// Output of [`ExtendedConnector::build_ioc_order`]: the ready-to-POST IOC
+/// order plus the rounded values and price source the callers log.
+pub(super) struct IocOrderPlan {
+    pub(super) order: NewOrderModel,
+    pub(super) rounded_price: Decimal,
+    pub(super) rounded_size: Decimal,
+    pub(super) used_market_stats: bool,
+    pub(super) side_str: &'static str,
+}
+
 /// Pure synthesis: build the `FilledOrder` list returned by `get_filled_orders`
 /// from the two REST sources (`/user/trades` + `/user/orders/history`) and the
 /// connector's `order_id_map` (Extended internal id → external_id).
@@ -422,51 +432,35 @@ impl ExtendedConnector {
         })
     }
 
-    /// bot-strategy#302: low-level IOC submit. Mirrors the
-    /// `close_all_positions` IOC path but lets the caller drive size /
-    /// side / reduce_only directly so it can be reused for entry-side
-    /// taker semantics (where `close_all_positions` would refuse —
-    /// no resting position to close).
+    /// Build the IOC `NewOrderModel` (plus the rounded price/size and the
+    /// price source) for a taker order, given the top-of-opposing-side
+    /// `base_price` the caller already fetched. When `base_price` is None we
+    /// fall back to market stats (index, then last) with a fixed slippage.
     ///
-    /// Pricing matches `close_all_positions`: top-of-book ± 1 tick
-    /// (aggressive) ± `slippage_bps`, falling back to market stats +
-    /// default 5% slippage if the order book is unreachable. The
-    /// venue's IOC TIF terminates the order on first match (filled or
-    /// zero-fill cancel) within ~ms, so callers do not need to chase or
-    /// cancel — `poll_fill_status` will see a terminal response on the
-    /// next read.
-    pub(super) async fn submit_taker_ioc(
+    /// Shared by `submit_taker_ioc` (entry/takeover) and `close_all_positions`
+    /// (bot-strategy#501) so the price math, the IOC LIMIT envelope, and the
+    /// StarkNet settlement stay identical across both paths. `base_price`
+    /// acquisition stays with each caller because they differ: `submit_taker_ioc`
+    /// prefers the WS order book then REST, while `close_all_positions` reads
+    /// REST only.
+    // Mirrors the IOC order-param shape shared with submit_taker_ioc /
+    // close_all_positions; a struct wrapper would obscure the call sites.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_ioc_order(
         &self,
-        symbol: &str,
-        size: Decimal,
+        market: &MarketModel,
         side: OrderSide,
+        size: Decimal,
         slippage_bps: u32,
         reduce_only: bool,
         cancel_id: Option<String>,
-    ) -> Result<CreateOrderResponse, DexError> {
-        let market = self.get_market(symbol).await?;
+        base_price: Option<Decimal>,
+    ) -> Result<IocOrderPlan, DexError> {
         let side_str = match side {
             OrderSide::Long => "BUY",
             OrderSide::Short => "SELL",
         };
         let tick = market.trading_config.min_price_change;
-
-        // Top of opposing side; REST fallback if WS cache empty.
-        let mut base_price: Option<Decimal> = None;
-        if let Ok(ob) = self.get_order_book(symbol, 1).await {
-            base_price = match side {
-                OrderSide::Long => ob.asks.first().map(|level| level.price),
-                OrderSide::Short => ob.bids.first().map(|level| level.price),
-            };
-        }
-        if base_price.is_none() {
-            if let Ok(ob) = self.get_order_book_rest(symbol, 1).await {
-                base_price = match side {
-                    OrderSide::Long => ob.asks.first().map(|level| level.price),
-                    OrderSide::Short => ob.bids.first().map(|level| level.price),
-                };
-            }
-        }
 
         let (mut order_price, used_market_stats) = if let Some(px) = base_price {
             (px, false)
@@ -489,13 +483,13 @@ impl ExtendedConnector {
             }
             order_price = pricing::apply_close_slippage_bps(order_price, slippage_bps, side);
         }
-        let rounded_price = pricing::round_price_for_market_aggressive(order_price, &market, side);
-        let rounded_size = pricing::round_size_for_market(size, &market)?;
+        let rounded_price = pricing::round_price_for_market_aggressive(order_price, market, side);
+        let rounded_size = pricing::round_size_for_market(size, market)?;
 
         let expire_time = Utc::now() + Duration::hours(1);
         let nonce = rand::random::<u32>() as u64;
         let settlement = self.compute_settlement(
-            &market,
+            market,
             side_str,
             rounded_size,
             rounded_price,
@@ -529,20 +523,80 @@ impl ExtendedConnector {
             builder_id: None,
         };
 
+        Ok(IocOrderPlan {
+            order,
+            rounded_price,
+            rounded_size,
+            used_market_stats,
+            side_str,
+        })
+    }
+
+    /// bot-strategy#302: low-level IOC submit. Mirrors the
+    /// `close_all_positions` IOC path but lets the caller drive size /
+    /// side / reduce_only directly so it can be reused for entry-side
+    /// taker semantics (where `close_all_positions` would refuse —
+    /// no resting position to close).
+    ///
+    /// Pricing matches `close_all_positions`: top-of-book ± 1 tick
+    /// (aggressive) ± `slippage_bps`, falling back to market stats +
+    /// default 5% slippage if the order book is unreachable. The
+    /// venue's IOC TIF terminates the order on first match (filled or
+    /// zero-fill cancel) within ~ms, so callers do not need to chase or
+    /// cancel — `poll_fill_status` will see a terminal response on the
+    /// next read.
+    pub(super) async fn submit_taker_ioc(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        slippage_bps: u32,
+        reduce_only: bool,
+        cancel_id: Option<String>,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let market = self.get_market(symbol).await?;
+
+        // Top of opposing side; REST fallback if WS cache empty.
+        let mut base_price: Option<Decimal> = None;
+        if let Ok(ob) = self.get_order_book(symbol, 1).await {
+            base_price = match side {
+                OrderSide::Long => ob.asks.first().map(|level| level.price),
+                OrderSide::Short => ob.bids.first().map(|level| level.price),
+            };
+        }
+        if base_price.is_none() {
+            if let Ok(ob) = self.get_order_book_rest(symbol, 1).await {
+                base_price = match side {
+                    OrderSide::Long => ob.asks.first().map(|level| level.price),
+                    OrderSide::Short => ob.bids.first().map(|level| level.price),
+                };
+            }
+        }
+
+        let plan = self.build_ioc_order(
+            &market,
+            side,
+            size,
+            slippage_bps,
+            reduce_only,
+            cancel_id,
+            base_price,
+        )?;
+
         log::info!(
             "[create_order_taker_ioc] {} side={} size={} price={} tif=IOC reduce_only={} source={} slippage_bps={}",
             symbol,
-            side_str,
-            rounded_size,
-            rounded_price,
+            plan.side_str,
+            plan.rounded_size,
+            plan.rounded_price,
             reduce_only,
-            if used_market_stats { "stats" } else { "order_book" },
-            if used_market_stats { 0 } else { slippage_bps },
+            if plan.used_market_stats { "stats" } else { "order_book" },
+            if plan.used_market_stats { 0 } else { slippage_bps },
         );
 
         let response: PlacedOrderModel = self
             .api
-            .post("/user/order".to_string(), order, true)
+            .post("/user/order".to_string(), plan.order, true)
             .await?;
 
         // bot-strategy#432: invalidate the `filled_orders` WS cache for
@@ -571,8 +625,8 @@ impl ExtendedConnector {
         Ok(CreateOrderResponse {
             order_id: response.external_id,
             exchange_order_id: Some(response.id.to_string()),
-            ordered_price: rounded_price,
-            ordered_size: rounded_size,
+            ordered_price: plan.rounded_price,
+            ordered_size: plan.rounded_size,
             client_order_id: None,
         })
     }

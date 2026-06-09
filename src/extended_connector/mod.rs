@@ -1,10 +1,9 @@
 use crate::{
-    dex_connector::{slippage_price, DexConnector},
-    dex_request::DexError,
-    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
-    CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
-    OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
-    TickerResponse, TpSl, TriggerOrderStyle,
+    dex_connector::DexConnector, dex_request::DexError, BalanceResponse, CanceledOrder,
+    CanceledOrdersResponse, CombinedBalanceResponse, CreateOrderResponse, FilledOrder,
+    FilledOrdersResponse, LastTrade, LastTradesResponse, OpenOrder, OpenOrdersResponse,
+    OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl,
+    TriggerOrderStyle,
 };
 use async_trait::async_trait;
 #[cfg(test)]
@@ -1407,15 +1406,8 @@ impl DexConnector for ExtendedConnector {
             } else {
                 OrderSide::Long
             };
-            let expire_time = Utc::now() + Duration::hours(1);
-
-            let nonce = rand::random::<u32>() as u64;
             let market = self.get_market(&position.symbol).await?;
-            let side_str = match side {
-                OrderSide::Long => "BUY",
-                OrderSide::Short => "SELL",
-            };
-            let tick = market.trading_config.min_price_change;
+            // REST-only top of opposing side (no WS read on the close path).
             let mut base_price: Option<Decimal> = None;
             if let Ok(ob) = self.get_order_book_rest(&position.symbol, 1).await {
                 base_price = match side {
@@ -1423,80 +1415,27 @@ impl DexConnector for ExtendedConnector {
                     OrderSide::Short => ob.bids.first().map(|level| level.price),
                 };
             }
-            let (mut order_price, used_market_stats) = if let Some(px) = base_price {
-                (px, false)
-            } else {
-                let stats_price = if market.market_stats.index_price > Decimal::ZERO {
-                    market.market_stats.index_price
-                } else {
-                    market.market_stats.last_price
-                };
-                (stats_price, true)
-            };
-            if used_market_stats {
-                order_price = slippage_price(order_price, side == OrderSide::Long);
-            } else {
-                if tick > Decimal::ZERO {
-                    match side {
-                        OrderSide::Long => {
-                            order_price += tick;
-                        }
-                        OrderSide::Short => {
-                            order_price -= tick;
-                        }
-                    }
-                }
-                order_price = pricing::apply_close_slippage_bps(
-                    order_price,
-                    self.close_all_positions_slippage_bps,
-                    side,
-                );
-            }
-            let rounded_price =
-                pricing::round_price_for_market_aggressive(order_price, &market, side);
-            let rounded_size = pricing::round_size_for_market(position.size, &market)?;
 
-            let settlement = self.compute_settlement(
+            // Shared IOC construction (bot-strategy#501): identical price math
+            // and LIMIT/IOC envelope as the entry-side `submit_taker_ioc`.
+            let plan = self.build_ioc_order(
                 &market,
-                side_str,
-                rounded_size,
-                rounded_price,
-                expire_time,
-                nonce,
+                side,
+                position.size,
+                self.close_all_positions_slippage_bps,
+                true,
+                None,
+                base_price,
             )?;
-
-            let order = NewOrderModel {
-                id: settlement.order_hash.to_string(),
-                market: market.name.clone(),
-                order_type: "LIMIT".to_string(),
-                side: side_str.to_string(),
-                qty: rounded_size,
-                price: rounded_price,
-                reduce_only: true,
-                post_only: false,
-                time_in_force: "IOC".to_string(),
-                expiry_epoch_millis: Self::to_epoch_millis(expire_time),
-                fee: settlement.fee_rate,
-                self_trade_protection_level: "ACCOUNT".to_string(),
-                nonce: Decimal::from(nonce),
-                cancel_id: None,
-                settlement: Some(settlement.settlement),
-                tp_sl_type: None,
-                take_profit: None,
-                stop_loss: None,
-                debugging_amounts: Some(settlement.debugging_amounts),
-                builder_fee: None,
-                builder_id: None,
-            };
 
             log::info!(
                 "[close_all_positions] {} side={} size={} price={} tif=IOC reduce_only=true source={} slippage_bps={}",
                 position.symbol,
-                side_str,
-                rounded_size,
-                rounded_price,
-                if used_market_stats { "stats" } else { "order_book" },
-                if used_market_stats {
+                plan.side_str,
+                plan.rounded_size,
+                plan.rounded_price,
+                if plan.used_market_stats { "stats" } else { "order_book" },
+                if plan.used_market_stats {
                     0
                 } else {
                     self.close_all_positions_slippage_bps
@@ -1505,7 +1444,7 @@ impl DexConnector for ExtendedConnector {
 
             match self
                 .api
-                .post::<PlacedOrderModel, _>("/user/order".to_string(), order, true)
+                .post::<PlacedOrderModel, _>("/user/order".to_string(), plan.order, true)
                 .await
             {
                 Ok(response) => {
