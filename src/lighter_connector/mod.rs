@@ -162,8 +162,9 @@ use maintenance::{
 use market_cache::MarketInfo;
 use market_cache::{MarketCache, MARKET_CACHE, MARKET_CACHE_INIT_LOCK};
 use models::{
-    ApiKeyResponse, LighterAccountResponse, LighterFundingRates, LighterOrderBookCacheEntry,
-    LighterOrderBookDetailsResponse, LighterOrderBooksResponse, LighterTradesResponse,
+    ApiKeyResponse, LighterAccountInfo, LighterAccountResponse, LighterFundingRates,
+    LighterOrderBookCacheEntry, LighterOrderBookDetailsResponse, LighterOrderBooksResponse,
+    LighterTradesResponse,
 };
 use outage_detector::{OutageDetector, OutageSignal, OutageTransition};
 use parsing::{
@@ -1439,106 +1440,10 @@ impl DexConnector for LighterConnector {
         // warmup was always a no-op that forced step() over the 5s tick
         // and caused STEP_OVERRUN on every equity refresh. See
         // bot-strategy#155 (event-sourced equity tracking).
+        log::info!("get_balance called for symbol: {:?}", symbol);
 
-        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
-
-        // First, get the raw response text for debugging
-        let url = format!("{}{}", self.base_url, endpoint);
-        log::info!(
-            "get_balance called for symbol: {:?}, requesting URL: {}",
-            symbol,
-            url
-        );
-
-        // Lighter occasionally 429s the head of a balance-refresh burst even
-        // when our per-URL rate is ~1/min. Its short-window per-wallet throttle
-        // is shared across all endpoints, so a concurrent order-placement or
-        // nextNonce call can push the instantaneous rate over the edge. Retry
-        // a couple of times with backoff so a transient 429 doesn't blank out
-        // the equity observation for a full 5-minute cache cycle. See
-        // bot-strategy#142.
-        const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[2_000, 5_000];
-
-        let mut attempt: usize = 0;
-        let (status, response_text) = loop {
-            // Gate through the shared 60s/60000-weight bucket before each
-            // attempt. Wait policy with a short cap — headroom is huge in
-            // normal ops so this rarely blocks, but it keeps the sidecar's
-            // view of outbound traffic complete and paces bursts. The retry
-            // below still handles Lighter's short-window throttle that the
-            // sidecar does not model. See bot-strategy#167.
-            self.acquire_rest_budget(
-                &endpoint,
-                crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 1_000 },
-            )
-            .await?;
-            track_api_call(&endpoint, "GET");
-            let response = self
-                .client
-                .get(&url)
-                .header("X-API-KEY", &self.api_key_public)
-                .send()
-                .await
-                .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
-
-            let status = response.status();
-            let response_text = response
-                .text()
-                .await
-                .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
-
-            if status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                || attempt >= BALANCE_RETRY_BACKOFF_MS.len()
-            {
-                break (status, response_text);
-            }
-            let backoff_ms = BALANCE_RETRY_BACKOFF_MS[attempt];
-            // Lighter's per-wallet short-window throttle is shared across
-            // endpoints and the first 429 is recovered transparently by the
-            // backoff retry below; logging WARN on every attempt 1 hit
-            // pollutes error-watch (bot-strategy#213, #227). Escalate only
-            // when the throttle persists into attempt 2+, which signals real
-            // sustained pressure that warrants attention.
-            if attempt == 0 {
-                log::info!(
-                    "get_balance: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
-                    attempt + 1,
-                    BALANCE_RETRY_BACKOFF_MS.len() + 1,
-                    backoff_ms
-                );
-            } else {
-                log::warn!(
-                    "get_balance: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
-                    attempt + 1,
-                    BALANCE_RETRY_BACKOFF_MS.len() + 1,
-                    backoff_ms
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            attempt += 1;
-        };
-
-        log::info!(
-            "Account API response (status: {}): {}",
-            status,
-            response_text
-        );
-
-        if !status.is_success() {
-            return Err(DexError::Transient(format!(
-                "HTTP {}: {}",
-                status, response_text
-            )));
-        }
-
-        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
-
-        if account_response.accounts.is_empty() {
-            return Err(DexError::Transient("No account found".to_string()));
-        }
-
-        let account = &account_response.accounts[0];
+        let account = self.fetch_account_via_rest().await?;
+        let account = &account;
 
         // Debug log account information
         log::info!("Account balance info:");
@@ -1676,40 +1581,10 @@ impl DexConnector for LighterConnector {
             });
         }
 
-        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
-        let url = format!("{}{}", self.base_url, endpoint);
+        log::info!("get_combined_balance called");
 
-        log::info!("get_combined_balance called, requesting URL: {}", url);
-
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-KEY", &self.api_key_public)
-            .send()
-            .await
-            .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
-
-        if !status.is_success() {
-            return Err(DexError::Transient(format!(
-                "HTTP {}: {}",
-                status, response_text
-            )));
-        }
-
-        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
-
-        if account_response.accounts.is_empty() {
-            return Err(DexError::Transient("No account found".to_string()));
-        }
-
-        let account = &account_response.accounts[0];
+        let account = self.fetch_account_via_rest().await?;
+        let account = &account;
 
         // Extract USD balance and total asset value
         let usd_balance = string_to_decimal(Some(account.available_balance.clone()))?;
@@ -2922,6 +2797,107 @@ impl LighterConnector {
     /// drift at roughly one rate-tick and matches pairtrade's
     /// `EQUITY_REFRESH_CACHE_SECS`. See bot-strategy#155.
     const BALANCE_CACHE_TTL_SECS: u64 = 300;
+
+    /// Fetch the `/account?by=index` snapshot via REST and return the first
+    /// (and only) account.
+    ///
+    /// Shared by `get_balance` and `get_combined_balance` (bot-strategy#501)
+    /// so both go through one consistent path: the host-shared rate-limit
+    /// bucket gate plus the 429 retry/backoff that recovers Lighter's
+    /// per-wallet short-window throttle (bot-strategy#142). Previously only
+    /// `get_balance` had this gating; `get_combined_balance` issued a bare
+    /// `client.get`, so a balance-refresh burst could 429 it with no retry.
+    async fn fetch_account_via_rest(&self) -> Result<LighterAccountInfo, DexError> {
+        let endpoint = format!("/api/v1/account?by=index&value={}", self.account_index);
+        let url = format!("{}{}", self.base_url, endpoint);
+
+        // Lighter occasionally 429s the head of a balance-refresh burst even
+        // when our per-URL rate is ~1/min. Its short-window per-wallet throttle
+        // is shared across all endpoints, so a concurrent order-placement or
+        // nextNonce call can push the instantaneous rate over the edge. Retry
+        // a couple of times with backoff so a transient 429 doesn't blank out
+        // the equity observation for a full cache cycle. See bot-strategy#142.
+        const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[2_000, 5_000];
+
+        let mut attempt: usize = 0;
+        let (status, response_text) = loop {
+            // Gate through the shared 60s/60000-weight bucket before each
+            // attempt. Wait policy with a short cap — headroom is huge in
+            // normal ops so this rarely blocks, but it keeps the sidecar's
+            // view of outbound traffic complete and paces bursts. The retry
+            // below still handles Lighter's short-window throttle that the
+            // sidecar does not model. See bot-strategy#167.
+            self.acquire_rest_budget(
+                &endpoint,
+                crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 1_000 },
+            )
+            .await?;
+            track_api_call(&endpoint, "GET");
+            let response = self
+                .client
+                .get(&url)
+                .header("X-API-KEY", &self.api_key_public)
+                .send()
+                .await
+                .map_err(|e| DexError::Transient(format!("Request failed: {}", e)))?;
+
+            let status = response.status();
+            let response_text = response
+                .text()
+                .await
+                .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
+
+            if status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                || attempt >= BALANCE_RETRY_BACKOFF_MS.len()
+            {
+                break (status, response_text);
+            }
+            let backoff_ms = BALANCE_RETRY_BACKOFF_MS[attempt];
+            // The first 429 is recovered transparently by the backoff retry;
+            // logging WARN on every attempt 1 hit pollutes error-watch
+            // (bot-strategy#213, #227). Escalate only when the throttle
+            // persists into attempt 2+, which signals sustained pressure.
+            if attempt == 0 {
+                log::info!(
+                    "fetch_account: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
+                    attempt + 1,
+                    BALANCE_RETRY_BACKOFF_MS.len() + 1,
+                    backoff_ms
+                );
+            } else {
+                log::warn!(
+                    "fetch_account: HTTP 429 from Lighter (attempt {}/{}), retrying after {}ms",
+                    attempt + 1,
+                    BALANCE_RETRY_BACKOFF_MS.len() + 1,
+                    backoff_ms
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            attempt += 1;
+        };
+
+        log::info!(
+            "Account API response (status: {}): {}",
+            status,
+            response_text
+        );
+
+        if !status.is_success() {
+            return Err(DexError::Transient(format!(
+                "HTTP {}: {}",
+                status, response_text
+            )));
+        }
+
+        let account_response: LighterAccountResponse = serde_json::from_str(&response_text)
+            .map_err(|e| DexError::Transient(format!("Failed to parse response: {}", e)))?;
+
+        account_response
+            .accounts
+            .into_iter()
+            .next()
+            .ok_or_else(|| DexError::Transient("No account found".to_string()))
+    }
 
     /// Snapshot read of WS-fed balance/position caches for `get_balance`.
     /// Returns `None` if the WS has not yet delivered an account update; the
