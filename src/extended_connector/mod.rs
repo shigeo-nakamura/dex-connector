@@ -1,10 +1,9 @@
 use crate::{
-    dex_connector::DexConnector,
-    dex_request::DexError,
-    BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
-    CreateOrderResponse, FilledOrder, FilledOrdersResponse, LastTrade, LastTradesResponse,
-    OpenOrder, OpenOrdersResponse, OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot,
-    TickerResponse, TpSl, TriggerOrderStyle,
+    dex_connector::DexConnector, dex_request::DexError, BalanceResponse, CanceledOrder,
+    CanceledOrdersResponse, CombinedBalanceResponse, CreateOrderResponse, FilledOrder,
+    FilledOrdersResponse, LastTrade, LastTradesResponse, OpenOrder, OpenOrdersResponse,
+    OrderBookLevel, OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl,
+    TriggerOrderStyle,
 };
 use async_trait::async_trait;
 #[cfg(test)]

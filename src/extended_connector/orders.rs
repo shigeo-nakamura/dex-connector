@@ -443,6 +443,9 @@ impl ExtendedConnector {
     /// acquisition stays with each caller because they differ: `submit_taker_ioc`
     /// prefers the WS order book then REST, while `close_all_positions` reads
     /// REST only.
+    // Mirrors the IOC order-param shape shared with submit_taker_ioc /
+    // close_all_positions; a struct wrapper would obscure the call sites.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn build_ioc_order(
         &self,
         market: &MarketModel,

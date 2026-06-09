@@ -2188,12 +2188,11 @@ impl DexConnector for LighterConnector {
         let price_decimals = market_info.price_decimals;
         let size_decimals = market_info.size_decimals;
 
-        let order_index = parse_cancel_order_index(order_id).ok_or_else(|| {
-            DexError::InvalidInput {
+        let order_index =
+            parse_cancel_order_index(order_id).ok_or_else(|| DexError::InvalidInput {
                 field: "order_id".to_string(),
                 value: order_id.to_string(),
-            }
-        })?;
+            })?;
 
         // Re-assert the order's *total* base amount. Because this equals the
         // value originally sent to `create_order`, the matching engine keeps
