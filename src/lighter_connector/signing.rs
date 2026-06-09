@@ -18,7 +18,9 @@
 //! parent module is itself `#![cfg(feature = "lighter-sdk")]` and they
 //! never compile in practice.
 
-use super::ffi::{parse_signed_tx_response, CheckClient, SignCancelOrder, SignCreateOrder};
+use super::ffi::{
+    parse_signed_tx_response, CheckClient, SignCancelOrder, SignCreateOrder, SignModifyOrder,
+};
 use super::order_payload::OrderPayload;
 use super::LighterConnector;
 use crate::dex_request::DexError;
@@ -144,6 +146,59 @@ impl LighterConnector {
         &self,
         _market_index: i32,
         _order_index: i64,
+        _nonce: i64,
+    ) -> Result<String, DexError> {
+        Err(DexError::Permanent(
+            "Lighter Go SDK not available. Build with --features lighter-sdk to enable."
+                .to_string(),
+        ))
+    }
+
+    /// Call Go shared library to sign an L2ModifyOrder (tx type 17)
+    /// transaction. `base_amount` / `trigger_price` of 0 are the Go-side
+    /// "leave unchanged" sentinels. Integrator-fee args are zeroed.
+    /// See bot-strategy#471.
+    #[cfg(feature = "lighter-sdk")]
+    pub(super) async fn call_go_sign_modify_order(
+        &self,
+        market_index: i32,
+        order_index: i64,
+        base_amount: i64,
+        price: i64,
+        trigger_price: i64,
+        nonce: i64,
+    ) -> Result<String, DexError> {
+        self.create_go_client().await?;
+
+        unsafe {
+            let result = SignModifyOrder(
+                market_index,
+                order_index,
+                base_amount,
+                price,
+                trigger_price,
+                0, // integrator_account_index (unused)
+                0, // integrator_taker_fee (unused)
+                0, // integrator_maker_fee (unused)
+                0, // skip_nonce = false
+                nonce,
+                self.api_key_index as c_int,
+                self.account_index as c_longlong,
+            );
+
+            let (tx_info, _) = parse_signed_tx_response(result)?;
+            Ok(tx_info)
+        }
+    }
+
+    #[cfg(not(feature = "lighter-sdk"))]
+    pub(super) async fn call_go_sign_modify_order(
+        &self,
+        _market_index: i32,
+        _order_index: i64,
+        _base_amount: i64,
+        _price: i64,
+        _trigger_price: i64,
         _nonce: i64,
     ) -> Result<String, DexError> {
         Err(DexError::Permanent(

@@ -157,6 +157,61 @@ pub trait DexConnector: Send + Sync {
         ))
     }
 
+    /// Atomically amend an already-open order's remaining quantity and/or
+    /// price without a separate cancel + create round-trip, eliminating the
+    /// partial-fill reissue race (bot-strategy#471). The cancel + reissue
+    /// path leaves a window between "cancel ACK" and "new order acked" in
+    /// which the venue can still fill the about-to-be-cancelled order; this
+    /// primitive collapses both into one server-acked operation.
+    ///
+    /// **Two sizes are passed because the venue models diverge** and each
+    /// implementation needs a different one — callers (which know both the
+    /// original target and the locally-observed fill) supply both rather
+    /// than the connector guessing:
+    ///
+    /// - `target_total_size`: the order's *total* base size (already-filled
+    ///   + still-open), i.e. the size originally handed to `create_order`.
+    ///   On a partial-fill reprice this is unchanged. Venues with a native
+    ///   in-place amend (Lighter `L2ModifyOrder`, tx type 17) re-assert the
+    ///   order's `base_amount` to this value; the matching engine treats the
+    ///   already-filled portion as immutable and re-opens only
+    ///   `target_total_size - filled`, so no double-fill is possible.
+    /// - `open_remaining_size`: the quantity that should be working on the
+    ///   book *after* the amend (`target_total_size - filled`). Venues that
+    ///   emulate amend via an atomic cancel-replace (Extended's `cancel_id`
+    ///   on `POST /user/order`) place a brand-new order for exactly this
+    ///   quantity, since the filled portion is already settled as a separate
+    ///   completed order and re-sending the full total would double-fill.
+    ///
+    /// `price`, `spread`, `reduce_only` carry the same meaning as
+    /// `create_order`. `price = None` (market/IOC) is only meaningful for
+    /// cancel-replace venues; native-amend venues that cannot retarget the
+    /// time-in-force of a resting order should reject `None` so the caller
+    /// falls back to cancel+reissue.
+    ///
+    /// On success returns a [`CreateOrderResponse`]. For native-amend venues
+    /// the `order_id` is unchanged (the order keeps its identity); for
+    /// cancel-replace venues it is the new order's id. Default impl returns
+    /// `DexError::Permanent` so this is opt-in per connector — callers MUST
+    /// fall back to the legacy cancel+reissue path on any error, which keeps
+    /// the bot-strategy#470 over-fill cap as the backstop.
+    #[allow(clippy::too_many_arguments)] // mirrors create_order's param shape plus the two amend sizes.
+    async fn modify_order(
+        &self,
+        _symbol: &str,
+        _order_id: &str,
+        _side: OrderSide,
+        _target_total_size: Decimal,
+        _open_remaining_size: Decimal,
+        _price: Option<Decimal>,
+        _spread: Option<i64>,
+        _reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        Err(DexError::Permanent(
+            "modify_order not implemented for this connector".into(),
+        ))
+    }
+
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
 
     async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError>;
