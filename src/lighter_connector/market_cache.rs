@@ -7,7 +7,6 @@
 //! plus `MARKET_CACHE_INIT_LOCK` guard ensure a single fetch per process
 //! lifetime even under concurrent constructor calls. See bot-strategy#135.
 
-use super::models::LighterExchangeStats;
 use super::{
     LighterConnector, DEFAULT_PRICE_DECIMALS, DEFAULT_SIZE_DECIMALS, MAX_DECIMAL_PRECISION,
 };
@@ -15,7 +14,7 @@ use crate::dex_request::DexError;
 use rust_decimal::{prelude::FromStr, Decimal};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
@@ -41,17 +40,6 @@ pub(super) static MARKET_CACHE: std::sync::LazyLock<Arc<RwLock<MarketCache>>> =
 
 pub(super) static MARKET_CACHE_INIT_LOCK: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
-
-/// Process-wide cache for the `/exchange-stats` ticker helper. Same
-/// reasoning as `MARKET_CACHE`: the data is global exchange state, not
-/// per-account, so all instances share one copy. Without this, each
-/// instance's first `get_ticker` call misses its own cache and fires a
-/// REST, producing an N-way burst at startup. See bot-strategy#135
-/// follow-up.
-type CachedExchangeStats = Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>;
-
-pub(super) static CACHED_EXCHANGE_STATS: std::sync::LazyLock<CachedExchangeStats> =
-    std::sync::LazyLock::new(|| Arc::new(RwLock::new(None)));
 
 impl LighterConnector {
     pub(super) async fn refresh_market_cache(&self) -> Result<(), DexError> {

@@ -160,11 +160,10 @@ use maintenance::{
 };
 #[cfg(test)]
 use market_cache::MarketInfo;
-use market_cache::{MarketCache, CACHED_EXCHANGE_STATS, MARKET_CACHE, MARKET_CACHE_INIT_LOCK};
+use market_cache::{MarketCache, MARKET_CACHE, MARKET_CACHE_INIT_LOCK};
 use models::{
-    ApiKeyResponse, LighterAccountResponse, LighterExchangeStats, LighterFundingRates,
-    LighterOrderBookCacheEntry, LighterOrderBookDetailsResponse, LighterOrderBooksResponse,
-    LighterTradesResponse,
+    ApiKeyResponse, LighterAccountResponse, LighterFundingRates, LighterOrderBookCacheEntry,
+    LighterOrderBookDetailsResponse, LighterOrderBooksResponse, LighterTradesResponse,
 };
 use outage_detector::{OutageDetector, OutageSignal, OutageTransition};
 use parsing::{
@@ -251,8 +250,6 @@ pub struct LighterConnector {
     nonce_cache: Arc<tokio::sync::Mutex<Option<NonceCache>>>,
     nonce_cache_ttl: Duration,
     ob_stale_after: Duration,
-    // Cached exchange stats to reduce REST API calls
-    cached_exchange_stats: Arc<RwLock<Option<(LighterExchangeStats, Instant)>>>,
     // Per-market funding rate fed by the `market_stats/{market_id}` WS channel
     // (bot-strategy#162). Key: market_id. Value: the `funding_rate` field of
     // the WS payload (the rate at the most recent funding settlement — same
@@ -729,7 +726,6 @@ impl LighterConnector {
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
-            cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
             funding_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
@@ -789,7 +785,6 @@ impl LighterConnector {
             nonce_cache: Arc::new(tokio::sync::Mutex::new(None)),
             nonce_cache_ttl: Duration::from_secs(30),
             ob_stale_after: Duration::from_secs(ob_stale_secs),
-            cached_exchange_stats: Arc::clone(&CACHED_EXCHANGE_STATS),
             funding_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
@@ -1338,12 +1333,6 @@ impl DexConnector for LighterConnector {
         let canonical_symbol = market_info.canonical_symbol.clone();
         let min_order = market_info.min_order;
 
-        // exchangeStats is dead data — populates TickerResponse.volume /
-        // num_trades which no downstream consumer (pairtrade, slow-mm) reads.
-        // Skipping the REST removes one mainnet GET per get_ticker miss and
-        // cuts a chunk of the periodic 429 trigger. See bot-strategy#128
-        // follow-up.
-        let stats_data: Option<LighterExchangeStats> = None;
         // Funding rate is fed by the `market_stats/{market_id}` WS channel
         // (bot-strategy#162). Cold-start before the first WS push returns None,
         // matching the prior REST error-path fallback. The switch also moves
@@ -1382,30 +1371,15 @@ impl DexConnector for LighterConnector {
             } else {
                 let min_tick = calculate_min_tick(ws_price, market_info.price_decimals, false);
 
-                let (volume, num_trades) = if let Some(stats) = &stats_data {
-                    if let Some(market_stats) = stats
-                        .order_book_stats
-                        .iter()
-                        .find(|s| normalize_symbol(&s.symbol) == canonical_symbol)
-                    {
-                        (
-                            Some(
-                                Decimal::from_f64_retain(market_stats.daily_base_token_volume)
-                                    .unwrap_or(Decimal::ZERO),
-                            ),
-                            Some(market_stats.daily_trades_count as u64),
-                        )
-                    } else {
-                        (Some(Decimal::ZERO), None)
-                    }
-                } else {
-                    (Some(Decimal::ZERO), None)
-                };
+                // exchangeStats was dead data — volume / num_trades have no
+                // downstream consumer (pairtrade, slow-mm). The WS-price path
+                // reports volume=0 / num_trades=None. See bot-strategy#128.
+                let (volume, num_trades) = (Some(Decimal::ZERO), None);
 
                 let funding_rate = funding_rate_from_ws;
 
                 log::trace!(
-                    "Using WebSocket price with API stats: price={}, volume={:?}, trades={:?}",
+                    "Using WebSocket price: price={}, volume={:?}, trades={:?}",
                     ws_price,
                     volume,
                     num_trades
@@ -1457,42 +1431,16 @@ impl DexConnector for LighterConnector {
         // Funding rate comes from the WS cache populated by market_stats.
         let funding_rate = funding_rate_from_ws;
 
-        // Use stats data if available, otherwise fallback to trades data
-        let (volume, num_trades) = if let Some(stats) = &stats_data {
-            if let Some(market_stats) = stats
-                .order_book_stats
-                .iter()
-                .find(|s| normalize_symbol(&s.symbol) == canonical_symbol)
-            {
-                (
-                    Some(
-                        Decimal::from_f64_retain(market_stats.daily_base_token_volume)
-                            .unwrap_or(Decimal::ZERO),
-                    ),
-                    Some(market_stats.daily_trades_count as u64),
-                )
-            } else {
-                // Fallback to trades data
-                let volume = trades_response
-                    .trades
-                    .iter()
-                    .map(|trade| string_to_decimal(Some(trade.size.clone())))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .iter()
-                    .sum();
-                (Some(volume), Some(trades_response.trades.len() as u64))
-            }
-        } else {
-            // Fallback to trades data
-            let volume = trades_response
-                .trades
-                .iter()
-                .map(|trade| string_to_decimal(Some(trade.size.clone())))
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .sum();
-            (Some(volume), Some(trades_response.trades.len() as u64))
-        };
+        // exchangeStats was dead data (bot-strategy#128); volume / num_trades
+        // are derived from the recentTrades response only.
+        let volume = trades_response
+            .trades
+            .iter()
+            .map(|trade| string_to_decimal(Some(trade.size.clone())))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .sum();
+        let (volume, num_trades) = (Some(volume), Some(trades_response.trades.len() as u64));
 
         Ok(TickerResponse {
             symbol: symbol.to_string(),
@@ -3019,19 +2967,6 @@ impl DexConnector for LighterConnector {
 }
 
 impl LighterConnector {
-    /// TTL for cached exchange stats / funding rates.
-    // Funding rates are paid every 8h on Lighter and the entry gate uses a
-    // very loose threshold (-0.01/hour in prod, with funding_entry_z_scale=0
-    // so the value never modulates entry threshold). The data is effectively
-    // a soft signal where 6h staleness is indistinguishable from 1h. The
-    // hourly fetch was the periodic trigger of the host-shared Lighter rate
-    // limit cooldown observed 2026-04-22 18:33 UTC: a single isolated GET to
-    // /funding-rates returned 429 and engaged the global cooldown for 103s,
-    // pausing all REST including order placement. Drop the call cadence 6x
-    // by raising TTL from 1h to 6h. See bot-strategy#128 follow-up and
-    // bot-strategy#161.
-    const STATS_CACHE_TTL_SECS: u64 = 21_600;
-
     /// TTL for the cached `/account` equity snapshot.
     ///
     /// Lighter's WS `account_all` does not publish `total_asset_value` for
@@ -3099,35 +3034,6 @@ impl LighterConnector {
                 })
             })
         }
-    }
-
-    #[allow(dead_code)]
-    async fn get_exchange_stats_cached(&self) -> Result<LighterExchangeStats, DexError> {
-        {
-            let cache = self.cached_exchange_stats.read().await;
-            if let Some((stats, ts)) = &*cache {
-                if ts.elapsed() < Duration::from_secs(Self::STATS_CACHE_TTL_SECS) {
-                    return Ok(stats.clone());
-                }
-            }
-        }
-        let stats = self.get_exchange_stats().await?;
-        {
-            let mut cache = self.cached_exchange_stats.write().await;
-            *cache = Some((stats.clone(), Instant::now()));
-        }
-        Ok(stats)
-    }
-
-    #[allow(dead_code)]
-    async fn get_exchange_stats(&self) -> Result<LighterExchangeStats, DexError> {
-        let url = format!("{}/api/v1/exchangeStats", self.base_url);
-        let response_text = self
-            .fetch_text_with_waf_guard(&url, "exchangeStats")
-            .await?;
-        log::trace!("Exchange stats response: {}", response_text);
-        serde_json::from_str(&response_text)
-            .map_err(|e| DexError::Transient(format!("Failed to parse exchange stats: {}", e)))
     }
 
     async fn get_order_book_details(&self) -> Result<LighterOrderBookDetailsResponse, DexError> {
