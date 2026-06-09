@@ -60,6 +60,25 @@ extern "C" {
         account_index: c_longlong,
     ) -> SignedTxResponse;
 
+    // Native L2 in-place amend (tx type 17). `base_amount` / `trigger_price`
+    // of 0 mean "leave unchanged" (NilOrderBaseAmount / NilOrderTriggerPrice
+    // on the Go side); `price` is the new scaled u32 price widened to a
+    // long. Integrator fee args are unused (0). See bot-strategy#471.
+    pub fn SignModifyOrder(
+        market_index: c_int,
+        order_index: c_longlong,
+        base_amount: c_longlong,
+        price: c_longlong,
+        trigger_price: c_longlong,
+        integrator_account_index: c_longlong,
+        integrator_taker_fee: c_int,
+        integrator_maker_fee: c_int,
+        skip_nonce: u8,
+        nonce: c_longlong,
+        api_key_index: c_int,
+        account_index: c_longlong,
+    ) -> SignedTxResponse;
+
     pub fn SignChangePubKey(
         new_pubkey: *const c_char,
         nonce: c_longlong,

@@ -470,6 +470,27 @@ impl LighterConnector {
         );
     }
 
+    /// Update the cached price of an order after a native in-place modify
+    /// (bot-strategy#471). The order keeps its identity (`order_id`), so we
+    /// reprice the existing tracked entry rather than add a duplicate. A
+    /// missing entry is a no-op — the WS order feed reconciles tracking
+    /// authoritatively on the next update.
+    pub(super) async fn update_order_tracking_after_modify(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        new_price: Decimal,
+    ) {
+        let mut orders_guard = self.cached_open_orders.write().await;
+        if let Some(orders) = orders_guard.get_mut(symbol) {
+            for order in orders.iter_mut() {
+                if order.order_id == order_id {
+                    order.price = new_price;
+                }
+            }
+        }
+    }
+
     /// Update order tracking after order cancellation
     #[allow(dead_code)]
     pub(super) async fn update_order_tracking_after_cancel(&self, symbol: &str, order_id: &str) {

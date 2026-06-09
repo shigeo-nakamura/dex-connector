@@ -1056,7 +1056,7 @@ impl DexConnector for ExtendedConnector {
         // never sitting as a maker.
         if price.is_none() {
             return self
-                .submit_taker_ioc(symbol, size, side, 0, reduce_only)
+                .submit_taker_ioc(symbol, size, side, 0, reduce_only, None)
                 .await;
         }
         let post_only = matches!(spread, Some(-2));
@@ -1069,6 +1069,56 @@ impl DexConnector for ExtendedConnector {
             expiry_secs,
             post_only,
             false,
+            None,
+        )
+        .await
+    }
+
+    /// bot-strategy#471: amend an open order by atomic cancel-replace.
+    /// Extended has no in-place modify; instead `POST /user/order` with a
+    /// `cancel_id` cancels the referenced order and places the new one in a
+    /// single server-acked request, eliminating the partial-fill reissue
+    /// race that the bot-strategy#470 cap currently papers over. The new
+    /// order carries `open_remaining_size` (the unfilled remainder the caller
+    /// computed) — NOT the total — because the already-filled portion is a
+    /// separate, already-settled order; re-sending the full total would
+    /// double-fill. `target_total_size` is unused here (it is the
+    /// native-amend venues' parameter). Queue priority is not preserved (new
+    /// id + Stark signature).
+    async fn modify_order(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        side: OrderSide,
+        _target_total_size: Decimal,
+        open_remaining_size: Decimal,
+        price: Option<Decimal>,
+        spread: Option<i64>,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        if price.is_none() {
+            return self
+                .submit_taker_ioc(
+                    symbol,
+                    open_remaining_size,
+                    side,
+                    0,
+                    reduce_only,
+                    Some(order_id.to_string()),
+                )
+                .await;
+        }
+        let post_only = matches!(spread, Some(-2));
+        self.create_order_internal(
+            symbol,
+            open_remaining_size,
+            side,
+            price,
+            reduce_only,
+            None,
+            post_only,
+            false,
+            Some(order_id.to_string()),
         )
         .await
     }
@@ -1087,7 +1137,7 @@ impl DexConnector for ExtendedConnector {
         slippage_bps: u32,
         reduce_only: bool,
     ) -> Result<CreateOrderResponse, DexError> {
-        self.submit_taker_ioc(symbol, size, side, slippage_bps, reduce_only)
+        self.submit_taker_ioc(symbol, size, side, slippage_bps, reduce_only, None)
             .await
     }
 

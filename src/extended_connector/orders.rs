@@ -237,6 +237,7 @@ impl ExtendedConnector {
     // public order params. A struct refactor would obscure the recursion site
     // for no real readability win.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // mirrors the public order-param shape; the trailing cancel_id enables atomic cancel-replace (bot-strategy#471).
     pub(super) async fn create_order_internal(
         &self,
         symbol: &str,
@@ -247,6 +248,7 @@ impl ExtendedConnector {
         expiry_secs: Option<u64>,
         post_only: bool,
         refreshed: bool,
+        cancel_id: Option<String>,
     ) -> Result<CreateOrderResponse, DexError> {
         let mut refreshed_once = refreshed;
         let mut fallback_price: Option<Decimal> = None;
@@ -271,6 +273,7 @@ impl ExtendedConnector {
                     reduce_only,
                     expiry_secs,
                     post_only,
+                    cancel_id.clone(),
                 )
                 .await
             {
@@ -327,6 +330,7 @@ impl ExtendedConnector {
         reduce_only: bool,
         expiry_secs: Option<u64>,
         post_only: bool,
+        cancel_id: Option<String>,
     ) -> Result<CreateOrderResponse, DexError> {
         let expire_time = match expiry_secs {
             Some(secs) => Utc::now() + Duration::seconds(secs as i64),
@@ -389,7 +393,12 @@ impl ExtendedConnector {
             fee: settlement.fee_rate,
             self_trade_protection_level: "ACCOUNT".to_string(),
             nonce: Decimal::from(nonce),
-            cancel_id: None,
+            // bot-strategy#471: when set, Extended atomically cancels the
+            // referenced order in the same request before placing this one,
+            // collapsing the cancel+reissue race window into one server-acked
+            // op. The replaced order keeps no queue priority (new id + Stark
+            // sig) but the fill race is eliminated.
+            cancel_id,
             settlement: Some(settlement.settlement),
             tp_sl_type: None,
             take_profit: None,
@@ -433,6 +442,7 @@ impl ExtendedConnector {
         side: OrderSide,
         slippage_bps: u32,
         reduce_only: bool,
+        cancel_id: Option<String>,
     ) -> Result<CreateOrderResponse, DexError> {
         let market = self.get_market(symbol).await?;
         let side_str = match side {
@@ -507,7 +517,9 @@ impl ExtendedConnector {
             fee: settlement.fee_rate,
             self_trade_protection_level: "ACCOUNT".to_string(),
             nonce: Decimal::from(nonce),
-            cancel_id: None,
+            // bot-strategy#471: atomic cancel-replace when amending on the
+            // IOC/taker takeover path.
+            cancel_id,
             settlement: Some(settlement.settlement),
             tp_sl_type: None,
             take_profit: None,

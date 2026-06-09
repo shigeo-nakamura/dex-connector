@@ -2391,6 +2391,144 @@ impl DexConnector for LighterConnector {
         result
     }
 
+    async fn modify_order(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        _side: OrderSide,
+        target_total_size: Decimal,
+        _open_remaining_size: Decimal,
+        price: Option<Decimal>,
+        _spread: Option<i64>,
+        _reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        // L2ModifyOrder cannot retarget time-in-force (the modify tx carries
+        // no TIF field), so it can only reprice a resting order — it cannot
+        // turn a passive maker into a taker. Callers that want market/IOC
+        // takeover must fall back to cancel+reissue. `side` / `reduce_only`
+        // are immutable properties of the existing order and are ignored
+        // here; `open_remaining_size` is unused for Lighter because the
+        // engine re-derives the open remainder from `base_amount - filled`.
+        let new_price = price.ok_or_else(|| {
+            DexError::Permanent(
+                "Lighter modify_order requires a limit price (cannot retarget TIF to market)"
+                    .to_string(),
+            )
+        })?;
+
+        let market_info = self.resolve_market_info(symbol).await?;
+        let market_id = market_info.market_id;
+        let price_decimals = market_info.price_decimals;
+        let size_decimals = market_info.size_decimals;
+
+        let order_index = parse_cancel_order_index(order_id).ok_or_else(|| {
+            DexError::InvalidInput {
+                field: "order_id".to_string(),
+                value: order_id.to_string(),
+            }
+        })?;
+
+        // Re-assert the order's *total* base amount. Because this equals the
+        // value originally sent to `create_order`, the matching engine keeps
+        // the already-filled portion immutable and re-opens only the unfilled
+        // remainder — no double-fill is possible (bot-strategy#471 / #470).
+        let total_abs = target_total_size.abs();
+        let mut base_amount = scale_decimal_to_u64(
+            total_abs,
+            size_decimals,
+            RoundingStrategy::ToZero,
+            "base amount",
+        )?;
+        if base_amount == 0 && total_abs > Decimal::ZERO {
+            base_amount = 1;
+        }
+
+        // Honour any positive tick adjustment carried on `spread`; the TIF
+        // output is irrelevant to a modify (only the price changes).
+        let tick_decimals = price_decimals.min(MAX_DECIMAL_PRECISION);
+        let tick_size = Decimal::new(1, tick_decimals);
+        let (final_price, _tif) =
+            resolve_spread_to_tif_and_price(new_price, _spread, tick_size, TIF_GTT);
+        let price_u32 = scale_decimal_to_u32(
+            final_price,
+            price_decimals,
+            RoundingStrategy::MidpointAwayFromZero,
+            "price",
+        )?;
+
+        let nonce = self.get_nonce().await? as i64;
+        let tx_json = self
+            .call_go_sign_modify_order(
+                market_id as i32,
+                order_index,
+                base_amount as i64,
+                u64::from(price_u32) as i64,
+                0, // trigger_price unchanged (NilOrderTriggerPrice)
+                nonce,
+            )
+            .await?;
+
+        let form_data = format!(
+            "tx_type=17&tx_info={}&price_protection=false",
+            urlencoding::encode(&tx_json)
+        );
+
+        track_api_call("POST /api/v1/sendTx (modify_order)", "POST");
+
+        // Amend is on the order-management path — wait for budget rather than
+        // drop it, matching create/cancel.
+        self.acquire_rest_budget(
+            "/api/v1/sendTx",
+            crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 5_000 },
+        )
+        .await?;
+
+        let response = self
+            .client
+            .post(format!("{}/api/v1/sendTx", self.base_url))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_data)
+            .send()
+            .await
+            .map_err(|e| DexError::Transient(format!("HTTP request failed: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
+
+        if !status.is_success() {
+            self.invalidate_nonce_cache().await;
+            return Err(DexError::Transient(format!(
+                "Modify order failed: HTTP {}, {}",
+                status, response_text
+            )));
+        }
+
+        let ordered_price = Decimal::new(i64::from(price_u32), price_decimals);
+        // The order keeps its identity (same order_id) — update the tracked
+        // price in place rather than adding a duplicate entry.
+        self.update_order_tracking_after_modify(symbol, order_id, ordered_price)
+            .await;
+
+        log::info!(
+            "[MODIFY_ORDER] Repriced order {} for {} to {} (base_amount={})",
+            order_id,
+            symbol,
+            ordered_price,
+            base_amount,
+        );
+
+        Ok(CreateOrderResponse {
+            order_id: order_id.to_string(),
+            exchange_order_id: None,
+            ordered_price,
+            ordered_size: total_abs,
+            client_order_id: None,
+        })
+    }
+
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
         let market_info = self.resolve_market_info(symbol).await?;
 
