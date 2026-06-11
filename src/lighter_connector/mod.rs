@@ -153,6 +153,7 @@ mod outage_detector;
 mod parsing;
 mod rest;
 mod signing;
+mod ticker;
 mod ws;
 use ffi::{parse_signed_tx_response, CheckClient, CreateClient, SignChangePubKey};
 pub use ffi::{SignedTxResponse, StrOrErr};
