@@ -25,7 +25,7 @@ use tokio::sync::RwLock;
 
 use super::models::LighterNonceResponse;
 use super::order_payload;
-use super::parsing::ten_pow;
+use super::parsing::{parse_cancel_order_index, ten_pow};
 use super::rest::track_api_call;
 use super::{
     normalize_symbol, LighterConnector, NonceCache, DEFAULT_PRICE_DECIMALS, DEFAULT_SIZE_DECIMALS,
@@ -531,6 +531,173 @@ impl LighterConnector {
                     );
                 }
             }
+        }
+    }
+}
+
+/// Order-cancellation helpers backing the `DexConnector` cancel trait
+/// methods. Extracted from `dex_impl.rs` (bot-strategy#501 item 1):
+/// `cancel_order` / `cancel_all_orders` / `cancel_orders` now delegate into
+/// these. Bodies are unchanged from the prior in-`dex_impl.rs`
+/// implementations except that the `cancel_all`/`cancel_orders` fan-out now
+/// calls `do_cancel_order` directly instead of routing back through the
+/// trait method.
+impl LighterConnector {
+    pub(super) async fn do_cancel_order(
+        &self,
+        symbol: &str,
+        order_id: &str,
+    ) -> Result<(), DexError> {
+        let market_info = self.resolve_market_info(symbol).await?;
+
+        let order_index = match parse_cancel_order_index(order_id) {
+            Some(idx) => idx,
+            None => {
+                log::warn!(
+                    "[CANCEL_ORDER] Unable to derive numeric index from order_id '{}'. Skipping cancel request.",
+                    order_id
+                );
+                return Ok(());
+            }
+        };
+
+        let nonce = self.get_nonce().await? as i64;
+        let tx_json = self
+            .call_go_sign_cancel_order(market_info.market_id as i32, order_index, nonce)
+            .await?;
+
+        let form_data = format!(
+            "tx_type=15&tx_info={}&price_protection=false",
+            urlencoding::encode(&tx_json)
+        );
+
+        track_api_call("POST /api/v1/sendTx (cancel_order)", "POST");
+
+        // Cancel is on the risk-reduction path — wait for budget.
+        self.acquire_rest_budget(
+            "/api/v1/sendTx",
+            crate::lighter_ratelimit::AcquirePolicy::Wait { max_ms: 5_000 },
+        )
+        .await?;
+
+        let response = self
+            .client
+            .post(format!("{}/api/v1/sendTx", self.base_url))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_data)
+            .send()
+            .await
+            .map_err(|e| DexError::Transient(format!("HTTP request failed: {}", e)))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| DexError::Transient(format!("Failed to read response: {}", e)))?;
+
+        if !status.is_success() {
+            self.invalidate_nonce_cache().await;
+            return Err(DexError::Transient(format!(
+                "Cancel order failed: HTTP {}, {}",
+                status, response_text
+            )));
+        }
+
+        self.update_order_tracking_after_cancel(symbol, order_id)
+            .await;
+
+        log::info!(
+            "[CANCEL_ORDER] Successfully cancelled order {} for {}",
+            order_id,
+            symbol
+        );
+
+        Ok(())
+    }
+
+    pub(super) async fn do_cancel_all_orders(
+        &self,
+        symbol: Option<String>,
+    ) -> Result<(), DexError> {
+        let targets: Vec<(String, Vec<String>)> = {
+            let orders_guard = self.cached_open_orders.read().await;
+            match symbol {
+                Some(sym) => {
+                    let ids = orders_guard
+                        .get(&sym)
+                        .map(|orders| orders.iter().map(|o| o.order_id.clone()).collect())
+                        .unwrap_or_default();
+                    vec![(sym, ids)]
+                }
+                None => orders_guard
+                    .iter()
+                    .map(|(sym, orders)| {
+                        (
+                            sym.clone(),
+                            orders.iter().map(|o| o.order_id.clone()).collect(),
+                        )
+                    })
+                    .collect(),
+            }
+        };
+
+        let mut last_err: Option<DexError> = None;
+        for (sym, ids) in targets {
+            for order_id in ids {
+                if let Err(e) = self.do_cancel_order(&sym, &order_id).await {
+                    log::error!(
+                        "[CANCEL_ORDER] Failed to cancel order {} for {}: {}",
+                        order_id,
+                        sym,
+                        e
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) async fn do_cancel_orders(
+        &self,
+        symbol: Option<String>,
+        order_ids: Vec<String>,
+    ) -> Result<(), DexError> {
+        let symbol = match symbol {
+            Some(sym) => sym,
+            None => {
+                return Err(DexError::Transient(
+                    "cancel_orders requires a symbol on Lighter".to_string(),
+                ))
+            }
+        };
+
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut last_err: Option<DexError> = None;
+        for order_id in order_ids {
+            if let Err(e) = self.do_cancel_order(&symbol, &order_id).await {
+                log::error!(
+                    "[CANCEL_ORDER] Failed to cancel order {} for {}: {}",
+                    order_id,
+                    symbol,
+                    e
+                );
+                last_err = Some(e);
+            }
+        }
+
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(())
         }
     }
 }
