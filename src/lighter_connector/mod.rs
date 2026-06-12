@@ -233,7 +233,6 @@ pub struct LighterConnector {
     maintenance_refresher_started: Arc<AtomicBool>,
     // WebSocket data storage
     current_price: Arc<RwLock<HashMap<String, (Decimal, u64)>>>, // symbol -> (price, timestamp)
-    current_volume: Arc<RwLock<Option<Decimal>>>,
     order_book: Arc<RwLock<HashMap<u32, LighterOrderBookCacheEntry>>>,
     maintenance: Arc<RwLock<MaintenanceInfo>>,
     outage_detector: Arc<std::sync::Mutex<OutageDetector>>,

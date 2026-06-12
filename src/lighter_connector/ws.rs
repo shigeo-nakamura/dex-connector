@@ -8,7 +8,7 @@
 //! - The dispatch helpers `handle_websocket_message`,
 //!   `handle_market_stats_update`, and `handle_account_update` that
 //!   classify each incoming frame and update the relevant shared cache
-//!   (price / volume / order book / fills / cancels / positions /
+//!   (price / order book / fills / cancels / positions /
 //!   balance / funding).
 //! - The `OutboundMessage` priority enum used to gate Pong/Close ahead
 //!   of any other write traffic on the WS sink.
@@ -122,7 +122,6 @@ impl LighterConnector {
 
         // Clone necessary data for the WebSocket task
         let current_price = self.current_price.clone();
-        let current_volume = self.current_volume.clone();
         let order_book = self.order_book.clone();
         let filled_orders = self.filled_orders.clone();
         let canceled_orders = self.canceled_orders.clone();
@@ -694,7 +693,6 @@ impl LighterConnector {
                                             Self::handle_websocket_message(
                                                 parsed,
                                                 &current_price,
-                                                &current_volume,
                                                 &order_book,
                                                 &filled_orders,
                                                 &canceled_orders,
@@ -1055,7 +1053,6 @@ impl LighterConnector {
     pub(super) async fn handle_websocket_message(
         message: Value,
         current_price: &Arc<RwLock<HashMap<String, (Decimal, u64)>>>,
-        current_volume: &Arc<RwLock<Option<Decimal>>>,
         order_book: &Arc<RwLock<HashMap<u32, LighterOrderBookCacheEntry>>>,
         filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
         canceled_orders: &Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
@@ -1213,16 +1210,6 @@ impl LighterConnector {
                                 );
                             }
                         }
-
-                        // Calculate volume from order book
-                        let total_volume: Decimal = ob
-                            .bids
-                            .iter()
-                            .chain(ob.asks.iter())
-                            .filter_map(|entry| string_to_decimal(Some(entry.size.clone())).ok())
-                            .sum();
-                        *current_volume.write().await = Some(total_volume);
-
                         if let Some(market_id) = market_id {
                             {
                                 let mut ob_guard = order_book.write().await;
