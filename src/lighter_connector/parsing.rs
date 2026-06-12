@@ -12,6 +12,30 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::Value;
 
+/// Normalize spot/perp symbols into the canonical Lighter cache key.
+pub(super) fn normalize_symbol(symbol: &str) -> String {
+    let upper = symbol.trim().to_ascii_uppercase();
+
+    // Spot symbols contain "/" (e.g. "LIT/USDC") — preserve as-is.
+    if upper.contains('/') {
+        return upper;
+    }
+
+    // Perp symbols: strip common suffixes to get canonical name.
+    let mut normalized = upper
+        .replace("-PERP", "")
+        .replace("_PERP", "")
+        .replace(".PERP", "")
+        .replace("-USD", "")
+        .replace("_USD", "")
+        .replace("-USDC", "")
+        .replace("_USDC", "");
+    if normalized.ends_with("-PERP") {
+        normalized = normalized.trim_end_matches("-PERP").to_string();
+    }
+    normalized
+}
+
 /// Recover the numeric `order_index` Lighter uses internally from one of
 /// the two order-id formats we surface: a plain numeric string, or a
 /// legacy `trigger-{ts}-{market}` style identifier (kept for backwards
