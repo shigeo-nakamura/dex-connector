@@ -614,6 +614,23 @@ impl DexConnector for LighterConnector {
         result
     }
 
+    /// Not implemented for Lighter: `create_order(price=None)` already
+    /// routes through the venue's native IOC + 20 % protection price, so
+    /// callers wanting taker semantics use that path instead. Explicit
+    /// `Permanent` rather than a trait default per bot-strategy#536.
+    async fn create_order_taker_ioc(
+        &self,
+        _symbol: &str,
+        _size: Decimal,
+        _side: OrderSide,
+        _slippage_bps: u32,
+        _reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        Err(DexError::Permanent(
+            "create_order_taker_ioc not implemented for this connector".into(),
+        ))
+    }
+
     async fn modify_order(
         &self,
         symbol: &str,

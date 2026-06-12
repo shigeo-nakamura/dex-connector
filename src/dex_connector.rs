@@ -42,6 +42,21 @@ pub fn slippage_price(price: Decimal, is_buy: bool) -> Decimal {
     }
 }
 
+/// Venue-agnostic connector surface.
+///
+/// **No silent-degradation defaults** (bot-strategy#536): every method is
+/// required, including the optional-by-capability ones
+/// (`create_order_taker_ioc`, `modify_order`, `subscribe_price_updates`).
+/// Connectors without venue support implement them as an explicit
+/// `Err(DexError::Permanent(...))`. This keeps the failure mode a compile
+/// error instead of a runtime "not implemented": wrapper types that hold a
+/// `Box<dyn DexConnector>` (pairtrade / xvenue-arb `DexConnectorBox`) MUST
+/// forward every method, and historically a missing forward silently
+/// downgraded the feature to the old trait default.
+///
+/// The only default left is `maintenance_status`, which is *derived* from
+/// `is_upcoming_maintenance` by design — overriding is optional and a
+/// non-forwarding wrapper still produces correct (if less detailed) output.
 #[async_trait]
 #[allow(clippy::too_many_arguments)] // trait IS the public API; signatures are stable.
 pub trait DexConnector: Send + Sync {
@@ -141,21 +156,19 @@ pub trait DexConnector: Send + Sync {
     ///   `time_in_force=IOC` so the venue terminates the order on first
     ///   match (filled or zero-fill cancel) within ~ms.
     ///
-    /// Default impl returns `DexError::Permanent(...)` so this is opt-in
-    /// per connector. bot-strategy#302 — Extended impl reuses the IOC
-    /// path that `close_all_positions` already exercises.
+    /// Connectors without a native IOC path must implement this as an
+    /// explicit `Err(DexError::Permanent(...))` (no trait default — see
+    /// trait-level docs / bot-strategy#536). bot-strategy#302 — Extended
+    /// impl reuses the IOC path that `close_all_positions` already
+    /// exercises.
     async fn create_order_taker_ioc(
         &self,
-        _symbol: &str,
-        _size: Decimal,
-        _side: OrderSide,
-        _slippage_bps: u32,
-        _reduce_only: bool,
-    ) -> Result<CreateOrderResponse, DexError> {
-        Err(DexError::Permanent(
-            "create_order_taker_ioc not implemented for this connector".into(),
-        ))
-    }
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        slippage_bps: u32,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError>;
 
     /// Atomically amend an already-open order's remaining quantity and/or
     /// price without a separate cancel + create round-trip, eliminating the
@@ -191,26 +204,23 @@ pub trait DexConnector: Send + Sync {
     ///
     /// On success returns a [`CreateOrderResponse`]. For native-amend venues
     /// the `order_id` is unchanged (the order keeps its identity); for
-    /// cancel-replace venues it is the new order's id. Default impl returns
-    /// `DexError::Permanent` so this is opt-in per connector — callers MUST
-    /// fall back to the legacy cancel+reissue path on any error, which keeps
-    /// the bot-strategy#470 over-fill cap as the backstop.
+    /// cancel-replace venues it is the new order's id. Connectors without an
+    /// amend primitive must implement this as an explicit
+    /// `Err(DexError::Permanent(...))` (no trait default — bot-strategy#536);
+    /// callers MUST fall back to the legacy cancel+reissue path on any error,
+    /// which keeps the bot-strategy#470 over-fill cap as the backstop.
     #[allow(clippy::too_many_arguments)] // mirrors create_order's param shape plus the two amend sizes.
     async fn modify_order(
         &self,
-        _symbol: &str,
-        _order_id: &str,
-        _side: OrderSide,
-        _target_total_size: Decimal,
-        _open_remaining_size: Decimal,
-        _price: Option<Decimal>,
-        _spread: Option<i64>,
-        _reduce_only: bool,
-    ) -> Result<CreateOrderResponse, DexError> {
-        Err(DexError::Permanent(
-            "modify_order not implemented for this connector".into(),
-        ))
-    }
+        symbol: &str,
+        order_id: &str,
+        side: OrderSide,
+        target_total_size: Decimal,
+        open_remaining_size: Decimal,
+        price: Option<Decimal>,
+        spread: Option<i64>,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError>;
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
 
@@ -242,12 +252,10 @@ pub trait DexConnector: Send + Sync {
 
     /// Subscribe to real-time price updates from WebSocket order book changes.
     /// Returns a broadcast receiver that yields PriceUpdate on each OB update.
-    /// Default implementation returns an error (unsupported).
+    /// Connectors without a push price feed must implement this as an
+    /// explicit `Err(DexError::Permanent(...))` (no trait default —
+    /// bot-strategy#536).
     fn subscribe_price_updates(
         &self,
-    ) -> Result<tokio::sync::broadcast::Receiver<PriceUpdate>, DexError> {
-        Err(DexError::Permanent(
-            "subscribe_price_updates not supported by this connector".to_string(),
-        ))
-    }
+    ) -> Result<tokio::sync::broadcast::Receiver<PriceUpdate>, DexError>;
 }

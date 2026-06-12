@@ -33,7 +33,12 @@ pub(super) fn track_api_call(endpoint: &str, method: &str) {
 
     // Clean old entries (older than 60 seconds)
     {
-        let mut tracker = API_CALL_TRACKER.lock().unwrap();
+        // Recover from poisoning instead of panicking: the tracker is
+        // monitoring-only state, and a panic here would take down every
+        // REST call path (bot-strategy#535).
+        let mut tracker = API_CALL_TRACKER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tracker.retain(|(time, _)| now.duration_since(*time) < Duration::from_secs(60));
         tracker.push((now, format!("{} {}", method, endpoint)));
 
