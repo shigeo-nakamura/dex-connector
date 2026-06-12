@@ -44,7 +44,13 @@ const WS_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn record_outage_failure(detector: &Arc<std::sync::Mutex<OutageDetector>>, signal: OutageSignal) {
     let transition = {
-        let mut detector = detector.lock().expect("outage detector poisoned");
+        // Recover from poisoning instead of panicking: detector state is a
+        // simple failure counter and stays consistent even if a holder
+        // panicked mid-update; crashing here would kill outage tracking on
+        // every WS/REST health signal (bot-strategy#535).
+        let mut detector = detector
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         detector.record_failure(signal, Instant::now())
     };
     if let Some(OutageTransition::Latched { reason }) = transition {
@@ -57,7 +63,10 @@ fn record_outage_failure(detector: &Arc<std::sync::Mutex<OutageDetector>>, signa
 
 fn record_outage_success(detector: &Arc<std::sync::Mutex<OutageDetector>>, signal: OutageSignal) {
     let transition = {
-        let mut detector = detector.lock().expect("outage detector poisoned");
+        // See record_outage_failure: poison-recover rather than panic.
+        let mut detector = detector
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         detector.record_success(signal, Instant::now())
     };
     if let Some(OutageTransition::Cleared { reason }) = transition {
