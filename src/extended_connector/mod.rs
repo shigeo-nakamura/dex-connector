@@ -1550,6 +1550,17 @@ impl DexConnector for ExtendedConnector {
             "sign_evm_65b_with_eip191 not supported for Extended".to_string(),
         ))
     }
+
+    /// Not supported for Extended: consumers poll `get_ticker` /
+    /// `get_order_book` instead. Explicit `Permanent` rather than a trait
+    /// default per bot-strategy#536.
+    fn subscribe_price_updates(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<crate::PriceUpdate>, DexError> {
+        Err(DexError::Permanent(
+            "subscribe_price_updates not supported by this connector".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
