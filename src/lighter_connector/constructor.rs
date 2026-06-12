@@ -46,7 +46,6 @@ impl LighterConnector {
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             maintenance_refresher_started: Arc::new(AtomicBool::new(false)),
             current_price: Arc::new(RwLock::new(HashMap::new())),
-            current_volume: Arc::new(RwLock::new(None)),
             order_book: Arc::new(RwLock::new(HashMap::new())),
             maintenance: Arc::new(RwLock::new(MaintenanceInfo {
                 next_start: None,
