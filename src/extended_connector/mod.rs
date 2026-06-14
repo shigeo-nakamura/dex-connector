@@ -227,10 +227,15 @@ impl ExtendedConnector {
     }
 
     async fn get_cached_order_book(&self, symbol: &str, depth: usize) -> Option<OrderBookSnapshot> {
-        let (bids_map, asks_map, updated_at) = {
+        let (bids_map, asks_map, updated_at, last_publish_ts_ms) = {
             let cache = self.order_book_cache.read().await;
             let entry = cache.get(symbol)?;
-            (entry.bids.clone(), entry.asks.clone(), entry.updated_at)
+            (
+                entry.bids.clone(),
+                entry.asks.clone(),
+                entry.updated_at,
+                entry.last_publish_ts_ms,
+            )
         };
         let age = updated_at.elapsed();
         if age > ORDERBOOK_STALE_AFTER {
@@ -261,7 +266,23 @@ impl ExtendedConnector {
                 size: *size,
             })
             .collect();
-        Some(OrderBookSnapshot { bids, asks })
+        // Prefer the exchange frame `ts`; fall back to local wall-clock at the
+        // last WS receive (now - cache age) when a frame lacked one. Never a
+        // REST serve time — this path is WS-only (bot-strategy#552).
+        let book_ts_ms = last_publish_ts_ms
+            .and_then(|ts| u64::try_from(ts).ok())
+            .or_else(|| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis() as u64;
+                now_ms.checked_sub(age.as_millis() as u64)
+            });
+        Some(OrderBookSnapshot {
+            bids,
+            asks,
+            book_ts_ms,
+        })
     }
 
     // `ws_tasks` mutex is held across `.get_market().await` etc. This runs
@@ -969,7 +990,13 @@ impl DexConnector for ExtendedConnector {
                     size: level.qty,
                 })
                 .collect::<Vec<_>>();
-            Ok(OrderBookSnapshot { bids, asks })
+            // REST fallback: no genuine feed age (do not pass off a REST serve
+            // time as freshness) — leave book_ts_ms None (bot-strategy#552).
+            Ok(OrderBookSnapshot {
+                bids,
+                asks,
+                book_ts_ms: None,
+            })
         }
     }
 

@@ -145,7 +145,12 @@ impl ExtendedConnector {
                 size: level.qty,
             })
             .collect::<Vec<_>>();
-        Ok(OrderBookSnapshot { bids, asks })
+        // REST path: no genuine WS feed age available (bot-strategy#552).
+        Ok(OrderBookSnapshot {
+            bids,
+            asks,
+            book_ts_ms: None,
+        })
     }
 
     pub(super) async fn choose_base_price(

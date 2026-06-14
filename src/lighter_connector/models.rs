@@ -26,6 +26,10 @@ pub(super) struct LighterOrderBook {
 pub(super) struct LighterOrderBookCacheEntry {
     pub(super) order_book: LighterOrderBook,
     pub(super) updated_at: Instant,
+    /// Book-update time in Unix ms: the exchange's `last_updated_at` when the
+    /// WS frame carries it, else local wall-clock at receive. Surfaced on
+    /// `OrderBookSnapshot::book_ts_ms` for feed-age watchdogs (bot-strategy#552).
+    pub(super) book_ts_ms: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
