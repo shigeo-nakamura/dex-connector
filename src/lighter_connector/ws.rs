@@ -1220,6 +1220,22 @@ impl LighterConnector {
                             }
                         }
                         if let Some(market_id) = market_id {
+                            // Book-update time: prefer the exchange `last_updated_at`
+                            // (µs since epoch, same field the price-update path uses)
+                            // so all bots observing this feed agree on book age;
+                            // fall back to local wall-clock at receive. Recomputed
+                            // here (outside the bid/ask block above) so delta frames
+                            // that touch only one side still advance book_ts_ms.
+                            let book_ts_ms = message
+                                .get("last_updated_at")
+                                .and_then(|v| v.as_u64())
+                                .map(|us| us / 1_000)
+                                .unwrap_or_else(|| {
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64
+                                });
                             {
                                 let mut ob_guard = order_book.write().await;
                                 // For delta updates, merge with existing cache:
@@ -1247,6 +1263,7 @@ impl LighterConnector {
                                     LighterOrderBookCacheEntry {
                                         order_book: merged_ob,
                                         updated_at: Instant::now(),
+                                        book_ts_ms,
                                     },
                                 );
                             }

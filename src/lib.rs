@@ -195,6 +195,17 @@ pub struct OrderBookLevel {
 pub struct OrderBookSnapshot {
     pub bids: Vec<OrderBookLevel>,
     pub asks: Vec<OrderBookLevel>,
+    /// Genuine per-venue book-update time in Unix milliseconds: the exchange's
+    /// own WS push time when the venue reports one (Lighter `last_updated_at`,
+    /// Extended frame `ts`), otherwise the connector's local wall-clock at the
+    /// last successful WS message receive.
+    ///
+    /// `None` when the book was served from a REST fallback: there is no
+    /// genuine feed age in that case, and a REST cache serve time must NOT be
+    /// passed off as feed freshness. Consumers use this as a positive
+    /// "this book is N ms old" staleness signal that complements count-based
+    /// frozen-book detection (bot-strategy#552 / #526).
+    pub book_ts_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

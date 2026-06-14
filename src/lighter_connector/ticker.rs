@@ -198,10 +198,10 @@ impl LighterConnector {
         depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
         let market_id = self.resolve_market_info(symbol).await?.market_id;
-        let (ob, updated_at) = {
+        let (ob, updated_at, book_ts_ms) = {
             let ob_guard = self.order_book.read().await;
             if let Some(entry) = ob_guard.get(&market_id) {
-                (entry.order_book.clone(), entry.updated_at)
+                (entry.order_book.clone(), entry.updated_at, entry.book_ts_ms)
             } else {
                 log::debug!(
                     "order book snapshot unavailable for {} (market_id={}, cached_entries={})",
@@ -243,6 +243,10 @@ impl LighterConnector {
             }
         }
         self.record_outage_success(OutageSignal::ReadMid);
-        Ok(OrderBookSnapshot { bids, asks })
+        Ok(OrderBookSnapshot {
+            bids,
+            asks,
+            book_ts_ms: Some(book_ts_ms),
+        })
     }
 }
