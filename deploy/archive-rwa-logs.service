@@ -1,0 +1,15 @@
+[Unit]
+# Daily mirror of the RWA Phase-0 logger dumps to S3 (bot-strategy#574).
+# Read-only collector backup; does NOT touch debot-pair-btceth.
+Description=Archive RWA logger dumps to S3 (bot-strategy#574)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rwa-logger/bin/archive-rwa-logs.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
