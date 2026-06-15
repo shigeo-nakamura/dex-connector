@@ -23,15 +23,19 @@
 //! `GET {base}/info/markets/{market}/trades?limit={n}` returns `data[].tT` in
 //! {TRADE, LIQUIDATION, DELEVERAGE}; anything other than "TRADE" is captured.
 //!
-//! Each new (non-normal) trade is de-duplicated by (venue, trade_id) against a
-//! bounded seen-set and appended as one JSONL line. Normal trades are dropped.
+//! Each new (non-normal) trade is de-duplicated by (venue, market, trade_id)
+//! against a bounded seen-set and appended as one JSONL line. Normal trades are
+//! dropped. The de-dup key includes the market because a venue may reuse a
+//! trade id across markets.
 //!
 //! ### Sampling caveat (logged, never silent)
 //! recent-trades is a sliding window, so on a very high-volume market a burst
 //! between two polls could push liquidations out of the window unseen. When a
-//! poll returns a full `limit` page AND none of those trades were already seen
-//! (i.e. the window fully turned over between polls), we WARN that liquidations
-//! may have been skipped — the resulting counts are then a lower bound. Lower
+//! poll returns a full `limit` page whose ids are FULLY DISJOINT from the
+//! previous poll's page for that market (i.e. the window turned over between
+//! polls), we WARN that liquidations may have been skipped — the resulting
+//! counts are then a lower bound. The check uses ALL page ids, not just
+//! liquidation rows, so it fires even on an all-normal-trade turnover. Lower
 //! `LIQ_POLL_SECS` / raise `LIQ_FETCH_LIMIT` if this fires often.
 //!
 //! ## Env vars
@@ -52,7 +56,7 @@
 //!   "type":"liquidation","side":"buy","price":..,"size":..,"usd":..,
 //!   "trade_ts_ms":..,"raw":{..}}`
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,15 +102,37 @@ struct LiqTrade {
     raw: Value,
 }
 
+/// Lighter trade id as a string (prefers the loss-free `trade_id_str`).
+fn lighter_id(t: &Value) -> String {
+    t.get("trade_id_str")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| t.get("trade_id").map(|v| v.to_string()))
+        .unwrap_or_default()
+}
+
+/// Extended trade id (`i`) as a string.
+fn extended_id(t: &Value) -> String {
+    t.get("i")
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
 /// Extract liquidation trades from a Lighter `recentTrades` body. Returns
-/// (liq_trades, total_rows_in_page). A row is a liquidation iff its `type` is
-/// present and not "trade".
-fn lighter_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, usize) {
+/// (liq_trades, ALL page trade ids). A row is a liquidation iff its `type` is
+/// present and not "trade". The full id list (incl. normal trades) feeds the
+/// window-turnover saturation check.
+fn lighter_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, Vec<String>) {
     let arr = body.get("trades").and_then(|t| t.as_array());
-    let rows = arr.map(|a| a.len()).unwrap_or(0);
     let mut out = Vec::new();
+    let mut page_ids = Vec::new();
     if let Some(a) = arr {
         for t in a {
+            let id = lighter_id(t);
+            page_ids.push(id.clone());
             let kind = t.get("type").and_then(|v| v.as_str()).unwrap_or("trade");
             if kind == "trade" {
                 continue;
@@ -116,12 +142,6 @@ fn lighter_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, usiz
                 .get("is_maker_ask")
                 .and_then(|v| v.as_bool())
                 .map(|maker_ask| if maker_ask { "buy" } else { "sell" }.to_string());
-            let id = t
-                .get("trade_id_str")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| t.get("trade_id").map(|v| v.to_string()))
-                .unwrap_or_default();
             out.push(LiqTrade {
                 label: label.to_string(),
                 market: market.to_string(),
@@ -136,17 +156,20 @@ fn lighter_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, usiz
             });
         }
     }
-    (out, rows)
+    (out, page_ids)
 }
 
-/// Extract liquidation trades from an Extended `trades` body. A row is a
-/// liquidation iff its `tT` is present and not "TRADE".
-fn extended_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, usize) {
+/// Extract liquidation trades from an Extended `trades` body. Returns
+/// (liq_trades, ALL page trade ids). A row is a liquidation iff its `tT` is
+/// present and not "TRADE".
+fn extended_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, Vec<String>) {
     let arr = body.get("data").and_then(|d| d.as_array());
-    let rows = arr.map(|a| a.len()).unwrap_or(0);
     let mut out = Vec::new();
+    let mut page_ids = Vec::new();
     if let Some(a) = arr {
         for t in a {
+            let id = extended_id(t);
+            page_ids.push(id.clone());
             let tt = t.get("tT").and_then(|v| v.as_str()).unwrap_or("TRADE");
             if tt == "TRADE" {
                 continue;
@@ -155,13 +178,6 @@ fn extended_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, usi
                 .get("S")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_lowercase());
-            let id = t
-                .get("i")
-                .map(|v| match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default();
             out.push(LiqTrade {
                 label: label.to_string(),
                 market: market.to_string(),
@@ -176,7 +192,7 @@ fn extended_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, usi
             });
         }
     }
-    (out, rows)
+    (out, page_ids)
 }
 
 /// Bounded de-dup set: remembers up to `cap` recent ids, evicting oldest first.
@@ -208,6 +224,7 @@ impl SeenRing {
         }
         true
     }
+    #[cfg(test)]
     fn contains(&self, id: &str) -> bool {
         self.set.contains(id)
     }
@@ -279,6 +296,9 @@ fn main() {
 
     let mut lighter_seen = SeenRing::new(seen_cap);
     let mut extended_seen = SeenRing::new(seen_cap);
+    // Previous poll's full page id set, per market, for the turnover check.
+    let mut lighter_prev: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut extended_prev: HashMap<String, HashSet<String>> = HashMap::new();
     let mut total_liq: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
@@ -304,14 +324,16 @@ fn main() {
                     match resp.json::<Value>() {
                         Ok(body) if status.is_success() => {
                             lighter_ok += 1;
-                            let (liqs, rows) = lighter_liqs(&body, label, market_id);
+                            let (liqs, page_ids) = lighter_liqs(&body, label, market_id);
                             new_this_cycle += record(
                                 &log_dir,
                                 "lighter",
                                 &liqs,
-                                rows,
+                                &page_ids,
                                 lighter_limit,
                                 &mut lighter_seen,
+                                &mut lighter_prev,
+                                market_id,
                                 label,
                             );
                         }
@@ -342,14 +364,16 @@ fn main() {
                     match resp.json::<Value>() {
                         Ok(body) if status.is_success() => {
                             extended_ok += 1;
-                            let (liqs, rows) = extended_liqs(&body, label, market);
+                            let (liqs, page_ids) = extended_liqs(&body, label, market);
                             new_this_cycle += record(
                                 &log_dir,
                                 "extended",
                                 &liqs,
-                                rows,
+                                &page_ids,
                                 limit,
                                 &mut extended_seen,
+                                &mut extended_prev,
+                                market,
                                 label,
                             );
                         }
@@ -401,24 +425,42 @@ fn parse_or_empty(name: &str, spec: &str) -> Vec<(String, String)> {
 
 /// Append the NEW (not-yet-seen) liquidations to today's JSONL and emit the
 /// sliding-window saturation warning. Returns the count of new rows written.
+///
+/// `page_ids` is EVERY trade id in the page (normal + liquidation), and
+/// `prev_page_ids` holds the previous poll's page id set for this market. The
+/// saturation check fires on the full page turning over (zero overlap with the
+/// previous page) — independent of whether a liquidation happened to be in the
+/// page — so a window that could have hidden a liquidation is never silent.
+#[allow(clippy::too_many_arguments)]
 fn record(
     log_dir: &str,
     venue: &str,
     liqs: &[LiqTrade],
-    page_rows: usize,
+    page_ids: &[String],
     limit: u64,
     seen: &mut SeenRing,
+    prev_page_ids: &mut HashMap<String, HashSet<String>>,
+    market: &str,
     label: &str,
 ) -> u64 {
-    // Saturation check uses ALL page ids, not just liquidations: a full page
-    // whose every row is new means the window fully turned over since last poll.
-    let any_already_seen = liqs.iter().any(|t| seen.contains(&t.trade_id));
-    if page_rows as u64 >= limit && !liqs.is_empty() && !any_already_seen {
-        log::warn!(
-            "{venue} {label}: full page ({page_rows}) with no overlap — liquidations may have \
-             been skipped between polls; lower LIQ_POLL_SECS or raise LIQ_FETCH_LIMIT"
-        );
+    let cur: HashSet<String> = page_ids.iter().cloned().collect();
+    if page_ids.len() as u64 >= limit {
+        if let Some(prev) = prev_page_ids.get(market) {
+            // Zero overlap between a full page and the previous page means the
+            // window fully turned over since last poll — trades (possibly
+            // liquidations) in between were never observed, so counts are a
+            // lower bound.
+            if !prev.is_empty() && prev.is_disjoint(&cur) {
+                log::warn!(
+                    "{venue} {label}: full page ({}) with no overlap vs previous poll — \
+                     liquidations may have been skipped; lower LIQ_POLL_SECS or raise \
+                     LIQ_FETCH_LIMIT (counts are a lower bound)",
+                    page_ids.len()
+                );
+            }
+        }
     }
+    prev_page_ids.insert(market.to_string(), cur);
 
     let mut written = 0u64;
     for t in liqs {
@@ -426,7 +468,11 @@ fn record(
             log::warn!("{venue} {label}: liquidation row with empty trade_id, skipping dedup");
             continue;
         }
-        if !seen.insert(&t.trade_id) {
+        // De-dup key is market-scoped: a venue may reuse a trade id across
+        // markets, so a bare trade_id shared by the per-venue ring could drop a
+        // real liquidation in another market.
+        let key = format!("{}:{}", t.market, t.trade_id);
+        if !seen.insert(&key) {
             continue; // already logged
         }
         write_liq(log_dir, venue, t);
@@ -483,8 +529,9 @@ mod tests {
             {"trade_id_str":"2","type":"liquidation","price":"99","size":"2","usd_amount":"198","is_maker_ask":false,"timestamp":1781541099999i64},
             {"trade_id_str":"3","type":"deleverage","price":"98","size":"3","usd_amount":"294","is_maker_ask":true,"timestamp":1781541100000i64}
         ]});
-        let (liqs, rows) = lighter_liqs(&body, "BTC", "1");
-        assert_eq!(rows, 3);
+        let (liqs, page_ids) = lighter_liqs(&body, "BTC", "1");
+        // page_ids holds EVERY row (incl. the normal trade), not just liquidations.
+        assert_eq!(page_ids, vec!["1", "2", "3"]);
         assert_eq!(liqs.len(), 2);
         assert_eq!(liqs[0].trade_id, "2");
         assert_eq!(liqs[0].kind, "liquidation");
@@ -501,8 +548,8 @@ mod tests {
             {"i":11,"m":"BTC-USD","S":"SELL","tT":"LIQUIDATION","T":1781541009999i64,"p":"67000","q":"0.5"},
             {"i":12,"m":"BTC-USD","S":"BUY","tT":"DELEVERAGE","T":1781541010000i64,"p":"66900","q":"0.2"}
         ]});
-        let (liqs, rows) = extended_liqs(&body, "BTC", "BTC-USD");
-        assert_eq!(rows, 3);
+        let (liqs, page_ids) = extended_liqs(&body, "BTC", "BTC-USD");
+        assert_eq!(page_ids, vec!["10", "11", "12"]);
         assert_eq!(liqs.len(), 2);
         assert_eq!(liqs[0].trade_id, "11");
         assert_eq!(liqs[0].kind, "liquidation");
@@ -514,8 +561,8 @@ mod tests {
     #[test]
     fn extended_empty_data_is_no_liqs() {
         let body = json!({"status":"OK","data":[]});
-        let (liqs, rows) = extended_liqs(&body, "BTC", "BTC-USD");
-        assert_eq!(rows, 0);
+        let (liqs, page_ids) = extended_liqs(&body, "BTC", "BTC-USD");
+        assert!(page_ids.is_empty());
         assert!(liqs.is_empty());
     }
 
@@ -530,6 +577,117 @@ mod tests {
         assert!(r.contains("b"));
         assert!(r.contains("c"));
         assert!(r.insert("a")); // "a" is new again after eviction
+    }
+
+    #[test]
+    fn saturation_warns_on_full_turnover_even_with_no_liquidations() {
+        // Two consecutive full pages of NORMAL trades with disjoint ids: the
+        // window turned over, so the count is a lower bound. The old code only
+        // checked liquidation ids and would have stayed silent here.
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let mut seen = SeenRing::new(100);
+        let mut prev: HashMap<String, HashSet<String>> = HashMap::new();
+        let limit = 3u64;
+
+        // First poll seeds prev; no warning possible yet (prev empty).
+        let w0 = record(
+            dir,
+            "lighter",
+            &[],
+            &id_vec(&["1", "2", "3"]),
+            limit,
+            &mut seen,
+            &mut prev,
+            "1",
+            "BTC",
+        );
+        assert_eq!(w0, 0);
+        assert_eq!(prev.get("1").unwrap().len(), 3);
+
+        // Second poll: full page, ids fully disjoint from the first -> turnover.
+        // No liquidations present, yet prev is recorded for the next round.
+        let w1 = record(
+            dir,
+            "lighter",
+            &[],
+            &id_vec(&["7", "8", "9"]),
+            limit,
+            &mut seen,
+            &mut prev,
+            "1",
+            "BTC",
+        );
+        assert_eq!(w1, 0);
+        assert_eq!(
+            prev.get("1").unwrap(),
+            &id_vec(&["7", "8", "9"]).into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn dedup_is_market_scoped() {
+        // Same trade_id "5" on two different markets must both be logged: a bare
+        // trade_id key in a shared per-venue ring would drop the second.
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let mut seen = SeenRing::new(100);
+        let mut prev: HashMap<String, HashSet<String>> = HashMap::new();
+
+        let liq = |market: &str| LiqTrade {
+            label: "L".into(),
+            market: market.into(),
+            trade_id: "5".into(),
+            kind: "liquidation".into(),
+            side: None,
+            price: Some(1.0),
+            size: Some(1.0),
+            usd: None,
+            trade_ts_ms: Some(1),
+            raw: Value::Null,
+        };
+
+        let a = record(
+            dir,
+            "lighter",
+            &[liq("0")],
+            &id_vec(&["5"]),
+            100,
+            &mut seen,
+            &mut prev,
+            "0",
+            "ETH",
+        );
+        let b = record(
+            dir,
+            "lighter",
+            &[liq("1")],
+            &id_vec(&["5"]),
+            100,
+            &mut seen,
+            &mut prev,
+            "1",
+            "BTC",
+        );
+        assert_eq!(a, 1, "first market's liquidation logged");
+        assert_eq!(b, 1, "same id on a different market must also log");
+        // Re-seeing market 0's id 5 is a dup and must be dropped.
+        let c = record(
+            dir,
+            "lighter",
+            &[liq("0")],
+            &id_vec(&["5"]),
+            100,
+            &mut seen,
+            &mut prev,
+            "0",
+            "ETH",
+        );
+        assert_eq!(c, 0, "same market+id is a duplicate");
+    }
+
+    fn id_vec(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
