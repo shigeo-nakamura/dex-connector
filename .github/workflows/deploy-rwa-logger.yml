@@ -27,6 +27,8 @@ env:
   RWA_S3_PREFIX: rwa-logger
   RWA_UNIT_S3_KEY: deploy/rwa-spot-logger.service
   APEX_UNIT_S3_KEY: deploy/apex-perp-logger.service
+  ARCHIVE_SERVICE_S3_KEY: deploy/archive-rwa-logs.service
+  ARCHIVE_TIMER_S3_KEY: deploy/archive-rwa-logs.timer
   BUILD_REGION: eu-central-1
 
 jobs:
@@ -113,6 +115,12 @@ jobs:
             "s3://${S3_BUCKET}/${APEX_UNIT_S3_KEY}"
           aws s3 cp deploy/verify-logger.sh \
             "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/verify-logger.sh"
+          aws s3 cp deploy/archive-rwa-logs.sh \
+            "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/archive-rwa-logs.sh"
+          aws s3 cp deploy/archive-rwa-logs.service \
+            "s3://${S3_BUCKET}/${ARCHIVE_SERVICE_S3_KEY}"
+          aws s3 cp deploy/archive-rwa-logs.timer \
+            "s3://${S3_BUCKET}/${ARCHIVE_TIMER_S3_KEY}"
 
   deploy:
     needs: build
@@ -148,7 +156,14 @@ jobs:
               "if [ ! -f /etc/systemd/system/rwa-spot-logger.service ] || ! cmp -s /etc/systemd/system/rwa-spot-logger.service /tmp/rwa-spot-logger.service; then sudo mv /tmp/rwa-spot-logger.service /etc/systemd/system/rwa-spot-logger.service; sudo systemctl daemon-reload; else rm /tmp/rwa-spot-logger.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__APEX_UNIT_S3_KEY__ /tmp/apex-perp-logger.service",
               "if [ ! -f /etc/systemd/system/apex-perp-logger.service ] || ! cmp -s /etc/systemd/system/apex-perp-logger.service /tmp/apex-perp-logger.service; then sudo mv /tmp/apex-perp-logger.service /etc/systemd/system/apex-perp-logger.service; sudo systemctl daemon-reload; else rm /tmp/apex-perp-logger.service; fi",
+              "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/archive-rwa-logs.sh /opt/rwa-logger/bin/archive-rwa-logs.sh && sudo chmod 755 /opt/rwa-logger/bin/archive-rwa-logs.sh",
+              "aws s3 cp s3://__S3_BUCKET__/__ARCHIVE_SERVICE_S3_KEY__ /tmp/archive-rwa-logs.service",
+              "if [ ! -f /etc/systemd/system/archive-rwa-logs.service ] || ! cmp -s /etc/systemd/system/archive-rwa-logs.service /tmp/archive-rwa-logs.service; then sudo mv /tmp/archive-rwa-logs.service /etc/systemd/system/archive-rwa-logs.service; sudo systemctl daemon-reload; else rm /tmp/archive-rwa-logs.service; fi",
+              "aws s3 cp s3://__S3_BUCKET__/__ARCHIVE_TIMER_S3_KEY__ /tmp/archive-rwa-logs.timer",
+              "if [ ! -f /etc/systemd/system/archive-rwa-logs.timer ] || ! cmp -s /etc/systemd/system/archive-rwa-logs.timer /tmp/archive-rwa-logs.timer; then sudo mv /tmp/archive-rwa-logs.timer /etc/systemd/system/archive-rwa-logs.timer; sudo systemctl daemon-reload; else rm /tmp/archive-rwa-logs.timer; fi",
               "sudo systemctl enable rwa-spot-logger.service apex-perp-logger.service",
+              "sudo systemctl enable --now archive-rwa-logs.timer && systemctl list-timers archive-rwa-logs.timer --no-pager | tail -3",
+              "echo 'running one-off archive sync to seed S3'; sudo systemctl start archive-rwa-logs.service && sudo journalctl -u archive-rwa-logs.service -n 10 --no-pager",
               "for u in rwa_spot:rwa-spot-logger apex_perp:apex-perp-logger; do p=${u%%:*}; f=/opt/debot-rwa/${p}_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/${p}_baseline; done; echo \"baselines: spot=$(cat /tmp/rwa_spot_baseline) apex=$(cat /tmp/apex_perp_baseline)\"",
               "for u in rwa-spot-logger apex-perp-logger; do if systemctl is-active --quiet $u; then sudo systemctl restart $u; else sudo systemctl start $u; fi; done; echo '(re)started both loggers'",
               "sleep 3; for u in rwa-spot-logger apex-perp-logger; do systemctl is-active --quiet $u || { echo \"$u failed to start\"; sudo journalctl -u $u -n 30 --no-pager; exit 1; }; done",
@@ -160,7 +175,9 @@ jobs:
           sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; \
                   s|__RWA_S3_PREFIX__|${RWA_S3_PREFIX}|g; \
                   s|__RWA_UNIT_S3_KEY__|${RWA_UNIT_S3_KEY}|g; \
-                  s|__APEX_UNIT_S3_KEY__|${APEX_UNIT_S3_KEY}|g" /tmp/ssm-params.json
+                  s|__APEX_UNIT_S3_KEY__|${APEX_UNIT_S3_KEY}|g; \
+                  s|__ARCHIVE_SERVICE_S3_KEY__|${ARCHIVE_SERVICE_S3_KEY}|g; \
+                  s|__ARCHIVE_TIMER_S3_KEY__|${ARCHIVE_TIMER_S3_KEY}|g" /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \

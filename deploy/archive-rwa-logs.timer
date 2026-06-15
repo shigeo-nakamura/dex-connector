@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily archive of RWA logger dumps to S3 (bot-strategy#574)
+
+[Timer]
+# 00:35 UTC — just after the UTC day rolls over (so yesterday's file is
+# complete) and offset from archive-bt-replay.timer (00:30) to avoid contending
+# for the same network/S3 path. sync is idempotent, so Persistent catches up a
+# missed run after downtime.
+OnCalendar=*-*-* 00:35:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+Unit=archive-rwa-logs.service
+
+[Install]
+WantedBy=timers.target
