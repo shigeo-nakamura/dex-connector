@@ -54,7 +54,9 @@ fn resolve_poll_secs(raw: Option<&str>) -> u64 {
                 MIN_POLL_SECS
             }
             Err(_) => {
-                log::warn!("RWA_POLL_SECS='{s}' not a valid u64, using default {DEFAULT_POLL_SECS}s");
+                log::warn!(
+                    "RWA_POLL_SECS='{s}' not a valid u64, using default {DEFAULT_POLL_SECS}s"
+                );
                 DEFAULT_POLL_SECS
             }
         },
