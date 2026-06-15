@@ -56,7 +56,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-arm64-rwa-
 
-      - name: Build rwa-spot-logger (linux/arm64, no default features)
+      - name: Build rwa-spot-logger (linux/arm64, standalone crate)
         run: |
           mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup target
           docker run --rm --platform linux/arm64 \
@@ -75,7 +75,7 @@ jobs:
               fi; \
               export PATH=/workspace/.cache/cargo/bin:\$PATH; \
               rustc -V; cargo -V; \
-              cargo build --release --no-default-features --bin rwa-spot-logger; \
+              cargo build --release -p rwa-logger --bin rwa-spot-logger; \
               chown -R \${HOST_UID}:\${HOST_GID} /workspace/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cache permissions
