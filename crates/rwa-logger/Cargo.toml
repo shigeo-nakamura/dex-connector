@@ -1,0 +1,23 @@
+[package]
+name = "rwa-logger"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only RWA spot price logger (bot-strategy#574). Standalone collector, no DEX SDK deps."
+license = "MIT"
+
+# Deliberately a separate workspace crate (mirrors lighter-ratelimit): the root
+# dex-connector package drags a heavy crypto dep tree (ethers/secp256k1/k256/
+# curve25519/poseidon/…) that is brutally slow to compile under QEMU arm64.
+# Keeping the logger here means the arm64 deploy build only compiles these light
+# deps. rustls (not native-tls) avoids an openssl-devel cross-build too.
+[dependencies]
+reqwest = { version = "0.11.18", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1.0.103"
+chrono = { version = "0.4.26", default-features = false, features = ["clock"] }
+ctrlc = "3.1.9"
+log = "0.4.19"
+env_logger = "0.10"
+
+[[bin]]
+name = "rwa-spot-logger"
+path = "src/bin/rwa-spot-logger.rs"
