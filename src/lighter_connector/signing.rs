@@ -156,8 +156,9 @@ impl LighterConnector {
 
     /// Call Go shared library to sign an L2ModifyOrder (tx type 17)
     /// transaction. `base_amount` / `trigger_price` of 0 are the Go-side
-    /// "leave unchanged" sentinels. Integrator-fee args are zeroed.
-    /// See bot-strategy#471.
+    /// "leave unchanged" sentinels. The argument list matches the lighter-go
+    /// v1.0.2 `SignModifyOrder` export the build links (no integrator-fee /
+    /// skip_nonce params — those were added in v1.0.6). See bot-strategy#471.
     #[cfg(feature = "lighter-sdk")]
     pub(super) async fn call_go_sign_modify_order(
         &self,
@@ -177,10 +178,6 @@ impl LighterConnector {
                 base_amount,
                 price,
                 trigger_price,
-                0, // integrator_account_index (unused)
-                0, // integrator_taker_fee (unused)
-                0, // integrator_maker_fee (unused)
-                0, // skip_nonce = false
                 nonce,
                 self.api_key_index as c_int,
                 self.account_index as c_longlong,
