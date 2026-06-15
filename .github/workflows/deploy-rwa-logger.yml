@@ -26,6 +26,7 @@ env:
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
   RWA_S3_PREFIX: rwa-logger
   RWA_UNIT_S3_KEY: deploy/rwa-spot-logger.service
+  APEX_UNIT_S3_KEY: deploy/apex-perp-logger.service
   BUILD_REGION: eu-central-1
 
 jobs:
@@ -56,7 +57,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-arm64-rwa-
 
-      - name: Build rwa-spot-logger (linux/arm64, standalone crate)
+      - name: Build rwa-logger bins (linux/arm64, standalone crate)
         run: |
           mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup target
           docker run --rm --platform linux/arm64 \
@@ -75,7 +76,7 @@ jobs:
               fi; \
               export PATH=/workspace/.cache/cargo/bin:\$PATH; \
               rustc -V; cargo -V; \
-              cargo build --release -p rwa-logger --bin rwa-spot-logger; \
+              cargo build --release -p rwa-logger; \
               chown -R \${HOST_UID}:\${HOST_GID} /workspace/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cache permissions
@@ -84,11 +85,13 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup target
           fi
 
-      - name: Sanity-check binary
+      - name: Sanity-check binaries
         run: |
-          file target/release/rwa-spot-logger
-          # Expect ARM aarch64 ELF — guard against an accidental host-arch build.
-          file target/release/rwa-spot-logger | grep -q aarch64
+          for b in rwa-spot-logger apex-perp-logger; do
+            file "target/release/$b"
+            # Expect ARM aarch64 ELF — guard against an accidental host-arch build.
+            file "target/release/$b" | grep -q aarch64
+          done
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -102,8 +105,12 @@ jobs:
         run: |
           aws s3 cp target/release/rwa-spot-logger \
             "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/rwa-spot-logger"
+          aws s3 cp target/release/apex-perp-logger \
+            "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/apex-perp-logger"
           aws s3 cp deploy/rwa-spot-logger.service \
             "s3://${S3_BUCKET}/${RWA_UNIT_S3_KEY}"
+          aws s3 cp deploy/apex-perp-logger.service \
+            "s3://${S3_BUCKET}/${APEX_UNIT_S3_KEY}"
 
   deploy:
     needs: build
@@ -132,21 +139,29 @@ jobs:
           {
             "commands": [
               "sudo mkdir -p /opt/rwa-logger/bin /opt/debot-rwa",
-              "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/rwa-spot-logger /opt/rwa-logger/bin/rwa-spot-logger",
-              "sudo chmod 755 /opt/rwa-logger/bin/rwa-spot-logger",
+              "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/rwa-spot-logger /opt/rwa-logger/bin/rwa-spot-logger && sudo chmod 755 /opt/rwa-logger/bin/rwa-spot-logger",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_UNIT_S3_KEY__ /tmp/rwa-spot-logger.service",
               "if [ ! -f /etc/systemd/system/rwa-spot-logger.service ] || ! cmp -s /etc/systemd/system/rwa-spot-logger.service /tmp/rwa-spot-logger.service; then sudo mv /tmp/rwa-spot-logger.service /etc/systemd/system/rwa-spot-logger.service; sudo systemctl daemon-reload; else rm /tmp/rwa-spot-logger.service; fi",
               "sudo systemctl enable rwa-spot-logger.service",
-              "f=/opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/rwa_baseline; echo \"pre-restart baseline lines: $(cat /tmp/rwa_baseline)\"",
+              "f=/opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/rwa_baseline; echo \"rwa-spot baseline lines: $(cat /tmp/rwa_baseline)\"",
               "if systemctl is-active --quiet rwa-spot-logger; then sudo systemctl restart rwa-spot-logger && echo 'Restarted rwa-spot-logger'; else sudo systemctl start rwa-spot-logger && echo 'Started rwa-spot-logger'; fi",
               "sleep 3 && systemctl is-active --quiet rwa-spot-logger || { echo 'rwa-spot-logger failed to start'; sudo journalctl -u rwa-spot-logger -n 30 --no-pager; exit 1; }",
-              "f=/opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl; base=$(cat /tmp/rwa_baseline 2>/dev/null || echo 0); cur=$base; for i in $(seq 1 20); do cur=$(wc -l < \"$f\" 2>/dev/null || echo 0); [ \"$cur\" -gt \"$base\" ] && break; sleep 2; done; if [ \"$cur\" -gt \"$base\" ]; then echo \"OK: $f grew $base -> $cur line(s) after restart\"; tail -1 \"$f\"; else echo \"FAIL: $f did not grow past $base in ~40s — restarted logger writing no fresh rows\"; sudo journalctl -u rwa-spot-logger -n 40 --no-pager; exit 1; fi"
+              "f=/opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl; base=$(cat /tmp/rwa_baseline 2>/dev/null || echo 0); cur=$base; for i in $(seq 1 20); do cur=$(wc -l < \"$f\" 2>/dev/null || echo 0); [ \"$cur\" -gt \"$base\" ] && break; sleep 2; done; if [ \"$cur\" -gt \"$base\" ]; then echo \"OK rwa-spot: $f grew $base -> $cur line(s)\"; tail -1 \"$f\"; else echo \"FAIL rwa-spot: $f did not grow past $base in ~40s\"; sudo journalctl -u rwa-spot-logger -n 40 --no-pager; exit 1; fi",
+              "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/apex-perp-logger /opt/rwa-logger/bin/apex-perp-logger && sudo chmod 755 /opt/rwa-logger/bin/apex-perp-logger",
+              "aws s3 cp s3://__S3_BUCKET__/__APEX_UNIT_S3_KEY__ /tmp/apex-perp-logger.service",
+              "if [ ! -f /etc/systemd/system/apex-perp-logger.service ] || ! cmp -s /etc/systemd/system/apex-perp-logger.service /tmp/apex-perp-logger.service; then sudo mv /tmp/apex-perp-logger.service /etc/systemd/system/apex-perp-logger.service; sudo systemctl daemon-reload; else rm /tmp/apex-perp-logger.service; fi",
+              "sudo systemctl enable apex-perp-logger.service",
+              "f=/opt/debot-rwa/apex_perp_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/apex_baseline; echo \"apex baseline lines: $(cat /tmp/apex_baseline)\"",
+              "if systemctl is-active --quiet apex-perp-logger; then sudo systemctl restart apex-perp-logger && echo 'Restarted apex-perp-logger'; else sudo systemctl start apex-perp-logger && echo 'Started apex-perp-logger'; fi",
+              "sleep 3 && systemctl is-active --quiet apex-perp-logger || { echo 'apex-perp-logger failed to start'; sudo journalctl -u apex-perp-logger -n 30 --no-pager; exit 1; }",
+              "f=/opt/debot-rwa/apex_perp_$(date -u +%Y%m%d).jsonl; base=$(cat /tmp/apex_baseline 2>/dev/null || echo 0); cur=$base; for i in $(seq 1 20); do cur=$(wc -l < \"$f\" 2>/dev/null || echo 0); [ \"$cur\" -gt \"$base\" ] && break; sleep 2; done; if [ \"$cur\" -gt \"$base\" ]; then echo \"OK apex: $f grew $base -> $cur line(s)\"; tail -1 \"$f\"; else echo \"FAIL apex: $f did not grow past $base in ~40s\"; sudo journalctl -u apex-perp-logger -n 40 --no-pager; exit 1; fi"
             ]
           }
           JSON
           sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; \
                   s|__RWA_S3_PREFIX__|${RWA_S3_PREFIX}|g; \
-                  s|__RWA_UNIT_S3_KEY__|${RWA_UNIT_S3_KEY}|g" /tmp/ssm-params.json
+                  s|__RWA_UNIT_S3_KEY__|${RWA_UNIT_S3_KEY}|g; \
+                  s|__APEX_UNIT_S3_KEY__|${APEX_UNIT_S3_KEY}|g" /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \

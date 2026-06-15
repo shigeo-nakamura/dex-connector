@@ -21,3 +21,7 @@ env_logger = "0.10"
 [[bin]]
 name = "rwa-spot-logger"
 path = "src/bin/rwa-spot-logger.rs"
+
+[[bin]]
+name = "apex-perp-logger"
+path = "src/bin/apex-perp-logger.rs"
