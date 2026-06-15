@@ -137,9 +137,10 @@ jobs:
               "aws s3 cp s3://__S3_BUCKET__/__RWA_UNIT_S3_KEY__ /tmp/rwa-spot-logger.service",
               "if [ ! -f /etc/systemd/system/rwa-spot-logger.service ] || ! cmp -s /etc/systemd/system/rwa-spot-logger.service /tmp/rwa-spot-logger.service; then sudo mv /tmp/rwa-spot-logger.service /etc/systemd/system/rwa-spot-logger.service; sudo systemctl daemon-reload; else rm /tmp/rwa-spot-logger.service; fi",
               "sudo systemctl enable rwa-spot-logger.service",
+              "f=/opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/rwa_baseline; echo \"pre-restart baseline lines: $(cat /tmp/rwa_baseline)\"",
               "if systemctl is-active --quiet rwa-spot-logger; then sudo systemctl restart rwa-spot-logger && echo 'Restarted rwa-spot-logger'; else sudo systemctl start rwa-spot-logger && echo 'Started rwa-spot-logger'; fi",
               "sleep 3 && systemctl is-active --quiet rwa-spot-logger || { echo 'rwa-spot-logger failed to start'; sudo journalctl -u rwa-spot-logger -n 30 --no-pager; exit 1; }",
-              "f=/opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl; for i in $(seq 1 15); do [ -s \"$f\" ] && break; sleep 2; done; if [ -s \"$f\" ]; then echo \"OK: $f has $(wc -l < \"$f\") line(s)\"; tail -1 \"$f\"; else echo \"FAIL: $f missing/empty after ~30s — logger alive but writing no rows\"; sudo journalctl -u rwa-spot-logger -n 40 --no-pager; exit 1; fi"
+              "f=/opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl; base=$(cat /tmp/rwa_baseline 2>/dev/null || echo 0); cur=$base; for i in $(seq 1 20); do cur=$(wc -l < \"$f\" 2>/dev/null || echo 0); [ \"$cur\" -gt \"$base\" ] && break; sleep 2; done; if [ \"$cur\" -gt \"$base\" ]; then echo \"OK: $f grew $base -> $cur line(s) after restart\"; tail -1 \"$f\"; else echo \"FAIL: $f did not grow past $base in ~40s — restarted logger writing no fresh rows\"; sudo journalctl -u rwa-spot-logger -n 40 --no-pager; exit 1; fi"
             ]
           }
           JSON
