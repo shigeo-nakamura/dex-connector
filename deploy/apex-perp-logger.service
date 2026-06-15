@@ -1,0 +1,23 @@
+[Unit]
+# ApeX RWA perp ticker logger — read-only Phase 0 collector (bot-strategy#574,
+# for #563 basis / #566 funding carry). Separate observe-only unit; does NOT
+# touch debot-pair-btceth.
+Description=ApeX RWA perp ticker logger (read-only, bot-strategy#574)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rwa-logger/bin/apex-perp-logger
+Environment=RUST_LOG=info
+Environment=APEX_LOG_DIR=/opt/debot-rwa
+Environment=APEX_POLL_SECS=10
+# ApeX Omni ticker endpoint wants the dash-less symbol form. RWA stock perps
+# listed as of 2026-06: TSLA/NVDA/META/QQQ/SPY/SNDK.
+Environment=APEX_SYMBOLS=TSLA:TSLAUSDT,NVDA:NVDAUSDT,META:METAUSDT,QQQ:QQQUSDT,SPY:SPYUSDT,SNDK:SNDKUSDT
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
