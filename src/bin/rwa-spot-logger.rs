@@ -36,6 +36,30 @@ use serde_json::{json, Value};
 
 const DEFAULT_PRICE_URL: &str = "https://lite-api.jup.ag/price/v3";
 const DEFAULT_POLL_SECS: u64 = 5;
+/// Floor for the poll cadence. `RWA_POLL_SECS=0` would make the sleep loop a
+/// no-op and turn this into an unbounded tight poll/write loop, so any value
+/// below this (incl. a 0 typo) is clamped up.
+const MIN_POLL_SECS: u64 = 1;
+
+/// Resolve the poll cadence from the raw env value, clamping a 0/too-small
+/// value up to `MIN_POLL_SECS` and falling back to the default on absent or
+/// unparseable input (so a typo can never produce a tight loop).
+fn resolve_poll_secs(raw: Option<&str>) -> u64 {
+    match raw {
+        None => DEFAULT_POLL_SECS,
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(n) if n >= MIN_POLL_SECS => n,
+            Ok(n) => {
+                log::warn!("RWA_POLL_SECS={n} below minimum, clamping to {MIN_POLL_SECS}s");
+                MIN_POLL_SECS
+            }
+            Err(_) => {
+                log::warn!("RWA_POLL_SECS='{s}' not a valid u64, using default {DEFAULT_POLL_SECS}s");
+                DEFAULT_POLL_SECS
+            }
+        },
+    }
+}
 
 /// Parse `label:mint,label:mint` into `[(label, mint)]`.
 /// A mint may itself contain no `:`, so we split on the first `:` only.
@@ -96,10 +120,7 @@ fn main() {
     };
     let log_dir = std::env::var("RWA_LOG_DIR").unwrap_or_else(|_| ".".to_string());
     let url = std::env::var("RWA_JUP_PRICE_URL").unwrap_or_else(|_| DEFAULT_PRICE_URL.to_string());
-    let poll_secs = std::env::var("RWA_POLL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_POLL_SECS);
+    let poll_secs = resolve_poll_secs(std::env::var("RWA_POLL_SECS").ok().as_deref());
 
     let ids = tokens
         .iter()
@@ -234,5 +255,27 @@ mod tests {
     fn extract_price_missing() {
         let body = json!({ "MintB": { "usdPrice": 1.0 } });
         assert_eq!(extract_price(&body, "MintA"), None);
+    }
+
+    #[test]
+    fn resolve_poll_secs_default_when_absent() {
+        assert_eq!(resolve_poll_secs(None), DEFAULT_POLL_SECS);
+    }
+
+    #[test]
+    fn resolve_poll_secs_clamps_zero() {
+        // The bug the reviewer caught: 0 must not disable the sleep loop.
+        assert_eq!(resolve_poll_secs(Some("0")), MIN_POLL_SECS);
+    }
+
+    #[test]
+    fn resolve_poll_secs_passthrough_valid() {
+        assert_eq!(resolve_poll_secs(Some("3")), 3);
+        assert_eq!(resolve_poll_secs(Some(" 10 ")), 10);
+    }
+
+    #[test]
+    fn resolve_poll_secs_default_when_unparseable() {
+        assert_eq!(resolve_poll_secs(Some("abc")), DEFAULT_POLL_SECS);
     }
 }
