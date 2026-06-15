@@ -95,6 +95,12 @@ name = "lighter-spike"
 path = "src/bin/lighter-spike.rs"
 required-features = ["lighter-sdk"]
 
+# RWA spot price logger PoC (bot-strategy#574). Read-only, no feature flags —
+# uses only base deps (reqwest blocking + serde_json + chrono).
+[[bin]]
+name = "rwa-spot-logger"
+path = "src/bin/rwa-spot-logger.rs"
+
 [dev-dependencies]
 rusoto_core = "0.48"
 rusoto_kms = "0.48"
