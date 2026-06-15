@@ -1,0 +1,163 @@
+name: Deploy RWA spot logger
+
+# Phase 0 read-only collector for the Tier-1 RWA strategies (bot-strategy#574).
+# Manual dispatch only. Models deploy-sidecar.yml: build an aarch64 binary in a
+# QEMU arm64 AL2023 container, push to S3, then SSM-install on Frankfurt.
+#
+# Frankfurt is the sole remaining instance (Tokyo Arb terminated, #559). This is
+# a SEPARATE observe-only unit — it does NOT restart debot-pair-btceth.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "dex-connector ref to build from (default: whatever was checked out)"
+        required: false
+        type: string
+
+concurrency:
+  group: rwa-logger-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  RWA_S3_PREFIX: rwa-logger
+  RWA_UNIT_S3_KEY: deploy/rwa-spot-logger.service
+  BUILD_REGION: eu-central-1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: sidecar
+    steps:
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Cache cargo (linux/arm64)
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            target
+          key: ${{ runner.os }}-cargo-arm64-rwa-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64-rwa-
+
+      - name: Build rwa-spot-logger (linux/arm64, no default features)
+        run: |
+          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/workspace/.cache/cargo \
+            -e RUSTUP_HOME=/workspace/.cache/rustup \
+            -e CARGO_INCREMENTAL=0 \
+            ${AL2023_IMAGE} \
+            /bin/bash -lc "set -euo pipefail; \
+              dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; \
+              if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then \
+                curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; \
+              fi; \
+              export PATH=/workspace/.cache/cargo/bin:\$PATH; \
+              rustc -V; cargo -V; \
+              cargo build --release --no-default-features --bin rwa-spot-logger; \
+              chown -R \${HOST_UID}:\${HOST_GID} /workspace/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Fix cache permissions
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup target
+          fi
+
+      - name: Sanity-check binary
+        run: |
+          file target/release/rwa-spot-logger
+          # Expect ARM aarch64 ELF — guard against an accidental host-arch build.
+          file target/release/rwa-spot-logger | grep -q aarch64
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.BUILD_REGION }}
+
+      - name: Upload to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          aws s3 cp target/release/rwa-spot-logger \
+            "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/rwa-spot-logger"
+          aws s3 cp deploy/rwa-spot-logger.service \
+            "s3://${S3_BUCKET}/${RWA_UNIT_S3_KEY}"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: sidecar
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: frankfurt
+            region: eu-central-1
+            instance_id: i-0c08fba996bc21879
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Deploy via SSM (install, enable, start, verify) [${{ matrix.target }}]
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          INSTANCE_ID: ${{ matrix.instance_id }}
+        run: |
+          cat > /tmp/ssm-params.json <<'JSON'
+          {
+            "commands": [
+              "sudo mkdir -p /opt/rwa-logger/bin /opt/debot-rwa",
+              "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/rwa-spot-logger /opt/rwa-logger/bin/rwa-spot-logger",
+              "sudo chmod 755 /opt/rwa-logger/bin/rwa-spot-logger",
+              "aws s3 cp s3://__S3_BUCKET__/__RWA_UNIT_S3_KEY__ /tmp/rwa-spot-logger.service",
+              "if [ ! -f /etc/systemd/system/rwa-spot-logger.service ] || ! cmp -s /etc/systemd/system/rwa-spot-logger.service /tmp/rwa-spot-logger.service; then sudo mv /tmp/rwa-spot-logger.service /etc/systemd/system/rwa-spot-logger.service; sudo systemctl daemon-reload; else rm /tmp/rwa-spot-logger.service; fi",
+              "sudo systemctl enable rwa-spot-logger.service",
+              "if systemctl is-active --quiet rwa-spot-logger; then sudo systemctl restart rwa-spot-logger && echo 'Restarted rwa-spot-logger'; else sudo systemctl start rwa-spot-logger && echo 'Started rwa-spot-logger'; fi",
+              "sleep 3 && systemctl is-active --quiet rwa-spot-logger || { echo 'rwa-spot-logger failed to start'; sudo journalctl -u rwa-spot-logger -n 30 --no-pager; exit 1; }",
+              "sudo journalctl -u rwa-spot-logger -n 8 --no-pager",
+              "ls -la /opt/debot-rwa/ | tail -3"
+            ]
+          }
+          JSON
+          sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; \
+                  s|__RWA_S3_PREFIX__|${RWA_S3_PREFIX}|g; \
+                  s|__RWA_UNIT_S3_KEY__|${RWA_UNIT_S3_KEY}|g" /tmp/ssm-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy rwa-spot-logger (dex-connector) [${{ matrix.target }}]" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          set +e
+          aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
+          WAIT_STATUS=$?
+          aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+          exit $WAIT_STATUS
