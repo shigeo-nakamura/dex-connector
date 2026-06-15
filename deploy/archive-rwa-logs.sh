@@ -18,6 +18,8 @@
 # S3 layout:
 #   s3://<bucket>/<prefix>/<host-tag>/rwa_spot_<YYYYMMDD>.jsonl
 #   s3://<bucket>/<prefix>/<host-tag>/apex_perp_<YYYYMMDD>.jsonl
+#   s3://<bucket>/<prefix>/<host-tag>/liq_<YYYYMMDD>.jsonl
+# (the sync globs '*.jsonl', so any logger writing into RWA_LOG_DIR is covered)
 #
 # Runs daily from archive-rwa-logs.timer. Read-only w.r.t. the loggers; does NOT
 # touch debot-pair-btceth.

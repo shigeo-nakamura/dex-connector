@@ -25,3 +25,7 @@ path = "src/bin/rwa-spot-logger.rs"
 [[bin]]
 name = "apex-perp-logger"
 path = "src/bin/apex-perp-logger.rs"
+
+[[bin]]
+name = "liq-logger"
+path = "src/bin/liq-logger.rs"

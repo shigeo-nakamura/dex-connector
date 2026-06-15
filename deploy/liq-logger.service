@@ -1,0 +1,28 @@
+[Unit]
+# Liquidation event logger — read-only Phase 0 collector (bot-strategy#571,
+# true-liquidation fade). Records CONFIRMED liquidation/deleverage trades on
+# Lighter + Extended so the event frequency and post-liquidation reversion can
+# be characterized offline. Separate observe-only unit; does NOT touch
+# debot-pair-btceth.
+Description=Liquidation event logger (read-only, bot-strategy#571)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rwa-logger/bin/liq-logger
+Environment=RUST_LOG=info
+Environment=LIQ_LOG_DIR=/opt/debot-rwa
+# Poll fast: Lighter caps recentTrades at 100 rows, so on high-volume BTC/ETH a
+# slow cadence can let the window turn over between polls (the logger WARNs when
+# this happens). 2s keeps the miss window small while staying trivially light.
+Environment=LIQ_POLL_SECS=2
+# Lighter market ids: ETH=0, BTC=1. Extended: BTC-USD / ETH-USD.
+Environment=LIGHTER_LIQ_MARKETS=ETH:0,BTC:1
+Environment=EXTENDED_LIQ_MARKETS=BTC:BTC-USD,ETH:ETH-USD
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
