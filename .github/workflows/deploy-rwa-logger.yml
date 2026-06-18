@@ -185,7 +185,6 @@ jobs:
               "if [ ! -f /etc/systemd/system/archive-rwa-logs.timer ] || ! cmp -s /etc/systemd/system/archive-rwa-logs.timer /tmp/archive-rwa-logs.timer; then sudo mv /tmp/archive-rwa-logs.timer /etc/systemd/system/archive-rwa-logs.timer; sudo systemctl daemon-reload; else rm /tmp/archive-rwa-logs.timer; fi",
               "sudo systemctl enable rwa-spot-logger.service rwa-quote-logger.service apex-perp-logger.service liq-logger.service",
               "sudo systemctl enable --now archive-rwa-logs.timer && systemctl list-timers archive-rwa-logs.timer --no-pager | tail -3",
-              "echo 'running one-off archive sync to seed S3'; sudo systemctl start archive-rwa-logs.service && sudo journalctl -u archive-rwa-logs.service -n 10 --no-pager",
               "for u in rwa_spot:rwa-spot-logger rwa_quote:rwa-quote-logger apex_perp:apex-perp-logger; do p=${u%%:*}; f=/opt/debot-rwa/${p}_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/${p}_baseline; done; echo \"baselines: spot=$(cat /tmp/rwa_spot_baseline) quote=$(cat /tmp/rwa_quote_baseline) apex=$(cat /tmp/apex_perp_baseline)\"",
               "date -u '+%Y-%m-%d %H:%M:%S' > /tmp/liq_since; echo \"liq verify since=$(cat /tmp/liq_since)\"",
               "for u in rwa-spot-logger rwa-quote-logger apex-perp-logger liq-logger; do if systemctl is-active --quiet $u; then sudo systemctl restart $u; else sudo systemctl start $u; fi; done; echo '(re)started all loggers'",
@@ -193,7 +192,8 @@ jobs:
               "sudo /tmp/verify-logger.sh rwa-spot-logger /opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl RWA_TOKENS usd_price /tmp/rwa_spot_baseline",
               "sudo /tmp/verify-quote-logger.sh rwa-quote-logger /opt/debot-rwa/rwa_quote_$(date -u +%Y%m%d).jsonl /tmp/rwa_quote_baseline",
               "sudo /tmp/verify-logger.sh apex-perp-logger /opt/debot-rwa/apex_perp_$(date -u +%Y%m%d).jsonl APEX_SYMBOLS funding_rate /tmp/apex_perp_baseline",
-              "sudo /tmp/verify-liq-logger.sh liq-logger \"$(cat /tmp/liq_since)\""
+              "sudo /tmp/verify-liq-logger.sh liq-logger \"$(cat /tmp/liq_since)\"",
+              "echo 'running post-verify one-off archive sync to seed S3'; sudo systemctl start archive-rwa-logs.service && sudo journalctl -u archive-rwa-logs.service -n 10 --no-pager"
             ]
           }
           JSON
