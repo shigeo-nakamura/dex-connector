@@ -33,3 +33,7 @@ path = "src/bin/apex-perp-logger.rs"
 [[bin]]
 name = "liq-logger"
 path = "src/bin/liq-logger.rs"
+
+[[bin]]
+name = "lighter-basis-logger"
+path = "src/bin/lighter-basis-logger.rs"
