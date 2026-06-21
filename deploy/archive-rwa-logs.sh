@@ -1,7 +1,7 @@
 #!/bin/bash
 # Archive the RWA Phase-0 logger dumps to S3 (bot-strategy#574).
 #
-# The rwa-spot-logger / apex-perp-logger write per-UTC-day JSONL files to
+# The rwa-spot-logger / rwa-quote-logger / apex-perp-logger / liq-logger write per-UTC-day JSONL files to
 # /opt/debot-rwa/. Those dumps are the only copy of 2-3 weeks of irreplaceable
 # read-side data and live on a single EC2 disk. This script mirrors them to S3
 # so the collection survives host loss, disk pressure, or an AMI reclone — the
