@@ -28,6 +28,7 @@ env:
   RWA_UNIT_S3_KEY: deploy/rwa-spot-logger.service
   QUOTE_UNIT_S3_KEY: deploy/rwa-quote-logger.service
   APEX_UNIT_S3_KEY: deploy/apex-perp-logger.service
+  BASIS_UNIT_S3_KEY: deploy/lighter-basis-logger.service
   LIQ_UNIT_S3_KEY: deploy/liq-logger.service
   ARCHIVE_SERVICE_S3_KEY: deploy/archive-rwa-logs.service
   ARCHIVE_TIMER_S3_KEY: deploy/archive-rwa-logs.timer
@@ -91,7 +92,7 @@ jobs:
 
       - name: Sanity-check binaries
         run: |
-          for b in rwa-spot-logger rwa-quote-logger apex-perp-logger liq-logger; do
+          for b in rwa-spot-logger rwa-quote-logger apex-perp-logger lighter-basis-logger liq-logger; do
             file "target/release/$b"
             # Expect ARM aarch64 ELF — guard against an accidental host-arch build.
             file "target/release/$b" | grep -q aarch64
@@ -113,6 +114,8 @@ jobs:
             "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/rwa-quote-logger"
           aws s3 cp target/release/apex-perp-logger \
             "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/apex-perp-logger"
+          aws s3 cp target/release/lighter-basis-logger \
+            "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/lighter-basis-logger"
           aws s3 cp target/release/liq-logger \
             "s3://${S3_BUCKET}/${RWA_S3_PREFIX}/liq-logger"
           aws s3 cp deploy/rwa-spot-logger.service \
@@ -121,6 +124,8 @@ jobs:
             "s3://${S3_BUCKET}/${QUOTE_UNIT_S3_KEY}"
           aws s3 cp deploy/apex-perp-logger.service \
             "s3://${S3_BUCKET}/${APEX_UNIT_S3_KEY}"
+          aws s3 cp deploy/lighter-basis-logger.service \
+            "s3://${S3_BUCKET}/${BASIS_UNIT_S3_KEY}"
           aws s3 cp deploy/liq-logger.service \
             "s3://${S3_BUCKET}/${LIQ_UNIT_S3_KEY}"
           aws s3 cp deploy/verify-logger.sh \
@@ -166,6 +171,7 @@ jobs:
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/rwa-spot-logger /opt/rwa-logger/bin/rwa-spot-logger && sudo chmod 755 /opt/rwa-logger/bin/rwa-spot-logger",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/rwa-quote-logger /opt/rwa-logger/bin/rwa-quote-logger && sudo chmod 755 /opt/rwa-logger/bin/rwa-quote-logger",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/apex-perp-logger /opt/rwa-logger/bin/apex-perp-logger && sudo chmod 755 /opt/rwa-logger/bin/apex-perp-logger",
+              "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/lighter-basis-logger /opt/rwa-logger/bin/lighter-basis-logger && sudo chmod 755 /opt/rwa-logger/bin/lighter-basis-logger",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/liq-logger /opt/rwa-logger/bin/liq-logger && sudo chmod 755 /opt/rwa-logger/bin/liq-logger",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/verify-logger.sh /tmp/verify-logger.sh && sudo chmod +x /tmp/verify-logger.sh",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/verify-quote-logger.sh /tmp/verify-quote-logger.sh && sudo chmod +x /tmp/verify-quote-logger.sh",
@@ -176,6 +182,8 @@ jobs:
               "if [ ! -f /etc/systemd/system/rwa-quote-logger.service ] || ! cmp -s /etc/systemd/system/rwa-quote-logger.service /tmp/rwa-quote-logger.service; then sudo mv /tmp/rwa-quote-logger.service /etc/systemd/system/rwa-quote-logger.service; sudo systemctl daemon-reload; else rm /tmp/rwa-quote-logger.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__APEX_UNIT_S3_KEY__ /tmp/apex-perp-logger.service",
               "if [ ! -f /etc/systemd/system/apex-perp-logger.service ] || ! cmp -s /etc/systemd/system/apex-perp-logger.service /tmp/apex-perp-logger.service; then sudo mv /tmp/apex-perp-logger.service /etc/systemd/system/apex-perp-logger.service; sudo systemctl daemon-reload; else rm /tmp/apex-perp-logger.service; fi",
+              "aws s3 cp s3://__S3_BUCKET__/__BASIS_UNIT_S3_KEY__ /tmp/lighter-basis-logger.service",
+              "if [ ! -f /etc/systemd/system/lighter-basis-logger.service ] || ! cmp -s /etc/systemd/system/lighter-basis-logger.service /tmp/lighter-basis-logger.service; then sudo mv /tmp/lighter-basis-logger.service /etc/systemd/system/lighter-basis-logger.service; sudo systemctl daemon-reload; else rm /tmp/lighter-basis-logger.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__LIQ_UNIT_S3_KEY__ /tmp/liq-logger.service",
               "if [ ! -f /etc/systemd/system/liq-logger.service ] || ! cmp -s /etc/systemd/system/liq-logger.service /tmp/liq-logger.service; then sudo mv /tmp/liq-logger.service /etc/systemd/system/liq-logger.service; sudo systemctl daemon-reload; else rm /tmp/liq-logger.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/archive-rwa-logs.sh /opt/rwa-logger/bin/archive-rwa-logs.sh && sudo chmod 755 /opt/rwa-logger/bin/archive-rwa-logs.sh",
@@ -183,15 +191,16 @@ jobs:
               "if [ ! -f /etc/systemd/system/archive-rwa-logs.service ] || ! cmp -s /etc/systemd/system/archive-rwa-logs.service /tmp/archive-rwa-logs.service; then sudo mv /tmp/archive-rwa-logs.service /etc/systemd/system/archive-rwa-logs.service; sudo systemctl daemon-reload; else rm /tmp/archive-rwa-logs.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__ARCHIVE_TIMER_S3_KEY__ /tmp/archive-rwa-logs.timer",
               "if [ ! -f /etc/systemd/system/archive-rwa-logs.timer ] || ! cmp -s /etc/systemd/system/archive-rwa-logs.timer /tmp/archive-rwa-logs.timer; then sudo mv /tmp/archive-rwa-logs.timer /etc/systemd/system/archive-rwa-logs.timer; sudo systemctl daemon-reload; else rm /tmp/archive-rwa-logs.timer; fi",
-              "sudo systemctl enable rwa-spot-logger.service rwa-quote-logger.service apex-perp-logger.service liq-logger.service",
+              "sudo systemctl enable rwa-spot-logger.service rwa-quote-logger.service apex-perp-logger.service lighter-basis-logger.service liq-logger.service",
               "sudo systemctl enable archive-rwa-logs.timer",
-              "for u in rwa_spot:rwa-spot-logger rwa_quote:rwa-quote-logger apex_perp:apex-perp-logger; do p=${u%%:*}; f=/opt/debot-rwa/${p}_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/${p}_baseline; done; echo \"baselines: spot=$(cat /tmp/rwa_spot_baseline) quote=$(cat /tmp/rwa_quote_baseline) apex=$(cat /tmp/apex_perp_baseline)\"",
+              "for u in rwa_spot:rwa-spot-logger rwa_quote:rwa-quote-logger apex_perp:apex-perp-logger lighter_basis:lighter-basis-logger; do p=${u%%:*}; f=/opt/debot-rwa/${p}_$(date -u +%Y%m%d).jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/${p}_baseline; done; echo \"baselines: spot=$(cat /tmp/rwa_spot_baseline) quote=$(cat /tmp/rwa_quote_baseline) apex=$(cat /tmp/apex_perp_baseline) basis=$(cat /tmp/lighter_basis_baseline)\"",
               "date -u '+%Y-%m-%d %H:%M:%S' > /tmp/liq_since; echo \"liq verify since=$(cat /tmp/liq_since)\"",
-              "for u in rwa-spot-logger rwa-quote-logger apex-perp-logger liq-logger; do if systemctl is-active --quiet $u; then sudo systemctl restart $u; else sudo systemctl start $u; fi; done; echo '(re)started all loggers'",
-              "sleep 3; for u in rwa-spot-logger rwa-quote-logger apex-perp-logger liq-logger; do systemctl is-active --quiet $u || { echo \"$u failed to start\"; sudo journalctl -u $u -n 30 --no-pager; exit 1; }; done",
+              "for u in rwa-spot-logger rwa-quote-logger apex-perp-logger lighter-basis-logger liq-logger; do if systemctl is-active --quiet $u; then sudo systemctl restart $u; else sudo systemctl start $u; fi; done; echo '(re)started all loggers'",
+              "sleep 3; for u in rwa-spot-logger rwa-quote-logger apex-perp-logger lighter-basis-logger liq-logger; do systemctl is-active --quiet $u || { echo \"$u failed to start\"; sudo journalctl -u $u -n 30 --no-pager; exit 1; }; done",
               "sudo /tmp/verify-logger.sh rwa-spot-logger /opt/debot-rwa/rwa_spot_$(date -u +%Y%m%d).jsonl RWA_TOKENS usd_price /tmp/rwa_spot_baseline",
               "sudo /tmp/verify-quote-logger.sh rwa-quote-logger /opt/debot-rwa/rwa_quote_$(date -u +%Y%m%d).jsonl /tmp/rwa_quote_baseline",
               "sudo /tmp/verify-logger.sh apex-perp-logger /opt/debot-rwa/apex_perp_$(date -u +%Y%m%d).jsonl APEX_SYMBOLS funding_rate /tmp/apex_perp_baseline",
+              "sudo /tmp/verify-logger.sh lighter-basis-logger /opt/debot-rwa/lighter_basis_$(date -u +%Y%m%d).jsonl LIGHTER_BASIS_MARKETS perp_minus_spot_bps /tmp/lighter_basis_baseline",
               "sudo /tmp/verify-liq-logger.sh liq-logger \"$(cat /tmp/liq_since)\"",
               "echo 'running post-verify one-off archive sync to seed S3'; sudo systemctl start archive-rwa-logs.service && sudo journalctl -u archive-rwa-logs.service -n 10 --no-pager",
               "sudo systemctl start archive-rwa-logs.timer && systemctl list-timers archive-rwa-logs.timer --no-pager | tail -3"
@@ -203,6 +212,7 @@ jobs:
                   s|__RWA_UNIT_S3_KEY__|${RWA_UNIT_S3_KEY}|g; \
                   s|__QUOTE_UNIT_S3_KEY__|${QUOTE_UNIT_S3_KEY}|g; \
                   s|__APEX_UNIT_S3_KEY__|${APEX_UNIT_S3_KEY}|g; \
+                  s|__BASIS_UNIT_S3_KEY__|${BASIS_UNIT_S3_KEY}|g; \
                   s|__LIQ_UNIT_S3_KEY__|${LIQ_UNIT_S3_KEY}|g; \
                   s|__ARCHIVE_SERVICE_S3_KEY__|${ARCHIVE_SERVICE_S3_KEY}|g; \
                   s|__ARCHIVE_TIMER_S3_KEY__|${ARCHIVE_TIMER_S3_KEY}|g" /tmp/ssm-params.json
