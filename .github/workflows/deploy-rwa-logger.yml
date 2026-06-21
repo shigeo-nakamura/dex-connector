@@ -167,6 +167,7 @@ jobs:
           cat > /tmp/ssm-params.json <<'JSON'
           {
             "commands": [
+              "set -e",
               "sudo mkdir -p /opt/rwa-logger/bin /opt/debot-rwa",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/rwa-spot-logger /opt/rwa-logger/bin/rwa-spot-logger && sudo chmod 755 /opt/rwa-logger/bin/rwa-spot-logger",
               "aws s3 cp s3://__S3_BUCKET__/__RWA_S3_PREFIX__/rwa-quote-logger /opt/rwa-logger/bin/rwa-quote-logger && sudo chmod 755 /opt/rwa-logger/bin/rwa-quote-logger",
