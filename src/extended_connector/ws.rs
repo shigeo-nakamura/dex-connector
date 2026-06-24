@@ -717,6 +717,219 @@ pub(super) async fn stream_account(
 }
 
 #[cfg(test)]
+mod fake_exchange_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::tungstenite::Message;
+
+    async fn extended_orderbook_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Extended orderbook");
+        let url = format!("ws://{}", listener.local_addr().expect("listener addr"));
+
+        let handle = tokio::spawn(async move {
+            for (bid, ask, ts, seq) in [
+                ("60000.0", "60001.0", 1_782_400_000_000i64, 1i64),
+                ("60010.0", "60011.0", 1_782_400_001_000i64, 2i64),
+            ] {
+                let (stream, _) = listener.accept().await.expect("accept orderbook client");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept orderbook WS");
+                let frame = json!({
+                    "type": "SNAPSHOT",
+                    "data": {
+                        "m": "BTC-USD",
+                        "b": [{ "p": bid, "q": "1.0" }],
+                        "a": [{ "p": ask, "q": "2.0" }]
+                    },
+                    "ts": ts,
+                    "seq": seq
+                });
+                ws.send(Message::Text(frame.to_string()))
+                    .await
+                    .expect("send orderbook snapshot");
+                let _ = ws.send(Message::Close(None)).await;
+            }
+        });
+
+        (url, handle)
+    }
+
+    async fn extended_account_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Extended account");
+        let url = format!("ws://{}", listener.local_addr().expect("listener addr"));
+
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept account client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept account WS");
+            let frame = json!({
+                "type": "SNAPSHOT",
+                "data": {
+                    "balance": {
+                        "collateralName": "USDC",
+                        "balance": "1000.0",
+                        "equity": "1001.0",
+                        "availableForTrade": "900.0",
+                        "availableForWithdrawal": "800.0",
+                        "unrealisedPnl": "1.0",
+                        "initialMargin": "100.0",
+                        "marginRatio": "0.10",
+                        "updatedTime": 1782400000000i64
+                    },
+                    "orders": [{
+                        "id": 12345,
+                        "accountId": 42,
+                        "externalId": "external-12345",
+                        "market": "BTC-USD",
+                        "type": "LIMIT",
+                        "side": "BUY",
+                        "status": "FILLED",
+                        "statusReason": null,
+                        "price": "60000.0",
+                        "averagePrice": "60000.0",
+                        "qty": "0.010",
+                        "filledQty": "0.010",
+                        "reduceOnly": false,
+                        "postOnly": false,
+                        "createdTime": 1782400000000i64,
+                        "updatedTime": 1782400000001i64,
+                        "expiryTime": null
+                    }],
+                    "trades": [{
+                        "id": 777,
+                        "accountId": 42,
+                        "market": "BTC-USD",
+                        "orderId": 12345,
+                        "side": "BUY",
+                        "price": "60000.0",
+                        "qty": "0.010",
+                        "value": "600.0",
+                        "fee": "0.2",
+                        "isTaker": true,
+                        "tradeType": "TRADE",
+                        "createdTime": 1782400000002i64
+                    }],
+                    "positions": []
+                },
+                "ts": 1782400000003i64,
+                "seq": 1
+            });
+            ws.send(Message::Text(frame.to_string()))
+                .await
+                .expect("send account snapshot");
+            let _ = ws.send(Message::Close(None)).await;
+        });
+
+        (url, handle)
+    }
+
+    async fn assert_cached_best(
+        cache: &Arc<RwLock<HashMap<String, OrderBookCacheEntry>>>,
+        expected_bid: Decimal,
+        expected_ask: Decimal,
+        expected_ts: i64,
+    ) {
+        let guard = cache.read().await;
+        let entry = guard.get("BTC").expect("cached BTC orderbook");
+        assert_eq!(
+            entry
+                .bids
+                .iter()
+                .next_back()
+                .map(|(price, qty)| (*price, *qty)),
+            Some((expected_bid, Decimal::new(10, 1)))
+        );
+        assert_eq!(
+            entry.asks.iter().next().map(|(price, qty)| (*price, *qty)),
+            Some((expected_ask, Decimal::new(20, 1)))
+        );
+        assert_eq!(entry.last_publish_ts_ms, Some(expected_ts));
+    }
+
+    #[tokio::test]
+    async fn orderbook_stream_can_restart_and_refresh_cache() {
+        let (url, server) = extended_orderbook_server().await;
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+
+        stream_orderbooks(&url, "BTC", &cache)
+            .await
+            .expect("first orderbook stream");
+        assert_cached_best(
+            &cache,
+            Decimal::new(600000, 1),
+            Decimal::new(600010, 1),
+            1_782_400_000_000,
+        )
+        .await;
+
+        stream_orderbooks(&url, "BTC", &cache)
+            .await
+            .expect("second orderbook stream");
+        assert_cached_best(
+            &cache,
+            Decimal::new(600100, 1),
+            Decimal::new(600110, 1),
+            1_782_400_001_000,
+        )
+        .await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn account_stream_caches_fills_from_fake_server() {
+        let (url, server) = extended_account_server().await;
+        let balance_cache = Arc::new(RwLock::new(None));
+        let open_orders_cache = Arc::new(RwLock::new(HashMap::new()));
+        let order_id_map = Arc::new(RwLock::new(HashMap::new()));
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let positions_cache = Arc::new(RwLock::new(None));
+
+        stream_account(
+            &url,
+            "test-key",
+            &balance_cache,
+            &open_orders_cache,
+            &order_id_map,
+            &filled_orders,
+            &positions_cache,
+        )
+        .await
+        .expect("account stream");
+
+        let balance = balance_cache
+            .read()
+            .await
+            .clone()
+            .expect("cached account balance");
+        assert_eq!(balance.equity, Decimal::new(10010, 1));
+        assert_eq!(balance.balance, Decimal::new(10000, 1));
+
+        let orders = filled_orders.read().await;
+        let btc_orders = orders.get("BTC").expect("BTC filled orders");
+        assert_eq!(btc_orders.len(), 1);
+        let fill = &btc_orders[0];
+        assert_eq!(fill.order_id, "external-12345");
+        assert_eq!(fill.trade_id, "777");
+        assert_eq!(fill.filled_side, Some(OrderSide::Long));
+        assert_eq!(fill.filled_size, Some(Decimal::new(10, 3)));
+        assert_eq!(fill.filled_value, Some(Decimal::new(6000, 1)));
+        assert_eq!(fill.filled_fee, Some(Decimal::new(2, 1)));
+        assert_eq!(fill.filled_ts_ms, Some(1_782_400_000_002));
+
+        server.abort();
+    }
+}
+
+#[cfg(test)]
 mod stall_tests {
     use super::*;
     use futures::stream::{self, StreamExt};

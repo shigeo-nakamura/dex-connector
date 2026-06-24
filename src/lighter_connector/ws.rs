@@ -36,11 +36,55 @@ use tokio::sync::RwLock;
 
 /// Outer bound on the gap between any inbound WS frame (data, ping, pong,
 /// close). Heartbeat detects a dead peer in ~40s under normal conditions
-/// (`PONG_TIMEOUT_SECS` × `PONG_MAX_MISSES` plus check granularity), so 60s
+/// (configured pong timeout × miss limit plus check granularity), so 60s
 /// is comfortably outside that window and only fires when the heartbeat
 /// path itself has failed. Defense in depth follow-up to bot-strategy#347
 /// (Extended saw a 28h silent fail with the same pattern).
 const WS_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WsTimingConfig {
+    pub(super) reconnect_policy: crate::ws_reconnect::WsReconnectPolicy,
+    pub(super) initial_reconnect_jitter_max: Option<Duration>,
+    pub(super) stall_timeout: Duration,
+    pub(super) idle_ping_interval: Duration,
+    pub(super) pong_timeout: Duration,
+    pub(super) pong_max_misses: u32,
+    pub(super) heartbeat_check_interval: Duration,
+}
+
+impl Default for WsTimingConfig {
+    fn default() -> Self {
+        Self {
+            reconnect_policy: crate::ws_reconnect::WsReconnectPolicy::lighter(),
+            initial_reconnect_jitter_max: None,
+            stall_timeout: WS_STALL_TIMEOUT,
+            idle_ping_interval: Duration::from_secs(20),
+            pong_timeout: Duration::from_secs(15),
+            pong_max_misses: 2,
+            heartbeat_check_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+#[cfg(test)]
+impl WsTimingConfig {
+    fn fast_for_tests() -> Self {
+        Self {
+            reconnect_policy: crate::ws_reconnect::WsReconnectPolicy {
+                curve: crate::ws_reconnect::BackoffCurve::Linear { delay_secs: 0.05 },
+                jitter_ms_range: None,
+                attempt_reset_after_secs: Some(1),
+            },
+            initial_reconnect_jitter_max: Some(Duration::ZERO),
+            stall_timeout: Duration::from_millis(500),
+            idle_ping_interval: Duration::from_secs(1),
+            pong_timeout: Duration::from_secs(1),
+            pong_max_misses: 2,
+            heartbeat_check_interval: Duration::from_millis(100),
+        }
+    }
+}
 
 fn record_outage_failure(detector: &Arc<std::sync::Mutex<OutageDetector>>, signal: OutageSignal) {
     let transition = {
@@ -171,13 +215,14 @@ impl LighterConnector {
             .first()
             .cloned()
             .unwrap_or_else(|| "BTC".to_string());
+        let ws_timing = self.ws_timing;
 
         // Spawn WebSocket handler task with reconnection logic
         let ws_url_clone = ws_url.clone();
         tokio::spawn(async move {
             use rand::Rng;
 
-            let reconnect_policy = crate::ws_reconnect::WsReconnectPolicy::lighter();
+            let reconnect_policy = ws_timing.reconnect_policy;
             let mut reconnect_attempt = 0u32;
             let mut last_reconnect_time = std::time::SystemTime::now();
 
@@ -222,18 +267,19 @@ impl LighterConnector {
                     // the same traffic over a window twice as wide, halving
                     // peak weight/s while staying well inside Lighter's 60s
                     // rolling window.
-                    let reconnect_jitter_secs: u64 = std::env::var("LIGHTER_RECONNECT_JITTER_SECS")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(30);
-                    if reconnect_jitter_secs > 0 {
-                        let jitter = rand::thread_rng().gen_range(0..=reconnect_jitter_secs);
-                        log::info!(
-                            "Reconnect jitter: sleeping {}s (max {}s)",
-                            jitter,
-                            reconnect_jitter_secs
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
+                    let reconnect_jitter_max =
+                        ws_timing.initial_reconnect_jitter_max.unwrap_or_else(|| {
+                            let secs = std::env::var("LIGHTER_RECONNECT_JITTER_SECS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(30);
+                            Duration::from_secs(secs)
+                        });
+                    if reconnect_jitter_max > Duration::ZERO {
+                        let max_secs = reconnect_jitter_max.as_secs();
+                        let jitter = rand::thread_rng().gen_range(0..=max_secs);
+                        log::info!("Reconnect jitter: sleeping {}s (max {}s)", jitter, max_secs);
+                        tokio::time::sleep(Duration::from_secs(jitter)).await;
                     }
                 }
 
@@ -494,15 +540,15 @@ impl LighterConnector {
                         // Heartbeat strategy: WebSocket control frame ping-pong only
                         // Server requires at least one frame every 2 minutes to keep connection alive.
                         // We send a control Ping every 20s which is well within that limit.
-                        const IDLE_PING_SECS: u64 = 20; // Client ping interval
-                                                        // Pong timeout: tolerate transient RTT spikes (cross-region WS to AWS
-                                                        // can briefly stall under congestion). Combined with the 5s check
-                                                        // granularity and the 2-strike rule below, a real dead connection is
-                                                        // still detected within ~40s, while one-shot packet loss no longer
-                                                        // forces a reconnect (bot-strategy#47).
-                        const PONG_TIMEOUT_SECS: u64 = 15;
-                        const PONG_MAX_MISSES: u32 = 2; // Require N consecutive misses before reconnect
-                        const HEARTBEAT_CHECK_SECS: u64 = 5; // Check interval for heartbeat logic
+                        let idle_ping_secs = ws_timing.idle_ping_interval.as_secs();
+                        // Pong timeout: tolerate transient RTT spikes (cross-region WS to AWS
+                        // can briefly stall under congestion). Combined with the check
+                        // granularity and the 2-strike default below, a real dead connection
+                        // is still detected within ~40s, while one-shot packet loss no longer
+                        // forces a reconnect (bot-strategy#47).
+                        let pong_timeout_secs = ws_timing.pong_timeout.as_secs();
+                        let pong_max_misses = ws_timing.pong_max_misses;
+                        let heartbeat_check_interval = ws_timing.heartbeat_check_interval;
 
                         fn get_pong_payload(ping_payload: &[u8]) -> Vec<u8> {
                             // Always echo for strict server compliance
@@ -542,9 +588,8 @@ impl LighterConnector {
                         let ping_conn_label = conn_label.clone();
 
                         let ping_task = tokio::spawn(async move {
-                            let mut heartbeat_interval = tokio::time::interval(
-                                std::time::Duration::from_secs(HEARTBEAT_CHECK_SECS),
-                            );
+                            let mut heartbeat_interval =
+                                tokio::time::interval(heartbeat_check_interval);
                             heartbeat_interval
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -564,7 +609,7 @@ impl LighterConnector {
                                         // Send WebSocket control Ping regularly (every 20s)
                                         // Server requires at least one frame every 2 minutes
                                         if !ping_pending_client_ping.load(Ordering::SeqCst)
-                                            && idle_tx >= IDLE_PING_SECS
+                                            && idle_tx >= idle_ping_secs
                                         {
                                             let payload: [u8; 8] = now.to_be_bytes();
                                             *ping_last_client_ping_payload.lock() = payload.to_vec();
@@ -595,16 +640,16 @@ impl LighterConnector {
                                         if ping_pending_client_ping.load(Ordering::SeqCst) {
                                             let sent_at = ping_sent_at_clone.load(Ordering::SeqCst);
                                             let waited = now.saturating_sub(sent_at);
-                                            if waited >= PONG_TIMEOUT_SECS {
+                                            if waited >= pong_timeout_secs {
                                                 let misses = pong_miss_count_clone
                                                     .fetch_add(1, Ordering::SeqCst)
                                                     + 1;
-                                                if misses < PONG_MAX_MISSES {
+                                                if misses < pong_max_misses {
                                                     log::info!(
                                                         "Pong missed ({}s, {}/{} strikes), retrying (conn={})",
                                                         waited,
                                                         misses,
-                                                        PONG_MAX_MISSES,
+                                                        pong_max_misses,
                                                         ping_conn_label,
                                                     );
                                                     // Allow a fresh ping next tick instead of reconnecting
@@ -635,14 +680,17 @@ impl LighterConnector {
                         log::debug!("Starting WebSocket message handling loop");
 
                         loop {
-                            let next = match tokio::time::timeout(WS_STALL_TIMEOUT, read.next())
-                                .await
+                            let next = match tokio::time::timeout(
+                                ws_timing.stall_timeout,
+                                read.next(),
+                            )
+                            .await
                             {
                                 Ok(next) => next,
                                 Err(_elapsed) => {
                                     log::warn!(
                                         "Lighter WS stalled — no frame for {}s, forcing reconnect (conn={})",
-                                        WS_STALL_TIMEOUT.as_secs(),
+                                        ws_timing.stall_timeout.as_secs(),
                                         conn_label
                                     );
                                     record_outage_failure(&outage_detector, OutageSignal::Ws);
@@ -1780,6 +1828,503 @@ impl LighterConnector {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fake_exchange_tests {
+    use super::*;
+    use crate::lighter_connector::market_cache::MarketInfo;
+    use crate::LighterConnectorConfig;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[derive(Clone, Copy)]
+    enum FirstConnectionFault {
+        Close,
+        NoControlPong,
+        Stall,
+    }
+
+    async fn scripted_lighter_server(
+        first_fault: FirstConnectionFault,
+        fill_after_reconnect: bool,
+    ) -> (String, mpsc::Receiver<Vec<String>>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake exchange");
+        let url = format!("ws://{}", listener.local_addr().expect("listener addr"));
+        let (seen_tx, seen_rx) = mpsc::channel(4);
+
+        let handle = tokio::spawn(async move {
+            for conn_idx in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept fake WS client");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept WS handshake");
+
+                let mut subscriptions = Vec::new();
+                while subscriptions.len() < 3 {
+                    let next = tokio::time::timeout(Duration::from_secs(1), ws.next())
+                        .await
+                        .expect("client subscription timeout")
+                        .expect("client stream ended before subscriptions")
+                        .expect("read client subscription");
+                    match next {
+                        Message::Text(text) => subscriptions.push(text),
+                        Message::Ping(payload) => ws
+                            .send(Message::Pong(payload))
+                            .await
+                            .expect("pong to client ping"),
+                        Message::Close(_) => return,
+                        _ => {}
+                    }
+                }
+                seen_tx
+                    .send(subscriptions)
+                    .await
+                    .expect("send observed subscriptions");
+
+                let (bid, ask, ts) = if conn_idx == 0 {
+                    ("60000.0", "60001.0", 1_782_300_000_000_000u64)
+                } else {
+                    ("60010.0", "60011.0", 1_782_300_001_000_000u64)
+                };
+                let frame = json!({
+                    "type": "subscribed/order_book",
+                    "channel": "order_book/1",
+                    "last_updated_at": ts,
+                    "order_book": {
+                        "bids": [{ "price": bid, "size": "1.0" }],
+                        "asks": [{ "price": ask, "size": "1.0" }]
+                    }
+                });
+                ws.send(Message::Text(frame.to_string()))
+                    .await
+                    .expect("send orderbook frame");
+
+                if conn_idx == 1 && fill_after_reconnect {
+                    let fill_frame = json!({
+                        "type": "update/account_all",
+                        "channel": "account_all/42",
+                        "positions": [],
+                        "fills": [{
+                            "order_id": "fill-after-reconnect",
+                            "trade_id": "9001",
+                            "size": "0.010",
+                            "price": "60012.0",
+                            "side": "buy"
+                        }]
+                    });
+                    ws.send(Message::Text(fill_frame.to_string()))
+                        .await
+                        .expect("send account fill frame");
+                }
+
+                if conn_idx == 0 {
+                    match first_fault {
+                        FirstConnectionFault::Close => {
+                            let _ = ws.close(None).await;
+                        }
+                        FirstConnectionFault::NoControlPong => {
+                            for i in 0..40u64 {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                let frame = json!({
+                                    "type": "update/order_book",
+                                    "channel": "order_book/1",
+                                    "last_updated_at": 1_782_300_000_000_001u64 + i,
+                                    "order_book": {
+                                        "bids": [{ "price": "60000.0", "size": "1.0" }],
+                                        "asks": [{ "price": "60001.0", "size": "1.0" }]
+                                    }
+                                });
+                                if ws.send(Message::Text(frame.to_string())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        FirstConnectionFault::Stall => {
+                            while let Some(msg) = ws.next().await {
+                                match msg {
+                                    Ok(Message::Ping(payload)) => {
+                                        let _ = ws.send(Message::Pong(payload)).await;
+                                    }
+                                    Ok(Message::Close(_)) | Err(_) => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    while let Some(msg) = ws.next().await {
+                        match msg {
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) | Err(_) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        (url, seen_rx, handle)
+    }
+
+    async fn outage_latch_clear_server(
+        close_count: usize,
+    ) -> (String, oneshot::Sender<()>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake exchange");
+        let url = format!("ws://{}", listener.local_addr().expect("listener addr"));
+        let (gate_tx, gate_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            for _ in 0..close_count {
+                let (stream, _) = listener.accept().await.expect("accept failed WS client");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept failed WS handshake");
+
+                let mut subscriptions = 0;
+                while subscriptions < 3 {
+                    let next = tokio::time::timeout(Duration::from_secs(1), ws.next())
+                        .await
+                        .expect("client subscription timeout")
+                        .expect("client stream ended before subscriptions")
+                        .expect("read client subscription");
+                    match next {
+                        Message::Text(_) => subscriptions += 1,
+                        Message::Ping(payload) => ws
+                            .send(Message::Pong(payload))
+                            .await
+                            .expect("pong to client ping"),
+                        Message::Close(_) => return,
+                        _ => {}
+                    }
+                }
+                drop(ws);
+            }
+
+            let _ = gate_rx.await;
+
+            let (stream, _) = listener.accept().await.expect("accept recovery WS client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept recovery WS handshake");
+
+            let mut subscriptions = 0;
+            while subscriptions < 3 {
+                let next = tokio::time::timeout(Duration::from_secs(1), ws.next())
+                    .await
+                    .expect("client subscription timeout")
+                    .expect("client stream ended before subscriptions")
+                    .expect("read client subscription");
+                match next {
+                    Message::Text(_) => subscriptions += 1,
+                    Message::Ping(payload) => ws
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("pong to client ping"),
+                    Message::Close(_) => return,
+                    _ => {}
+                }
+            }
+
+            for (bid, ask, ts) in [
+                ("60020.0", "60021.0", 1_782_300_002_000_000u64),
+                ("60030.0", "60031.0", 1_782_300_003_000_000u64),
+                ("60040.0", "60041.0", 1_782_300_004_000_000u64),
+            ] {
+                let frame = json!({
+                    "type": "subscribed/order_book",
+                    "channel": "order_book/1",
+                    "last_updated_at": ts,
+                    "order_book": {
+                        "bids": [{ "price": bid, "size": "1.0" }],
+                        "asks": [{ "price": ask, "size": "1.0" }]
+                    }
+                });
+                ws.send(Message::Text(frame.to_string()))
+                    .await
+                    .expect("send recovery orderbook frame");
+            }
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    Ok(Message::Ping(payload)) => {
+                        let _ = ws.send(Message::Pong(payload)).await;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        (url, gate_tx, handle)
+    }
+
+    fn test_connector(ws_url: String) -> LighterConnector {
+        let mut connector = LighterConnector::new(LighterConnectorConfig {
+            api_key_public: "test-key".to_string(),
+            api_key_index: 0,
+            api_private_key_hex: "00".repeat(40),
+            evm_wallet_private_key: None,
+            account_index: 42,
+            base_url: "http://127.0.0.1:9".to_string(),
+            websocket_url: ws_url,
+            tracked_symbols: vec!["BTC".to_string()],
+            ob_stale_secs: None,
+        })
+        .expect("construct test connector");
+        connector.ws_timing = WsTimingConfig::fast_for_tests();
+        connector
+    }
+
+    async fn seed_btc_market(connector: &LighterConnector) {
+        let info = MarketInfo {
+            canonical_symbol: "BTC".to_string(),
+            market_id: 1,
+            price_decimals: 1,
+            size_decimals: 5,
+            min_order: Some(Decimal::new(1, 5)),
+        };
+        let mut cache = connector.market_cache.write().await;
+        cache.by_symbol.clear();
+        cache.by_id.clear();
+        cache.by_symbol.insert("BTC".to_string(), info.clone());
+        cache.by_id.insert(1, info);
+    }
+
+    async fn wait_for_mid(connector: &LighterConnector, expected: Decimal) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some((mid, _)) = connector.current_price.read().await.get("BTC") {
+                if *mid == expected {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for BTC mid {}",
+                expected
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_outage_reason(connector: &LighterConnector, expected: Option<&'static str>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let actual = connector
+                .outage_detector
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reason();
+            if actual == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for outage reason {:?}, last seen {:?}",
+                expected,
+                actual
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_filled_order(connector: &LighterConnector, order_id: &str) -> FilledOrder {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let maybe_order = connector
+                .filled_orders
+                .read()
+                .await
+                .get("BTC")
+                .and_then(|orders| orders.iter().find(|order| order.order_id == order_id))
+                .cloned();
+            if let Some(order) = maybe_order {
+                return order;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for filled order {}",
+                order_id
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn assert_lighter_subscriptions(subs: &[String]) {
+        assert!(
+            subs.iter()
+                .any(|s| s.contains(r#""channel":"order_book/1""#)),
+            "missing order_book subscription: {:?}",
+            subs
+        );
+        assert!(
+            subs.iter()
+                .any(|s| s.contains(r#""channel":"market_stats/1""#)),
+            "missing market_stats subscription: {:?}",
+            subs
+        );
+        assert!(
+            subs.iter()
+                .any(|s| s.contains(r#""channel":"account_all/42""#)),
+            "missing account subscription: {:?}",
+            subs
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_resubscribes_and_resumes_orderbook_updates() {
+        let (ws_url, mut seen_subs, server) =
+            scripted_lighter_server(FirstConnectionFault::Close, false).await;
+        let connector = test_connector(ws_url);
+        seed_btc_market(&connector).await;
+        connector.is_running.store(true, Ordering::SeqCst);
+
+        connector.start_websocket().await.expect("start WS task");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), seen_subs.recv())
+            .await
+            .expect("first connection subscriptions timeout")
+            .expect("first connection subscriptions");
+        assert_lighter_subscriptions(&first);
+        wait_for_mid(&connector, Decimal::new(600005, 1)).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(2), seen_subs.recv())
+            .await
+            .expect("reconnect subscriptions timeout")
+            .expect("reconnect subscriptions");
+        assert_lighter_subscriptions(&second);
+        wait_for_mid(&connector, Decimal::new(600105, 1)).await;
+
+        connector.is_running.store(false, Ordering::SeqCst);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fills_after_reconnect_are_cached() {
+        let (ws_url, mut seen_subs, server) =
+            scripted_lighter_server(FirstConnectionFault::Close, true).await;
+        let connector = test_connector(ws_url);
+        seed_btc_market(&connector).await;
+        connector.is_running.store(true, Ordering::SeqCst);
+
+        connector.start_websocket().await.expect("start WS task");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), seen_subs.recv())
+            .await
+            .expect("first connection subscriptions timeout")
+            .expect("first connection subscriptions");
+        assert_lighter_subscriptions(&first);
+        wait_for_mid(&connector, Decimal::new(600005, 1)).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(2), seen_subs.recv())
+            .await
+            .expect("reconnect subscriptions timeout")
+            .expect("reconnect subscriptions");
+        assert_lighter_subscriptions(&second);
+        wait_for_mid(&connector, Decimal::new(600105, 1)).await;
+
+        let fill = wait_for_filled_order(&connector, "fill-after-reconnect").await;
+        assert_eq!(fill.trade_id, "9001");
+        assert_eq!(fill.filled_side, Some(OrderSide::Long));
+        assert_eq!(fill.filled_size, Some(Decimal::new(10, 3)));
+        assert_eq!(fill.filled_value, Some(Decimal::new(600120, 3)));
+
+        connector.is_running.store(false, Ordering::SeqCst);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missed_control_pong_forces_reconnect_and_resubscribe() {
+        let (ws_url, mut seen_subs, server) =
+            scripted_lighter_server(FirstConnectionFault::NoControlPong, false).await;
+        let mut connector = test_connector(ws_url);
+        connector.ws_timing.stall_timeout = Duration::from_secs(5);
+        seed_btc_market(&connector).await;
+        connector.is_running.store(true, Ordering::SeqCst);
+
+        connector.start_websocket().await.expect("start WS task");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), seen_subs.recv())
+            .await
+            .expect("first connection subscriptions timeout")
+            .expect("first connection subscriptions");
+        assert_lighter_subscriptions(&first);
+        wait_for_mid(&connector, Decimal::new(600005, 1)).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(6), seen_subs.recv())
+            .await
+            .expect("control-pong reconnect subscriptions timeout")
+            .expect("control-pong reconnect subscriptions");
+        assert_lighter_subscriptions(&second);
+        wait_for_mid(&connector, Decimal::new(600105, 1)).await;
+
+        connector.is_running.store(false, Ordering::SeqCst);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn silent_stall_forces_reconnect_and_resubscribe() {
+        let (ws_url, mut seen_subs, server) =
+            scripted_lighter_server(FirstConnectionFault::Stall, false).await;
+        let connector = test_connector(ws_url);
+        seed_btc_market(&connector).await;
+        connector.is_running.store(true, Ordering::SeqCst);
+
+        connector.start_websocket().await.expect("start WS task");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), seen_subs.recv())
+            .await
+            .expect("first connection subscriptions timeout")
+            .expect("first connection subscriptions");
+        assert_lighter_subscriptions(&first);
+        wait_for_mid(&connector, Decimal::new(600005, 1)).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(3), seen_subs.recv())
+            .await
+            .expect("stall reconnect subscriptions timeout")
+            .expect("stall reconnect subscriptions");
+        assert_lighter_subscriptions(&second);
+        wait_for_mid(&connector, Decimal::new(600105, 1)).await;
+
+        connector.is_running.store(false, Ordering::SeqCst);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn outage_detector_latches_and_clears_under_ws_flow() {
+        let (ws_url, allow_recovery, server) = outage_latch_clear_server(6).await;
+        let mut connector = test_connector(ws_url);
+        connector.ws_timing.reconnect_policy = crate::ws_reconnect::WsReconnectPolicy {
+            curve: crate::ws_reconnect::BackoffCurve::Linear { delay_secs: 0.01 },
+            jitter_ms_range: None,
+            attempt_reset_after_secs: Some(1),
+        };
+        connector.ws_timing.stall_timeout = Duration::from_millis(100);
+        seed_btc_market(&connector).await;
+        connector.is_running.store(true, Ordering::SeqCst);
+
+        connector.start_websocket().await.expect("start WS task");
+
+        wait_for_outage_reason(&connector, Some("ws")).await;
+        allow_recovery.send(()).expect("allow recovery connection");
+        wait_for_outage_reason(&connector, None).await;
+        wait_for_mid(&connector, Decimal::new(600405, 1)).await;
+
+        connector.is_running.store(false, Ordering::SeqCst);
+        server.abort();
     }
 }
 
