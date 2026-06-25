@@ -65,6 +65,7 @@ impl LighterConnector {
             ob_stale_after: Duration::from_secs(ob_stale_secs),
             funding_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             price_update_tx: tokio::sync::broadcast::channel(128).0,
+            ws_timing: WsTimingConfig::default(),
             rate_limiter: crate::lighter_ratelimit::RateLimitClient::from_env(),
         })
     }

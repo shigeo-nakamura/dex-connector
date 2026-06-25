@@ -93,6 +93,7 @@ use protocol::{
     ORDER_TYPE_TRIGGER, SIDE_BUY, SIDE_SELL, TIF_GTT, TIF_IOC, TIF_POST_ONLY,
 };
 use rest::track_api_call;
+use ws::WsTimingConfig;
 
 /// Bundled account-side cache shared between REST (`get_balance` /
 /// `get_positions`) and WS (`handle_account_update` / fill detection).
@@ -180,6 +181,10 @@ pub struct LighterConnector {
     funding_rate_cache: Arc<RwLock<HashMap<u32, Decimal>>>,
     // Broadcast sender for real-time price updates from WS OB changes
     price_update_tx: tokio::sync::broadcast::Sender<crate::PriceUpdate>,
+    // Timing contract for WS reconnect / heartbeat / stall detection.
+    // Defaults match production constants; unit tests can shrink the values
+    // enough to exercise reconnect paths without minute-long sleeps.
+    ws_timing: WsTimingConfig,
     // Host-shared weight-based rate limiter (bot-strategy#79). Routes every
     // Lighter REST call through the sidecar daemon (or an in-process fallback
     // bucket) so the per-IP 60k weight/min ceiling is respected even when
