@@ -1,7 +1,7 @@
 [Unit]
 # Lighter spot/perp basis logger - read-only Phase 0 collector
-# (bot-strategy#573). Separate observe-only unit; does NOT touch
-# debot-pair-btceth.
+# (bot-strategy#573). Uses Lighter public WebSocket order_book/market_stats
+# streams; separate observe-only unit; does NOT touch debot-pair-btceth.
 Description=Lighter spot/perp basis logger (read-only, bot-strategy#573)
 After=network-online.target
 Wants=network-online.target
@@ -11,6 +11,7 @@ Type=simple
 ExecStart=/opt/rwa-logger/bin/lighter-basis-logger
 Environment=RUST_LOG=info
 Environment=LIGHTER_BASIS_LOG_DIR=/opt/debot-rwa
+Environment=LIGHTER_WS_URL=wss://mainnet.zklighter.elliot.ai/stream
 Environment=LIGHTER_BASIS_POLL_SECS=10
 Environment=LIGHTER_BASIS_ORDERBOOK_LIMIT=100
 Environment=LIGHTER_BASIS_DEPTH_BPS=25

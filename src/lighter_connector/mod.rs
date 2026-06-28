@@ -192,6 +192,25 @@ pub struct LighterConnector {
     rate_limiter: crate::lighter_ratelimit::RateLimitClient,
 }
 
+fn env_flag_enabled(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .map(|v| {
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+fn lighter_rest_fallback_disabled() -> bool {
+    env_flag_enabled(
+        std::env::var("LIGHTER_DISABLE_REST_FALLBACK")
+            .ok()
+            .as_deref(),
+    )
+}
+
 #[derive(Clone, Debug)]
 struct NonceCache {
     next_nonce: u64,

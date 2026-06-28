@@ -1,40 +1,25 @@
-//! Lighter spot/perp basis logger (bot-strategy#573).
+//! Lighter spot/perp basis logger (bot-strategy#573 / #663).
 //!
-//! Phase 0 read-only collector for the narrow single-venue spot/perp surface
-//! found on Lighter. It polls public order books for configured spot/perp
-//! market-id pairs, joins the current perp funding rate, and writes one compact
-//! JSONL row per symbol per tick. It does NOT place orders and needs no auth.
-//!
-//! ## Env vars
-//! - `LIGHTER_BASIS_MARKETS` - comma-separated `label:spot_market_id:perp_market_id`
-//!                            entries, e.g. `ETH:2048:0,LIT:2049:120`.
-//! - `LIGHTER_BASIS_LOG_DIR` (default `.`) - output directory.
-//! - `LIGHTER_BASIS_POLL_SECS` (default `10`) - poll cadence.
-//! - `LIGHTER_BASIS_ORDERBOOK_LIMIT` (default `100`, max `250`).
-//! - `LIGHTER_BASIS_DEPTH_BPS` (default `25`) - depth window around mid.
-//! - `LIGHTER_BASE_URL` (default `https://mainnet.zklighter.elliot.ai`).
-//!
-//! ## Output
-//! `<LIGHTER_BASIS_LOG_DIR>/lighter_basis_YYYYMMDD.jsonl`, one row per pair:
-//! `perp_minus_spot_bps` is positive when the perp mid is rich versus spot.
+//! Consumes Lighter public WebSocket `order_book/{id}` and `market_stats/{id}`
+//! streams and writes spot/perp basis JSONL without using Lighter REST.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use reqwest::StatusCode;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::Message;
 
 use rwa_logger::resolve_poll_secs;
 
-const DEFAULT_LIGHTER_BASE: &str = "https://mainnet.zklighter.elliot.ai";
+const DEFAULT_LIGHTER_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 const DEFAULT_ORDERBOOK_LIMIT: u64 = 100;
 const MAX_ORDERBOOK_LIMIT: u64 = 250;
 const DEFAULT_DEPTH_BPS: f64 = 25.0;
-const USER_AGENT: &str = "lighter-basis-logger/0.1 (+bot-strategy#573)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BasisMarket {
@@ -53,7 +38,29 @@ struct BookSummary {
     depth_usd: f64,
 }
 
-fn main() {
+#[derive(Clone, Debug)]
+struct BookLevel {
+    price: f64,
+    size: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BookState {
+    bids: HashMap<String, BookLevel>,
+    asks: HashMap<String, BookLevel>,
+    updated_at: Option<Instant>,
+}
+
+impl BookState {
+    fn apply(&mut self, order_book: &Value) {
+        apply_side(&mut self.bids, order_book.get("bids"));
+        apply_side(&mut self.asks, order_book.get("asks"));
+        self.updated_at = Some(Instant::now());
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let markets_spec = match std::env::var("LIGHTER_BASIS_MARKETS") {
@@ -73,8 +80,8 @@ fn main() {
         }
     };
     let log_dir = std::env::var("LIGHTER_BASIS_LOG_DIR").unwrap_or_else(|_| ".".to_string());
-    let base_url =
-        std::env::var("LIGHTER_BASE_URL").unwrap_or_else(|_| DEFAULT_LIGHTER_BASE.to_string());
+    let ws_url =
+        std::env::var("LIGHTER_WS_URL").unwrap_or_else(|_| DEFAULT_LIGHTER_WS_URL.to_string());
     let poll_secs = resolve_poll_secs(std::env::var("LIGHTER_BASIS_POLL_SECS").ok().as_deref());
     let orderbook_limit = resolve_orderbook_limit(
         std::env::var("LIGHTER_BASIS_ORDERBOOK_LIMIT")
@@ -84,21 +91,9 @@ fn main() {
     let depth_bps = resolve_depth_bps(std::env::var("LIGHTER_BASIS_DEPTH_BPS").ok().as_deref());
 
     log::info!(
-        "lighter-basis-logger starting: {} market pair(s), poll={}s, limit={}, depth={}bps, base={}, dir={}",
-        markets.len(), poll_secs, orderbook_limit, depth_bps, base_url, log_dir
+        "lighter-basis-logger starting: {} market pair(s), poll={}s, limit={}, depth={}bps, ws={}, dir={}",
+        markets.len(), poll_secs, orderbook_limit, depth_bps, ws_url, log_dir
     );
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(USER_AGENT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("failed to build http client: {e}");
-            std::process::exit(1);
-        }
-    };
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -110,25 +105,153 @@ fn main() {
     }
 
     while running.load(Ordering::SeqCst) {
-        let funding = fetch_funding_rates(&client, &base_url);
-        write_tick(
-            &client,
+        if let Err(e) = run_ws_loop(
+            &ws_url,
             &log_dir,
-            &base_url,
             &markets,
+            poll_secs,
             orderbook_limit,
             depth_bps,
-            funding.as_ref(),
-        );
-
-        let mut slept = 0u64;
-        while slept < poll_secs && running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_secs(1));
-            slept += 1;
+            Arc::clone(&running),
+        )
+        .await
+        {
+            if running.load(Ordering::SeqCst) {
+                log::warn!("lighter basis WS loop ended: {e}; reconnecting in 2s");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
     }
 
     log::info!("lighter-basis-logger stopped");
+}
+
+async fn run_ws_loop(
+    ws_url: &str,
+    log_dir: &str,
+    markets: &[BasisMarket],
+    poll_secs: u64,
+    orderbook_limit: u64,
+    depth_bps: f64,
+    running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    log::info!("Lighter basis WS connected: {ws_url}");
+
+    let subscriptions = subscriptions_for(markets);
+    let mut books: HashMap<u64, BookState> = HashMap::new();
+    let mut funding: HashMap<u64, f64> = HashMap::new();
+    let mut last_write = Instant::now()
+        .checked_sub(Duration::from_secs(poll_secs))
+        .unwrap_or_else(Instant::now);
+
+    while running.load(Ordering::SeqCst) {
+        if last_write.elapsed() >= Duration::from_secs(poll_secs) {
+            write_tick(
+                log_dir,
+                markets,
+                &books,
+                orderbook_limit,
+                depth_bps,
+                &funding,
+            );
+            last_write = Instant::now();
+        }
+
+        let next = match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(next) => next,
+            Err(_) => continue,
+        };
+        let Some(next) = next else {
+            return Err("stream closed".to_string());
+        };
+        let msg = next.map_err(|e| format!("ws read failed: {e}"))?;
+        match msg {
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .map_err(|e| format!("pong failed: {e}"))?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(frame) => return Err(format!("close frame: {frame:?}")),
+            Message::Text(text) => {
+                let value: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("non-JSON WS text ignored: {e}");
+                        continue;
+                    }
+                };
+                let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if msg_type == "connected" {
+                    for sub in &subscriptions {
+                        ws.send(Message::Text(sub.to_string()))
+                            .await
+                            .map_err(|e| format!("subscribe failed: {e}"))?;
+                    }
+                    log::info!(
+                        "sent {} Lighter basis WS subscriptions",
+                        subscriptions.len()
+                    );
+                    continue;
+                }
+                if msg_type == "ping" {
+                    ws.send(Message::Text(json!({"type": "pong"}).to_string()))
+                        .await
+                        .map_err(|e| format!("app pong failed: {e}"))?;
+                    continue;
+                }
+                if let Some(err) = value.get("error") {
+                    log::warn!("Lighter basis WS error frame: {err}");
+                    continue;
+                }
+                match msg_type {
+                    "subscribed/order_book" | "update/order_book" => {
+                        if let (Some(market_id), Some(order_book)) =
+                            (channel_market_id(&value), value.get("order_book"))
+                        {
+                            books.entry(market_id).or_default().apply(order_book);
+                        }
+                    }
+                    "subscribed/market_stats" | "update/market_stats" => {
+                        if let (Some(market_id), Some(rate)) =
+                            (channel_market_id(&value), market_stats_funding_rate(&value))
+                        {
+                            funding.insert(market_id, rate);
+                        }
+                    }
+                    _ => log::trace!("ignored Lighter basis WS type={msg_type}"),
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn subscriptions_for(markets: &[BasisMarket]) -> Vec<Value> {
+    let mut book_ids = HashSet::new();
+    let mut stats_ids = HashSet::new();
+    for market in markets {
+        book_ids.insert(market.spot_market_id);
+        book_ids.insert(market.perp_market_id);
+        stats_ids.insert(market.perp_market_id);
+    }
+    let mut book_ids: Vec<_> = book_ids.into_iter().collect();
+    book_ids.sort_unstable();
+    let mut stats_ids: Vec<_> = stats_ids.into_iter().collect();
+    stats_ids.sort_unstable();
+
+    let mut out = Vec::new();
+    for id in book_ids {
+        out.push(json!({"type": "subscribe", "channel": format!("order_book/{id}")}));
+    }
+    for id in stats_ids {
+        out.push(json!({"type": "subscribe", "channel": format!("market_stats/{id}")}));
+    }
+    out
 }
 
 fn parse_basis_markets(spec: &str) -> Result<Vec<BasisMarket>, String> {
@@ -201,94 +324,71 @@ fn fnum(node: &Value, key: &str) -> Option<f64> {
     }
 }
 
-fn market_id_value(node: &Value) -> Option<u64> {
-    match node.get("market_id") {
-        Some(Value::Number(n)) => n.as_u64(),
-        Some(Value::String(s)) => s.parse::<u64>().ok(),
-        _ => None,
-    }
+fn channel_market_id(message: &Value) -> Option<u64> {
+    message
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .and_then(|channel| channel.rsplit(['/', ':']).next())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
-fn fetch_json(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    context: &str,
-) -> Result<Value, String> {
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("{context} request failed: {e}"))?;
-    let status = resp.status();
-    let body = resp
-        .json::<Value>()
-        .map_err(|e| format!("{context} {status}, body not JSON: {e}"))?;
-    if status == StatusCode::OK {
-        Ok(body)
-    } else {
-        Err(format!("{context} returned {status}: {body}"))
-    }
+fn market_stats_funding_rate(message: &Value) -> Option<f64> {
+    let raw = message
+        .get("market_stats")
+        .and_then(|s| s.get("funding_rate"))
+        .and_then(value_as_f64)?;
+    Some(raw / 100.0)
 }
 
-fn fetch_order_book(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-    market_id: u64,
-    limit: u64,
-) -> Result<Value, String> {
-    let url = format!("{base_url}/api/v1/orderBookOrders?market_id={market_id}&limit={limit}");
-    fetch_json(
-        client,
-        &url,
-        &format!("orderBookOrders market_id={market_id}"),
-    )
-}
-
-fn fetch_funding_rates(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-) -> Option<HashMap<u64, Value>> {
-    let url = format!("{base_url}/api/v1/funding-rates");
-    let body = match fetch_json(client, &url, "funding-rates") {
-        Ok(body) => body,
-        Err(e) => {
-            log::warn!("{e}");
-            return None;
-        }
+fn apply_side(dst: &mut HashMap<String, BookLevel>, raw: Option<&Value>) {
+    let Some(rows) = raw.and_then(|v| v.as_array()) else {
+        return;
     };
-    let mut out = HashMap::new();
-    if let Some(rows) = body.get("funding_rates").and_then(|v| v.as_array()) {
-        for row in rows {
-            if let Some(market_id) = market_id_value(row) {
-                out.insert(market_id, row.clone());
-            }
+    for row in rows {
+        let Some((key, price)) = row_price_key(row) else {
+            continue;
+        };
+        let Some(size) = row_size(row) else {
+            continue;
+        };
+        if !price.is_finite() || !size.is_finite() {
+            continue;
+        }
+        if size <= 0.0 {
+            dst.remove(&key);
+        } else {
+            dst.insert(key, BookLevel { price, size });
         }
     }
-    Some(out)
 }
 
-fn order_rows<'a>(body: &'a Value, side: &str) -> Vec<&'a Value> {
-    let src = body
-        .get("order_book")
-        .filter(|v| v.is_object())
-        .unwrap_or(body);
-    src.get(side)
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().collect())
-        .unwrap_or_default()
-}
-
-fn row_price(row: &Value) -> Option<f64> {
+fn row_price_key(row: &Value) -> Option<(String, f64)> {
     match row {
-        Value::Object(_) => fnum(row, "price").or_else(|| fnum(row, "p")),
-        Value::Array(a) => a.first().and_then(value_as_f64),
+        Value::Object(_) => row
+            .get("price")
+            .or_else(|| row.get("p"))
+            .and_then(|v| match v {
+                Value::String(s) if !s.is_empty() => {
+                    s.parse::<f64>().ok().map(|price| (s.clone(), price))
+                }
+                Value::Number(n) => n.as_f64().map(|price| (n.to_string(), price)),
+                _ => None,
+            }),
+        Value::Array(a) => a.first().and_then(|v| match v {
+            Value::String(s) if !s.is_empty() => {
+                s.parse::<f64>().ok().map(|price| (s.clone(), price))
+            }
+            Value::Number(n) => n.as_f64().map(|price| (n.to_string(), price)),
+            _ => None,
+        }),
         _ => None,
     }
 }
 
 fn row_size(row: &Value) -> Option<f64> {
     match row {
-        Value::Object(_) => fnum(row, "remaining_base_amount")
-            .or_else(|| fnum(row, "size"))
+        Value::Object(_) => fnum(row, "size")
+            .or_else(|| fnum(row, "remaining_base_amount"))
             .or_else(|| fnum(row, "amount"))
             .or_else(|| fnum(row, "q")),
         Value::Array(a) => a.get(1).and_then(value_as_f64),
@@ -304,20 +404,35 @@ fn value_as_f64(v: &Value) -> Option<f64> {
     }
 }
 
-fn summarize_book(body: &Value, depth_bps: f64) -> Result<BookSummary, String> {
-    let bids = order_rows(body, "bids");
-    let asks = order_rows(body, "asks");
+fn summarize_state(
+    state: &BookState,
+    depth_bps: f64,
+    orderbook_limit: u64,
+) -> Result<BookSummary, String> {
+    let mut bids: Vec<_> = state.bids.values().collect();
+    let mut asks: Vec<_> = state.asks.values().collect();
+    bids.sort_by(|a, b| {
+        b.price
+            .partial_cmp(&a.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    asks.sort_by(|a, b| {
+        a.price
+            .partial_cmp(&b.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bids.truncate(orderbook_limit as usize);
+    asks.truncate(orderbook_limit as usize);
+
     let bid = bids
-        .iter()
-        .filter_map(|r| row_price(r))
+        .first()
+        .map(|level| level.price)
         .filter(|p| p.is_finite() && *p > 0.0)
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .ok_or_else(|| "missing bid".to_string())?;
     let ask = asks
-        .iter()
-        .filter_map(|r| row_price(r))
+        .first()
+        .map(|level| level.price)
         .filter(|p| p.is_finite() && *p > 0.0)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .ok_or_else(|| "missing ask".to_string())?;
     if ask < bid {
         return Err(format!("crossed book bid={bid} ask={ask}"));
@@ -328,18 +443,14 @@ fn summarize_book(body: &Value, depth_bps: f64) -> Result<BookSummary, String> {
     let lo = mid * (1.0 - depth_bps / 10_000.0);
     let hi = mid * (1.0 + depth_bps / 10_000.0);
     let mut depth_usd = 0.0;
-    for row in bids {
-        if let (Some(p), Some(s)) = (row_price(row), row_size(row)) {
-            if p >= lo && p.is_finite() && s.is_finite() && s > 0.0 {
-                depth_usd += p * s;
-            }
+    for level in bids {
+        if level.price >= lo && level.size > 0.0 {
+            depth_usd += level.price * level.size;
         }
     }
-    for row in asks {
-        if let (Some(p), Some(s)) = (row_price(row), row_size(row)) {
-            if p <= hi && p.is_finite() && s.is_finite() && s > 0.0 {
-                depth_usd += p * s;
-            }
+    for level in asks {
+        if level.price <= hi && level.size > 0.0 {
+            depth_usd += level.price * level.size;
         }
     }
 
@@ -364,20 +475,13 @@ fn book_json(book: &BookSummary) -> Value {
     })
 }
 
-fn funding_rate_for(funding: Option<&HashMap<u64, Value>>, market_id: u64) -> Option<f64> {
-    funding
-        .and_then(|m| m.get(&market_id))
-        .and_then(|row| fnum(row, "rate"))
-}
-
 fn write_tick(
-    client: &reqwest::blocking::Client,
     log_dir: &str,
-    base_url: &str,
     markets: &[BasisMarket],
+    books: &HashMap<u64, BookState>,
     orderbook_limit: u64,
     depth_bps: f64,
-    funding: Option<&HashMap<u64, Value>>,
+    funding: &HashMap<u64, f64>,
 ) {
     let now = chrono::Utc::now();
     let path = format!("{log_dir}/lighter_basis_{}.jsonl", now.format("%Y%m%d"));
@@ -392,43 +496,37 @@ fn write_tick(
 
     for market in markets {
         let mut error = None;
-        let mut spot = None;
-        let mut perp = None;
-
-        match fetch_order_book(client, base_url, market.spot_market_id, orderbook_limit)
-            .and_then(|body| summarize_book(&body, depth_bps))
-        {
-            Ok(summary) => spot = Some(summary),
+        let spot = match books
+            .get(&market.spot_market_id)
+            .ok_or_else(|| "spot: waiting for websocket data".to_string())
+            .and_then(|state| {
+                summarize_state(state, depth_bps, orderbook_limit).map_err(|e| format!("spot: {e}"))
+            }) {
+            Ok(summary) => Some(summary),
             Err(e) => {
-                log::warn!(
-                    "{} spot market {}: {e}",
-                    market.label,
-                    market.spot_market_id
-                );
-                error = Some(format!("spot: {e}"));
+                error = Some(e);
+                None
             }
-        }
-
-        match fetch_order_book(client, base_url, market.perp_market_id, orderbook_limit)
-            .and_then(|body| summarize_book(&body, depth_bps))
-        {
-            Ok(summary) => perp = Some(summary),
+        };
+        let perp = match books
+            .get(&market.perp_market_id)
+            .ok_or_else(|| "perp: waiting for websocket data".to_string())
+            .and_then(|state| {
+                summarize_state(state, depth_bps, orderbook_limit).map_err(|e| format!("perp: {e}"))
+            }) {
+            Ok(summary) => Some(summary),
             Err(e) => {
-                log::warn!(
-                    "{} perp market {}: {e}",
-                    market.label,
-                    market.perp_market_id
-                );
                 let prefix = error.take().map(|s| format!("{s}; ")).unwrap_or_default();
-                error = Some(format!("{prefix}perp: {e}"));
+                error = Some(format!("{prefix}{e}"));
+                None
             }
-        }
+        };
 
         let basis_bps = match (&spot, &perp) {
             (Some(s), Some(p)) if s.mid > 0.0 => Some((p.mid - s.mid) / s.mid * 10_000.0),
             _ => None,
         };
-        let funding_rate = funding_rate_for(funding, market.perp_market_id);
+        let funding_rate = funding.get(&market.perp_market_id).copied();
         let funding_bps_per_day = funding_rate.map(|r| r * 24.0 * 10_000.0);
 
         let line = json!({
@@ -442,7 +540,7 @@ fn write_tick(
             "perp_funding_rate": funding_rate,
             "perp_funding_bps_per_day": funding_bps_per_day,
             "orderbook_limit": orderbook_limit,
-            "source": "lighter",
+            "source": "lighter_ws",
             "error": error,
         });
         if let Err(e) = writeln!(file, "{line}") {
@@ -483,18 +581,36 @@ mod tests {
     }
 
     #[test]
-    fn summarize_book_handles_lighter_shape() {
-        let body = json!({
+    fn subscriptions_skip_spot_market_stats() {
+        let subs = subscriptions_for(&[BasisMarket {
+            label: "ETH".to_string(),
+            spot_market_id: 2048,
+            perp_market_id: 0,
+        }]);
+        let channels: Vec<_> = subs
+            .iter()
+            .filter_map(|s| s.get("channel").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            channels,
+            vec!["order_book/0", "order_book/2048", "market_stats/0"]
+        );
+    }
+
+    #[test]
+    fn summarize_state_handles_lighter_ws_shape() {
+        let mut state = BookState::default();
+        state.apply(&json!({
             "bids": [
-                {"price": "99.0", "remaining_base_amount": "2.0"},
-                {"price": "100.0", "remaining_base_amount": "1.5"}
+                {"price": "99.0", "size": "2.0"},
+                {"price": "100.0", "size": "1.5"}
             ],
             "asks": [
-                {"price": "101.0", "remaining_base_amount": "1.0"},
-                {"price": "102.0", "remaining_base_amount": "2.0"}
+                {"price": "101.0", "size": "1.0"},
+                {"price": "102.0", "size": "2.0"}
             ]
-        });
-        let summary = summarize_book(&body, 100.0).unwrap();
+        }));
+        let summary = summarize_state(&state, 100.0, 100).unwrap();
         assert_eq!(summary.bid, 100.0);
         assert_eq!(summary.ask, 101.0);
         assert_eq!(summary.mid, 100.5);
@@ -503,24 +619,20 @@ mod tests {
     }
 
     #[test]
-    fn summarize_book_handles_nested_and_array_rows() {
-        let body = json!({
-            "order_book": {
-                "bids": [["10.0", "3.0"]],
-                "asks": [["10.2", "4.0"]]
-            }
-        });
-        let summary = summarize_book(&body, 200.0).unwrap();
-        assert_eq!(summary.bid, 10.0);
-        assert_eq!(summary.ask, 10.2);
-        assert_eq!(summary.depth_usd, 70.8);
+    fn apply_side_removes_zero_size_delta() {
+        let mut state = BookState::default();
+        state.apply(&json!({"bids": [{"price": "10.0", "size": "3.0"}], "asks": []}));
+        state.apply(&json!({"bids": [{"price": "10.0", "size": "0"}], "asks": []}));
+        assert!(state.bids.is_empty());
     }
 
     #[test]
-    fn funding_rate_for_uses_market_id() {
-        let mut m = HashMap::new();
-        m.insert(0, json!({"market_id": 0, "rate": 0.000048}));
-        assert_eq!(funding_rate_for(Some(&m), 0), Some(0.000048));
-        assert_eq!(funding_rate_for(Some(&m), 1), None);
+    fn market_stats_funding_rate_normalizes_pct_per_hour() {
+        let msg = json!({
+            "channel": "market_stats:0",
+            "type": "update/market_stats",
+            "market_stats": {"funding_rate": "0.0007"}
+        });
+        assert_eq!(market_stats_funding_rate(&msg), Some(0.000007));
     }
 }

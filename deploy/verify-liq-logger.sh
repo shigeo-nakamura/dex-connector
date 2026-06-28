@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Verify a freshly (re)started liquidation logger is LIVE and BOTH venues are
-# polling OK (bot-strategy#571). Used by deploy-rwa-logger.yml via SSM.
+# Verify a freshly (re)started liquidation logger is LIVE, with Lighter WS
+# subscriptions healthy and Extended polling OK (bot-strategy#571). Used by deploy-rwa-logger.yml via SSM.
 #
 # Unlike verify-logger.sh (rwa-spot / apex-perp), this logger must NOT be
 # checked by "did the output file grow per label": liquidations are rare events,
 # so a healthy logger normally writes zero rows for minutes/hours. Instead we
-# assert the per-poll heartbeat line shows every configured market polling OK:
+# assert the heartbeat line shows every configured market healthy:
 #
 #   [HEARTBEAT] poll ok: lighter=2/2, extended=2/2, new_liq=0, total_liq=0
 #
@@ -42,7 +42,7 @@ for _ in $(seq 1 30); do
     lo=${lighter%/*}; lt=${lighter#*/}
     eo=${extended%/*}; et=${extended#*/}
     # Each configured venue must be fully OK (ok==total); an unconfigured venue
-    # is total=0 (trivially OK). Require at least one venue actually polling.
+    # is total=0 (trivially OK). Require at least one venue actually healthy.
     if [ "${lo:-0}" = "${lt:-0}" ] && [ "${eo:-0}" = "${et:-0}" ] \
        && [ "$(( ${lt:-0} + ${et:-0} ))" -ge 1 ]; then
       echo "OK $unit: heartbeat healthy ($line)"
