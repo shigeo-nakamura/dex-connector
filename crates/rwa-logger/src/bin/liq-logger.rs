@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -27,6 +27,10 @@ const USER_AGENT: &str = "rwa-logger/0.1 (+bot-strategy#571/#663)";
 /// connector sends a control Ping every 20s (src/lighter_connector/ws.rs); mirror
 /// that here so a quiet trade stream is not disconnected between liquidations.
 const LIGHTER_WS_PING_SECS: u64 = 20;
+/// Serializes appends to the shared daily `liq_*.jsonl`: the Lighter WS task and
+/// the Extended blocking poller both reach `write_liq` concurrently, and their
+/// `writeln!` calls would otherwise interleave and corrupt JSONL rows.
+static LIQ_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 fn fnum(node: &Value, key: &str) -> Option<f64> {
     match node.get(key) {
@@ -264,8 +268,22 @@ async fn main() {
 
     let total_liq = Arc::new(AtomicU64::new(0));
     let lighter_ok = Arc::new(AtomicUsize::new(0));
+    let extended_ok = Arc::new(AtomicUsize::new(0));
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Single heartbeat source, independent of which collectors are enabled, so a
+    // Lighter-only config still emits `[HEARTBEAT]` (verify-liq-logger.sh needs
+    // it) even though Lighter liquidations are rare.
+    tasks.push(tokio::spawn(heartbeat_task(
+        poll_secs,
+        Arc::clone(&running),
+        Arc::clone(&lighter_ok),
+        lighter_markets.len(),
+        Arc::clone(&extended_ok),
+        extended_markets.len(),
+        Arc::clone(&total_liq),
+    )));
 
     if !lighter_markets.is_empty() {
         tasks.push(tokio::spawn(lighter_ws_task(
@@ -285,10 +303,9 @@ async fn main() {
         // never monopolize the runtime and starve the spawned Lighter WS task on
         // a single-vCPU host.
         let running = Arc::clone(&running);
-        let lighter_ok = Arc::clone(&lighter_ok);
+        let extended_ok = Arc::clone(&extended_ok);
         let total_liq = Arc::clone(&total_liq);
         let log_dir = log_dir.clone();
-        let lighter_markets_len = lighter_markets.len();
         tasks.push(tokio::task::spawn_blocking(move || {
             let client = match reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -310,8 +327,7 @@ async fn main() {
                 poll_secs,
                 seen_cap,
                 running,
-                lighter_ok,
-                lighter_markets_len,
+                extended_ok,
                 total_liq,
             );
         }));
@@ -327,6 +343,41 @@ async fn main() {
     );
 }
 
+/// Periodic `[HEARTBEAT]` emitter. Runs regardless of which collectors are
+/// enabled so a Lighter-only logger (where liquidations are rare) still produces
+/// the heartbeat line that `deploy/verify-liq-logger.sh` polls for.
+#[allow(clippy::too_many_arguments)]
+async fn heartbeat_task(
+    poll_secs: u64,
+    running: Arc<AtomicBool>,
+    lighter_ok: Arc<AtomicUsize>,
+    lighter_total: usize,
+    extended_ok: Arc<AtomicUsize>,
+    extended_total: usize,
+    total_liq: Arc<AtomicU64>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(poll_secs.max(1)));
+    let mut last_reported_total = 0u64;
+    while running.load(Ordering::SeqCst) {
+        interval.tick().await;
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        let total_now = total_liq.load(Ordering::SeqCst);
+        let new_since_last = total_now.saturating_sub(last_reported_total);
+        last_reported_total = total_now;
+        log::info!(
+            "[HEARTBEAT] poll ok: lighter={}/{}, extended={}/{}, new_liq={}, total_liq={}",
+            lighter_ok.load(Ordering::SeqCst),
+            lighter_total,
+            extended_ok.load(Ordering::SeqCst),
+            extended_total,
+            new_since_last,
+            total_now
+        );
+    }
+}
+
 /// Blocking Extended recent-trades poll loop. Runs on a dedicated blocking
 /// thread (see `main`) so its `reqwest::blocking` calls and `thread::sleep` do
 /// not occupy an async worker.
@@ -340,17 +391,15 @@ fn extended_poll_loop(
     poll_secs: u64,
     seen_cap: usize,
     running: Arc<AtomicBool>,
-    lighter_ok: Arc<AtomicUsize>,
-    lighter_markets_len: usize,
+    extended_ok: Arc<AtomicUsize>,
     total_liq: Arc<AtomicU64>,
 ) {
     let mut extended_seen = SeenRing::new(seen_cap);
     let mut extended_prev: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut last_reported_total = 0u64;
 
     while running.load(Ordering::SeqCst) {
         let mut new_this_cycle: u64 = 0;
-        let mut extended_ok = 0usize;
+        let mut ok_this_cycle = 0usize;
 
         for (label, market) in &markets {
             if !running.load(Ordering::SeqCst) {
@@ -370,7 +419,7 @@ fn extended_poll_loop(
                     let status = resp.status();
                     match resp.json::<Value>() {
                         Ok(body) if status.is_success() => {
-                            extended_ok += 1;
+                            ok_this_cycle += 1;
                             let (liqs, page_ids) = extended_liqs(&body, label, market);
                             new_this_cycle += record_page(
                                 &log_dir,
@@ -395,18 +444,8 @@ fn extended_poll_loop(
         if new_this_cycle > 0 {
             total_liq.fetch_add(new_this_cycle, Ordering::SeqCst);
         }
-        let total_now = total_liq.load(Ordering::SeqCst);
-        let new_since_last = total_now.saturating_sub(last_reported_total);
-        last_reported_total = total_now;
-        log::info!(
-            "[HEARTBEAT] poll ok: lighter={}/{}, extended={}/{}, new_liq={}, total_liq={}",
-            lighter_ok.load(Ordering::SeqCst),
-            lighter_markets_len,
-            extended_ok,
-            markets.len(),
-            new_since_last,
-            total_now
-        );
+        // Publish this cycle's health for the heartbeat task to report.
+        extended_ok.store(ok_this_cycle, Ordering::SeqCst);
 
         let mut slept = 0u64;
         while slept < poll_secs && running.load(Ordering::SeqCst) {
@@ -612,13 +651,6 @@ fn record_stream(log_dir: &str, venue: &str, liqs: &[LiqTrade], seen: &mut SeenR
 fn write_liq(log_dir: &str, venue: &str, t: &LiqTrade) {
     let now = chrono::Utc::now();
     let path = format!("{}/liq_{}.jsonl", log_dir, now.format("%Y%m%d"));
-    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            log::error!("cannot open {path}: {e}");
-            return;
-        }
-    };
     let line = json!({
         "ts": now.to_rfc3339(),
         "venue": venue,
@@ -633,8 +665,20 @@ fn write_liq(log_dir: &str, venue: &str, t: &LiqTrade) {
         "trade_ts_ms": t.trade_ts_ms,
         "raw": t.raw,
     });
-    if let Err(e) = writeln!(file, "{line}") {
-        log::error!("write failed for {venue} {}: {e}", t.label);
+    {
+        // Hold the lock across open+append so concurrent writers (Lighter WS task
+        // + Extended blocking poller) cannot interleave rows in the daily file.
+        let _guard = LIQ_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("cannot open {path}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = writeln!(file, "{line}") {
+            log::error!("write failed for {venue} {}: {e}", t.label);
+        }
     }
     log::info!(
         "LIQUIDATION {venue} {} {} price={:?} size={:?} side={:?}",
