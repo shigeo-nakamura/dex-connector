@@ -20,6 +20,10 @@ const DEFAULT_LIGHTER_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 const DEFAULT_ORDERBOOK_LIMIT: u64 = 100;
 const MAX_ORDERBOOK_LIMIT: u64 = 250;
 const DEFAULT_DEPTH_BPS: f64 = 25.0;
+/// Lighter drops a WS client that sends no frame within ~2 minutes. The basis
+/// loop only replies to server pings otherwise, so send a proactive control Ping
+/// on this cadence (mirrors the live connector's 20s heartbeat).
+const LIGHTER_WS_PING_SECS: u64 = 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BasisMarket {
@@ -49,13 +53,46 @@ struct BookState {
     bids: HashMap<String, BookLevel>,
     asks: HashMap<String, BookLevel>,
     updated_at: Option<Instant>,
+    /// Last applied matching-engine `nonce`. Used to detect dropped delta frames:
+    /// a continuous update has `begin_nonce == last_nonce`. (Lighter's `offset`
+    /// is API-server tied and not contiguous, so it cannot be used here.)
+    last_nonce: Option<u64>,
 }
 
 impl BookState {
+    /// Re-baseline from a fresh `subscribed/order_book` snapshot.
+    fn reset(&mut self) {
+        self.bids.clear();
+        self.asks.clear();
+        self.updated_at = None;
+        self.last_nonce = None;
+    }
+
+    /// True when an incremental `update/order_book` does not continue from the
+    /// last applied nonce, i.e. a frame was dropped and the book is now stale.
+    /// Returns false before a baseline exists or when nonce fields are absent.
+    fn is_gap(&self, order_book: &Value) -> bool {
+        match (self.last_nonce, ob_u64(order_book, "begin_nonce")) {
+            (Some(last), Some(begin)) => begin != last,
+            _ => false,
+        }
+    }
+
     fn apply(&mut self, order_book: &Value) {
         apply_side(&mut self.bids, order_book.get("bids"));
         apply_side(&mut self.asks, order_book.get("asks"));
         self.updated_at = Some(Instant::now());
+        if let Some(nonce) = ob_u64(order_book, "nonce") {
+            self.last_nonce = Some(nonce);
+        }
+    }
+}
+
+fn ob_u64(order_book: &Value, key: &str) -> Option<u64> {
+    match order_book.get(key) {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.parse::<u64>().ok(),
+        _ => None,
     }
 }
 
@@ -146,6 +183,7 @@ async fn run_ws_loop(
     let mut last_write = Instant::now()
         .checked_sub(Duration::from_secs(poll_secs))
         .unwrap_or_else(Instant::now);
+    let mut last_ping = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         if last_write.elapsed() >= Duration::from_secs(poll_secs) {
@@ -158,6 +196,15 @@ async fn run_ws_loop(
                 &funding,
             );
             last_write = Instant::now();
+        }
+
+        if last_ping.elapsed() >= Duration::from_secs(LIGHTER_WS_PING_SECS) {
+            // Proactive client keepalive (the 1s read timeout below guarantees we
+            // reach this at least once per second to honour the cadence).
+            ws.send(Message::Ping(Vec::new()))
+                .await
+                .map_err(|e| format!("client ping failed: {e}"))?;
+            last_ping = Instant::now();
         }
 
         let next = match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
@@ -208,11 +255,30 @@ async fn run_ws_loop(
                     continue;
                 }
                 match msg_type {
-                    "subscribed/order_book" | "update/order_book" => {
+                    "subscribed/order_book" => {
+                        // Full snapshot: replace the book and re-baseline the nonce.
                         if let (Some(market_id), Some(order_book)) =
                             (channel_market_id(&value), value.get("order_book"))
                         {
-                            books.entry(market_id).or_default().apply(order_book);
+                            let state = books.entry(market_id).or_default();
+                            state.reset();
+                            state.apply(order_book);
+                        }
+                    }
+                    "update/order_book" => {
+                        if let (Some(market_id), Some(order_book)) =
+                            (channel_market_id(&value), value.get("order_book"))
+                        {
+                            let state = books.entry(market_id).or_default();
+                            if state.is_gap(order_book) {
+                                // A dropped delta leaves stale price levels in the
+                                // book; reconnect so the next subscription delivers
+                                // a fresh snapshot rather than emitting corrupt rows.
+                                return Err(format!(
+                                    "order_book nonce gap on market {market_id}; reconnecting for snapshot"
+                                ));
+                            }
+                            state.apply(order_book);
                         }
                     }
                     "subscribed/market_stats" | "update/market_stats" => {
@@ -616,6 +682,37 @@ mod tests {
         assert_eq!(summary.mid, 100.5);
         assert!((summary.spread_bps - 99.50248756218906).abs() < 1e-9);
         assert_eq!(summary.depth_usd, 251.0);
+    }
+
+    #[test]
+    fn is_gap_detects_dropped_delta() {
+        let mut state = BookState::default();
+        // Snapshot establishes the nonce baseline.
+        state.apply(&json!({"bids": [], "asks": [], "begin_nonce": 10, "nonce": 12}));
+        // Continuous delta: begin_nonce matches the previous nonce.
+        assert!(!state.is_gap(&json!({"begin_nonce": 12, "nonce": 15})));
+        state.apply(&json!({"bids": [], "asks": [], "begin_nonce": 12, "nonce": 15}));
+        // Gapped delta: begin_nonce (16) skips ahead of the last nonce (15).
+        assert!(state.is_gap(&json!({"begin_nonce": 16, "nonce": 18})));
+    }
+
+    #[test]
+    fn is_gap_false_without_baseline_or_nonce_fields() {
+        let state = BookState::default();
+        // No baseline yet.
+        assert!(!state.is_gap(&json!({"begin_nonce": 5, "nonce": 7})));
+        // Baseline present but the frame omits nonce fields → cannot judge, allow.
+        let mut state = BookState::default();
+        state.apply(&json!({"bids": [], "asks": [], "nonce": 7}));
+        assert!(!state.is_gap(&json!({"bids": [], "asks": []})));
+    }
+
+    #[test]
+    fn ob_u64_parses_number_and_string() {
+        assert_eq!(ob_u64(&json!({"nonce": 42}), "nonce"), Some(42));
+        assert_eq!(ob_u64(&json!({"nonce": "42"}), "nonce"), Some(42));
+        assert_eq!(ob_u64(&json!({"nonce": "x"}), "nonce"), None);
+        assert_eq!(ob_u64(&json!({}), "nonce"), None);
     }
 
     #[test]

@@ -23,6 +23,10 @@ const DEFAULT_EXTENDED_BASE: &str = "https://api.starknet.extended.exchange/api/
 const DEFAULT_FETCH_LIMIT: u64 = 100;
 const DEFAULT_SEEN_CAP: usize = 20_000;
 const USER_AGENT: &str = "rwa-logger/0.1 (+bot-strategy#571/#663)";
+/// Lighter drops a WS client that sends no frame within ~2 minutes. The live
+/// connector sends a control Ping every 20s (src/lighter_connector/ws.rs); mirror
+/// that here so a quiet trade stream is not disconnected between liquidations.
+const LIGHTER_WS_PING_SECS: u64 = 20;
 
 fn fnum(node: &Value, key: &str) -> Option<f64> {
     match node.get(key) {
@@ -416,9 +420,22 @@ async fn lighter_ws_once(
         .map_err(|e| format!("connect failed: {e}"))?;
     log::info!("Lighter liquidation WS connected: {ws_url}");
     let mut acknowledged = HashSet::new();
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(LIGHTER_WS_PING_SECS));
+    ping_interval.tick().await; // consume the immediate first tick
 
     while running.load(Ordering::SeqCst) {
-        let Some(next) = ws.next().await else {
+        let next = tokio::select! {
+            _ = ping_interval.tick() => {
+                // Proactive client keepalive: the liquidation stream is often quiet
+                // for minutes, so we cannot rely on reacting to a server ping.
+                ws.send(Message::Ping(Vec::new()))
+                    .await
+                    .map_err(|e| format!("client ping failed: {e}"))?;
+                continue;
+            }
+            next = ws.next() => next,
+        };
+        let Some(next) = next else {
             return Err("stream closed".to_string());
         };
         let msg = next.map_err(|e| format!("ws read failed: {e}"))?;
