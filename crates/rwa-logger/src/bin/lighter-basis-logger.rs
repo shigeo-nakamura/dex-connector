@@ -178,6 +178,19 @@ async fn run_ws_loop(
     log::info!("Lighter basis WS connected: {ws_url}");
 
     let subscriptions = subscriptions_for(markets);
+    // Subscribe immediately after the handshake. The production connector
+    // (src/lighter_connector/ws.rs) and the Lighter WS reference both send
+    // subscribe frames directly; gating on an undocumented `type:"connected"`
+    // welcome would leave subscriptions unsent if the server never emits one.
+    for sub in &subscriptions {
+        ws.send(Message::Text(sub.to_string()))
+            .await
+            .map_err(|e| format!("subscribe failed: {e}"))?;
+    }
+    log::info!(
+        "sent {} Lighter basis WS subscriptions",
+        subscriptions.len()
+    );
     let mut books: HashMap<u64, BookState> = HashMap::new();
     let mut funding: HashMap<u64, f64> = HashMap::new();
     let mut last_write = Instant::now()
@@ -233,15 +246,9 @@ async fn run_ws_loop(
                 };
                 let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if msg_type == "connected" {
-                    for sub in &subscriptions {
-                        ws.send(Message::Text(sub.to_string()))
-                            .await
-                            .map_err(|e| format!("subscribe failed: {e}"))?;
-                    }
-                    log::info!(
-                        "sent {} Lighter basis WS subscriptions",
-                        subscriptions.len()
-                    );
+                    // Optional welcome frame; subscriptions were already sent after
+                    // the handshake, so nothing to do here.
+                    log::debug!("Lighter basis WS connected frame");
                     continue;
                 }
                 if msg_type == "ping" {

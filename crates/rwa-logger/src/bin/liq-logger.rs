@@ -509,6 +509,17 @@ async fn lighter_ws_once(
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     log::info!("Lighter liquidation WS connected: {ws_url}");
+    // Subscribe immediately after the handshake. The production connector
+    // (src/lighter_connector/ws.rs) and the Lighter WS reference both send
+    // subscribe frames directly; gating on an undocumented `type:"connected"`
+    // welcome would leave subscriptions unsent if the server never emits one.
+    for (_label, market) in markets {
+        let sub = json!({"type": "subscribe", "channel": format!("trade/{market}")});
+        ws.send(Message::Text(sub.to_string()))
+            .await
+            .map_err(|e| format!("subscribe failed: {e}"))?;
+    }
+    log::info!("sent {} Lighter trade WS subscriptions", markets.len());
     let mut acknowledged = HashSet::new();
     let mut ping_interval = tokio::time::interval(Duration::from_secs(LIGHTER_WS_PING_SECS));
     ping_interval.tick().await; // consume the immediate first tick
@@ -547,14 +558,9 @@ async fn lighter_ws_once(
                 };
                 let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if msg_type == "connected" {
-                    for (_label, market) in markets {
-                        let sub =
-                            json!({"type": "subscribe", "channel": format!("trade/{market}")});
-                        ws.send(Message::Text(sub.to_string()))
-                            .await
-                            .map_err(|e| format!("subscribe failed: {e}"))?;
-                    }
-                    log::info!("sent {} Lighter trade WS subscriptions", markets.len());
+                    // Optional welcome frame; subscriptions were already sent after
+                    // the handshake, so nothing to do here.
+                    log::debug!("Lighter trade WS connected frame");
                     continue;
                 }
                 if msg_type == "ping" {
