@@ -253,18 +253,6 @@ async fn main() {
         log_dir
     );
 
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(USER_AGENT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("failed to build http client: {e}");
-            std::process::exit(1);
-        }
-    };
-
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -276,8 +264,11 @@ async fn main() {
 
     let total_liq = Arc::new(AtomicU64::new(0));
     let lighter_ok = Arc::new(AtomicUsize::new(0));
+
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     if !lighter_markets.is_empty() {
-        tokio::spawn(lighter_ws_task(
+        tasks.push(tokio::spawn(lighter_ws_task(
             lighter_ws_url,
             log_dir.clone(),
             lighter_markets.clone(),
@@ -285,9 +276,74 @@ async fn main() {
             Arc::clone(&running),
             Arc::clone(&lighter_ok),
             Arc::clone(&total_liq),
-        ));
+        )));
     }
 
+    if !extended_markets.is_empty() {
+        // Extended polling uses a blocking HTTP client and std::thread::sleep.
+        // Run it on a dedicated blocking thread (not an async worker) so it can
+        // never monopolize the runtime and starve the spawned Lighter WS task on
+        // a single-vCPU host.
+        let running = Arc::clone(&running);
+        let lighter_ok = Arc::clone(&lighter_ok);
+        let total_liq = Arc::clone(&total_liq);
+        let log_dir = log_dir.clone();
+        let lighter_markets_len = lighter_markets.len();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .user_agent(USER_AGENT)
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("failed to build http client: {e}");
+                    std::process::exit(1);
+                }
+            };
+            extended_poll_loop(
+                client,
+                extended_markets,
+                extended_base,
+                log_dir,
+                limit,
+                poll_secs,
+                seen_cap,
+                running,
+                lighter_ok,
+                lighter_markets_len,
+                total_liq,
+            );
+        }));
+    }
+
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    log::info!(
+        "liq-logger stopped (total_liq={})",
+        total_liq.load(Ordering::SeqCst)
+    );
+}
+
+/// Blocking Extended recent-trades poll loop. Runs on a dedicated blocking
+/// thread (see `main`) so its `reqwest::blocking` calls and `thread::sleep` do
+/// not occupy an async worker.
+#[allow(clippy::too_many_arguments)]
+fn extended_poll_loop(
+    client: reqwest::blocking::Client,
+    markets: Vec<(String, String)>,
+    base: String,
+    log_dir: String,
+    limit: u64,
+    poll_secs: u64,
+    seen_cap: usize,
+    running: Arc<AtomicBool>,
+    lighter_ok: Arc<AtomicUsize>,
+    lighter_markets_len: usize,
+    total_liq: Arc<AtomicU64>,
+) {
     let mut extended_seen = SeenRing::new(seen_cap);
     let mut extended_prev: HashMap<String, HashSet<String>> = HashMap::new();
     let mut last_reported_total = 0u64;
@@ -296,13 +352,13 @@ async fn main() {
         let mut new_this_cycle: u64 = 0;
         let mut extended_ok = 0usize;
 
-        for (label, market) in &extended_markets {
+        for (label, market) in &markets {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
             let url = format!(
                 "{}/info/markets/{}/trades",
-                extended_base.trim_end_matches('/'),
+                base.trim_end_matches('/'),
                 market
             );
             match client
@@ -345,9 +401,9 @@ async fn main() {
         log::info!(
             "[HEARTBEAT] poll ok: lighter={}/{}, extended={}/{}, new_liq={}, total_liq={}",
             lighter_ok.load(Ordering::SeqCst),
-            lighter_markets.len(),
+            lighter_markets_len,
             extended_ok,
-            extended_markets.len(),
+            markets.len(),
             new_since_last,
             total_now
         );
@@ -358,11 +414,6 @@ async fn main() {
             slept += 1;
         }
     }
-
-    log::info!(
-        "liq-logger stopped (total_liq={})",
-        total_liq.load(Ordering::SeqCst)
-    );
 }
 
 async fn lighter_ws_task(
