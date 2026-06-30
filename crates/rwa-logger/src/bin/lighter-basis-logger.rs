@@ -20,18 +20,15 @@ const DEFAULT_LIGHTER_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 const DEFAULT_ORDERBOOK_LIMIT: u64 = 100;
 const MAX_ORDERBOOK_LIMIT: u64 = 250;
 const DEFAULT_DEPTH_BPS: f64 = 25.0;
-/// Max age of a leg's cached order book before it is treated as stale and
-/// excluded from the basis row. The configured markets are liquid majors whose
-/// books churn sub-second, so a multi-second gap means the subscription stalled
-/// while the socket stayed open (e.g. another channel keeps it alive).
-const DEFAULT_MAX_STALE_SECS: u64 = 60;
 /// Lighter drops a WS client that sends no frame within ~2 minutes. The basis
 /// loop only replies to server pings otherwise, so send a proactive control Ping
 /// on this cadence (mirrors the live connector's 20s heartbeat).
 const LIGHTER_WS_PING_SECS: u64 = 20;
-/// If no inbound frame (order_book/market_stats update, server ping, or pong to
-/// our keepalive) arrives within this window the socket is treated as
-/// read-stalled and reconnected to obtain a fresh snapshot.
+/// If no inbound frame (data, server ping, or pong to our keepalive) arrives
+/// within this window the socket is treated as dead and reconnected. A healthy
+/// socket answers our 20s ping even when the market is quiet, so this fires only
+/// on a genuinely dead connection — not on a legitimately idle order book (which
+/// Lighter leaves un-updated until it actually changes).
 const LIGHTER_WS_IDLE_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,15 +132,10 @@ async fn main() {
             .as_deref(),
     );
     let depth_bps = resolve_depth_bps(std::env::var("LIGHTER_BASIS_DEPTH_BPS").ok().as_deref());
-    let max_stale = Duration::from_secs(resolve_max_stale_secs(
-        std::env::var("LIGHTER_BASIS_MAX_STALE_SECS")
-            .ok()
-            .as_deref(),
-    ));
 
     log::info!(
-        "lighter-basis-logger starting: {} market pair(s), poll={}s, limit={}, depth={}bps, max_stale={}s, ws={}, dir={}",
-        markets.len(), poll_secs, orderbook_limit, depth_bps, max_stale.as_secs(), ws_url, log_dir
+        "lighter-basis-logger starting: {} market pair(s), poll={}s, limit={}, depth={}bps, ws={}, dir={}",
+        markets.len(), poll_secs, orderbook_limit, depth_bps, ws_url, log_dir
     );
 
     let running = Arc::new(AtomicBool::new(true));
@@ -163,7 +155,6 @@ async fn main() {
             poll_secs,
             orderbook_limit,
             depth_bps,
-            max_stale,
             Arc::clone(&running),
         )
         .await
@@ -178,7 +169,6 @@ async fn main() {
     log::info!("lighter-basis-logger stopped");
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_ws_loop(
     ws_url: &str,
     log_dir: &str,
@@ -186,7 +176,6 @@ async fn run_ws_loop(
     poll_secs: u64,
     orderbook_limit: u64,
     depth_bps: f64,
-    max_stale: Duration,
     running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url)
@@ -215,10 +204,11 @@ async fn run_ws_loop(
         .unwrap_or_else(Instant::now);
     let mut last_ping = Instant::now();
     let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
-    // Tracks the last *data* frame (order_book/market_stats), not pongs: the
-    // configured markets are liquid and stream sub-second, so a data gap means
-    // the feed stalled even if the server still answers our keepalive pings.
-    let mut last_data = Instant::now();
+    // Tracks the last frame of ANY kind, including the pong to our keepalive.
+    // This is deliberate: a legitimately quiet order book sends no data frames,
+    // so data-silence is not a stall signal — only total socket silence (no pong
+    // either) is. That avoids reconnecting a healthy but idle market (e.g. LIT).
+    let mut last_inbound = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         if last_write.elapsed() >= Duration::from_secs(poll_secs) {
@@ -228,7 +218,6 @@ async fn run_ws_loop(
                 &books,
                 orderbook_limit,
                 depth_bps,
-                max_stale,
                 &funding,
             );
             last_write = Instant::now();
@@ -243,13 +232,12 @@ async fn run_ws_loop(
             last_ping = Instant::now();
         }
 
-        // A stalled data feed (socket still pongs but order_book/market_stats
-        // stop) would otherwise loop here forever writing stale-error rows but
-        // never reconnecting; bail to resubscribe and get a fresh snapshot.
-        if last_data.elapsed() > idle_timeout {
+        // Reconnect only when the socket goes fully silent (no data AND no pong),
+        // which means it is dead; a quiet-but-live book still pongs.
+        if last_inbound.elapsed() > idle_timeout {
             return Err(format!(
-                "no order_book/market_stats data for {}s; reconnecting",
-                last_data.elapsed().as_secs()
+                "no inbound frame for {}s; reconnecting",
+                last_inbound.elapsed().as_secs()
             ));
         }
 
@@ -261,6 +249,7 @@ async fn run_ws_loop(
             return Err("stream closed".to_string());
         };
         let msg = next.map_err(|e| format!("ws read failed: {e}"))?;
+        last_inbound = Instant::now();
         match msg {
             Message::Ping(payload) => {
                 ws.send(Message::Pong(payload))
@@ -303,7 +292,6 @@ async fn run_ws_loop(
                             let state = books.entry(market_id).or_default();
                             state.reset();
                             state.apply(order_book);
-                            last_data = Instant::now();
                         }
                     }
                     "update/order_book" => {
@@ -320,7 +308,6 @@ async fn run_ws_loop(
                                 ));
                             }
                             state.apply(order_book);
-                            last_data = Instant::now();
                         }
                     }
                     "subscribed/market_stats" | "update/market_stats" => {
@@ -328,7 +315,6 @@ async fn run_ws_loop(
                             (channel_market_id(&value), market_stats_funding_rate(&value))
                         {
                             funding.insert(market_id, rate);
-                            last_data = Instant::now();
                         }
                     }
                     _ => log::trace!("ignored Lighter basis WS type={msg_type}"),
@@ -412,33 +398,13 @@ fn resolve_orderbook_limit(raw: Option<&str>) -> u64 {
     parsed.clamp(1, MAX_ORDERBOOK_LIMIT)
 }
 
-fn resolve_max_stale_secs(raw: Option<&str>) -> u64 {
-    raw.and_then(|s| match s.trim().parse::<u64>() {
-        Ok(n) if n >= 1 => Some(n),
-        _ => {
-            log::warn!(
-                "LIGHTER_BASIS_MAX_STALE_SECS='{s}' is invalid, using {DEFAULT_MAX_STALE_SECS}"
-            );
-            None
-        }
-    })
-    .unwrap_or(DEFAULT_MAX_STALE_SECS)
-}
-
-/// Error if the leg's cached book is missing or older than `max_stale`, so a
-/// stalled subscription cannot keep feeding stale prices into the basis row.
-fn ensure_fresh(state: &BookState, now: Instant, max_stale: Duration) -> Result<(), String> {
-    match state.updated_at {
-        None => Err("no book update received".to_string()),
-        Some(t) => {
-            let age = now.saturating_duration_since(t);
-            if age > max_stale {
-                Err(format!("stale book ({}s since last update)", age.as_secs()))
-            } else {
-                Ok(())
-            }
-        }
-    }
+/// Age in whole seconds of a leg's cached order book, or None if no snapshot has
+/// arrived yet. Surfaced per leg so downstream can judge staleness itself — a
+/// quiet book is still the latest valid book, so we never drop it from the row.
+fn book_age_secs(state: &BookState, now: Instant) -> Option<u64> {
+    state
+        .updated_at
+        .map(|t| now.saturating_duration_since(t).as_secs())
 }
 
 fn resolve_depth_bps(raw: Option<&str>) -> f64 {
@@ -613,14 +579,12 @@ fn book_json(book: &BookSummary) -> Value {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn write_tick(
     log_dir: &str,
     markets: &[BasisMarket],
     books: &HashMap<u64, BookState>,
     orderbook_limit: u64,
     depth_bps: f64,
-    max_stale: Duration,
     funding: &HashMap<u64, f64>,
 ) {
     let now = chrono::Utc::now();
@@ -637,11 +601,17 @@ fn write_tick(
 
     for market in markets {
         let mut error = None;
-        let spot = match books
-            .get(&market.spot_market_id)
+        // The cached book is the latest known book even if the market has been
+        // quiet (Lighter only pushes order_book frames on change), so summarize
+        // it whenever present and expose its age rather than dropping the leg.
+        let spot_state = books.get(&market.spot_market_id);
+        let perp_state = books.get(&market.perp_market_id);
+        let spot_age_secs = spot_state.and_then(|s| book_age_secs(s, now_instant));
+        let perp_age_secs = perp_state.and_then(|s| book_age_secs(s, now_instant));
+
+        let spot = match spot_state
             .ok_or_else(|| "spot: waiting for websocket data".to_string())
             .and_then(|state| {
-                ensure_fresh(state, now_instant, max_stale).map_err(|e| format!("spot: {e}"))?;
                 summarize_state(state, depth_bps, orderbook_limit).map_err(|e| format!("spot: {e}"))
             }) {
             Ok(summary) => Some(summary),
@@ -650,11 +620,9 @@ fn write_tick(
                 None
             }
         };
-        let perp = match books
-            .get(&market.perp_market_id)
+        let perp = match perp_state
             .ok_or_else(|| "perp: waiting for websocket data".to_string())
             .and_then(|state| {
-                ensure_fresh(state, now_instant, max_stale).map_err(|e| format!("perp: {e}"))?;
                 summarize_state(state, depth_bps, orderbook_limit).map_err(|e| format!("perp: {e}"))
             }) {
             Ok(summary) => Some(summary),
@@ -679,6 +647,8 @@ fn write_tick(
             "perp_market_id": market.perp_market_id,
             "spot": spot.as_ref().map(book_json),
             "perp": perp.as_ref().map(book_json),
+            "spot_age_secs": spot_age_secs,
+            "perp_age_secs": perp_age_secs,
             "perp_minus_spot_bps": basis_bps,
             "perp_funding_rate": funding_rate,
             "perp_funding_bps_per_day": funding_bps_per_day,
@@ -785,29 +755,18 @@ mod tests {
     }
 
     #[test]
-    fn ensure_fresh_rejects_missing_and_stale() {
-        let max_stale = Duration::from_secs(60);
+    fn book_age_secs_none_until_first_apply() {
         let now = Instant::now();
-        // No book yet.
-        let empty = BookState::default();
-        assert!(ensure_fresh(&empty, now, max_stale).is_err());
-        // Fresh book.
+        // No snapshot yet.
+        assert_eq!(book_age_secs(&BookState::default(), now), None);
+        // After apply, age is measured from updated_at (~0s here).
         let mut fresh = BookState::default();
         fresh.apply(&json!({"bids": [], "asks": []}));
-        assert!(ensure_fresh(&fresh, now, max_stale).is_ok());
-        // Stale book: updated 120s ago.
-        let mut stale = BookState::default();
-        stale.updated_at = now.checked_sub(Duration::from_secs(120));
-        assert!(stale.updated_at.is_some());
-        assert!(ensure_fresh(&stale, now, max_stale).is_err());
-    }
-
-    #[test]
-    fn resolve_max_stale_secs_defaults_and_validates() {
-        assert_eq!(resolve_max_stale_secs(None), DEFAULT_MAX_STALE_SECS);
-        assert_eq!(resolve_max_stale_secs(Some("30")), 30);
-        assert_eq!(resolve_max_stale_secs(Some("0")), DEFAULT_MAX_STALE_SECS);
-        assert_eq!(resolve_max_stale_secs(Some("x")), DEFAULT_MAX_STALE_SECS);
+        assert_eq!(book_age_secs(&fresh, now), Some(0));
+        // A book updated 120s ago reports its age, and is NOT dropped.
+        let mut quiet = BookState::default();
+        quiet.updated_at = now.checked_sub(Duration::from_secs(120));
+        assert_eq!(book_age_secs(&quiet, now), Some(120));
     }
 
     #[test]

@@ -530,7 +530,12 @@ async fn lighter_ws_once(
             .map_err(|e| format!("subscribe failed: {e}"))?;
     }
     log::info!("sent {} Lighter trade WS subscriptions", markets.len());
-    let mut acknowledged = HashSet::new();
+    // Health is "subscribed and socket alive", NOT "saw a trade": the Lighter
+    // trade channel sends no subscribed/trade ack and trades are sparse, so a
+    // quiet-but-subscribed market would otherwise read 0/N forever and fail
+    // verify. A dead socket is caught by the idle-timeout below (resets to 0 on
+    // reconnect via the caller).
+    ok_count.store(markets.len(), Ordering::SeqCst);
     let mut ping_interval = tokio::time::interval(Duration::from_secs(LIGHTER_WS_PING_SECS));
     ping_interval.tick().await; // consume the immediate first tick
     let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
@@ -598,12 +603,7 @@ async fn lighter_ws_once(
                     log::trace!("ignored Lighter trade WS type={msg_type}");
                     continue;
                 }
-                let (liqs, market) = lighter_liqs_from_ws(&value, labels_by_market);
-                if let Some(market) = market {
-                    if acknowledged.insert(market) {
-                        ok_count.store(acknowledged.len(), Ordering::SeqCst);
-                    }
-                }
+                let (liqs, _market) = lighter_liqs_from_ws(&value, labels_by_market);
                 let written = record_stream(log_dir, "lighter", &liqs, seen);
                 if written > 0 {
                     total_liq.fetch_add(written, Ordering::SeqCst);
