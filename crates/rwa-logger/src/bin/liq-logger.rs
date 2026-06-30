@@ -74,6 +74,16 @@ struct LiqTrade {
     raw: Value,
 }
 
+/// Market id from an error frame's `channel` (e.g. `trade/0` -> `0`), if present.
+/// Lighter doesn't document the error shape, so this is best-effort: errors that
+/// carry no channel are logged but don't change health.
+fn error_frame_market(msg: &Value) -> Option<String> {
+    msg.get("channel")
+        .and_then(|v| v.as_str())
+        .and_then(|channel| channel.rsplit(['/', ':']).next())
+        .map(str::to_string)
+}
+
 fn lighter_liqs_from_ws(
     msg: &Value,
     labels_by_market: &HashMap<String, String>,
@@ -530,12 +540,14 @@ async fn lighter_ws_once(
             .map_err(|e| format!("subscribe failed: {e}"))?;
     }
     log::info!("sent {} Lighter trade WS subscriptions", markets.len());
-    // Health is "subscribed and socket alive", NOT "saw a trade": the Lighter
+    // Health is "subscribed and not rejected", NOT "saw a trade": the Lighter
     // trade channel sends no subscribed/trade ack and trades are sparse, so a
     // quiet-but-subscribed market would otherwise read 0/N forever and fail
-    // verify. A dead socket is caught by the idle-timeout below (resets to 0 on
-    // reconnect via the caller).
-    ok_count.store(markets.len(), Ordering::SeqCst);
+    // verify. Start optimistic, then drop a market from the set if the venue
+    // sends an error frame for it (see below). A dead socket is caught by the
+    // idle-timeout reconnect (resets to 0 via the caller).
+    let mut healthy: HashSet<String> = markets.iter().map(|(_, m)| m.clone()).collect();
+    ok_count.store(healthy.len(), Ordering::SeqCst);
     let mut ping_interval = tokio::time::interval(Duration::from_secs(LIGHTER_WS_PING_SECS));
     ping_interval.tick().await; // consume the immediate first tick
     let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
@@ -596,7 +608,19 @@ async fn lighter_ws_once(
                     continue;
                 }
                 if let Some(err) = value.get("error") {
-                    log::warn!("Lighter trade WS error frame: {err}");
+                    // A rejected subscription must drop that market from health so
+                    // verify catches it instead of passing on a stale N/N.
+                    match error_frame_market(&value) {
+                        Some(market) if healthy.remove(&market) => {
+                            ok_count.store(healthy.len(), Ordering::SeqCst);
+                            log::warn!(
+                                "Lighter trade WS rejected market {market}: {err}; health {}/{}",
+                                healthy.len(),
+                                markets.len()
+                            );
+                        }
+                        _ => log::warn!("Lighter trade WS error frame: {err}"),
+                    }
                     continue;
                 }
                 if msg_type != "subscribed/trade" && msg_type != "update/trade" {
@@ -774,6 +798,20 @@ mod tests {
         assert_eq!(rows[0].label, "BTC");
         assert_eq!(rows[0].trade_id, "2");
         assert_eq!(rows[0].kind, "liquidation");
+    }
+
+    #[test]
+    fn error_frame_market_extracts_channel_id() {
+        assert_eq!(
+            error_frame_market(&json!({"error": "bad", "channel": "trade/7"})).as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            error_frame_market(&json!({"error": "bad", "channel": "trade:3"})).as_deref(),
+            Some("3")
+        );
+        // No channel -> unattributable (logged, health unchanged).
+        assert_eq!(error_frame_market(&json!({"error": "bad"})), None);
     }
 
     #[test]
