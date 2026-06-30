@@ -215,7 +215,10 @@ async fn run_ws_loop(
         .unwrap_or_else(Instant::now);
     let mut last_ping = Instant::now();
     let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
-    let mut last_inbound = Instant::now();
+    // Tracks the last *data* frame (order_book/market_stats), not pongs: the
+    // configured markets are liquid and stream sub-second, so a data gap means
+    // the feed stalled even if the server still answers our keepalive pings.
+    let mut last_data = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         if last_write.elapsed() >= Duration::from_secs(poll_secs) {
@@ -240,13 +243,13 @@ async fn run_ws_loop(
             last_ping = Instant::now();
         }
 
-        // A read-stalled (half-open) socket would otherwise loop here forever,
-        // writing stale-error rows but never reconnecting; bail to get a fresh
-        // snapshot from a new subscription.
-        if last_inbound.elapsed() > idle_timeout {
+        // A stalled data feed (socket still pongs but order_book/market_stats
+        // stop) would otherwise loop here forever writing stale-error rows but
+        // never reconnecting; bail to resubscribe and get a fresh snapshot.
+        if last_data.elapsed() > idle_timeout {
             return Err(format!(
-                "no inbound frame for {}s; reconnecting",
-                last_inbound.elapsed().as_secs()
+                "no order_book/market_stats data for {}s; reconnecting",
+                last_data.elapsed().as_secs()
             ));
         }
 
@@ -258,7 +261,6 @@ async fn run_ws_loop(
             return Err("stream closed".to_string());
         };
         let msg = next.map_err(|e| format!("ws read failed: {e}"))?;
-        last_inbound = Instant::now();
         match msg {
             Message::Ping(payload) => {
                 ws.send(Message::Pong(payload))
@@ -301,6 +303,7 @@ async fn run_ws_loop(
                             let state = books.entry(market_id).or_default();
                             state.reset();
                             state.apply(order_book);
+                            last_data = Instant::now();
                         }
                     }
                     "update/order_book" => {
@@ -317,6 +320,7 @@ async fn run_ws_loop(
                                 ));
                             }
                             state.apply(order_book);
+                            last_data = Instant::now();
                         }
                     }
                     "subscribed/market_stats" | "update/market_stats" => {
@@ -324,6 +328,7 @@ async fn run_ws_loop(
                             (channel_market_id(&value), market_stats_funding_rate(&value))
                         {
                             funding.insert(market_id, rate);
+                            last_data = Instant::now();
                         }
                     }
                     _ => log::trace!("ignored Lighter basis WS type={msg_type}"),
