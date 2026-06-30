@@ -491,6 +491,12 @@ async fn lighter_ws_task(
             Err(e) => {
                 if running.load(Ordering::SeqCst) {
                     log::warn!("lighter WS stream ended: {e}; reconnecting in 2s");
+                    // Liquidations during the down/backoff/resubscribe window are
+                    // not observed (we deliberately don't REST-backfill — the whole
+                    // point of #663 is to stop spending the live bot's Lighter REST
+                    // budget). Emit an explicit gap marker so the event-frequency
+                    // dataset isn't silently undercounted across the gap.
+                    write_liq_gap(&log_dir, &markets, &e);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -667,6 +673,40 @@ fn record_stream(log_dir: &str, venue: &str, liqs: &[LiqTrade], seen: &mut SeenR
         written += 1;
     }
     written
+}
+
+/// Append an explicit coverage-gap marker to the daily file when the Lighter WS
+/// reconnects, so downstream event-frequency analysis can see that liquidations
+/// may be missing across the disconnect/backoff window (a lower-bound marker;
+/// we do not REST-backfill by design — see bot-strategy#663).
+fn write_liq_gap(log_dir: &str, markets: &[(String, String)], reason: &str) {
+    let now = chrono::Utc::now();
+    let path = format!("{}/liq_{}.jsonl", log_dir, now.format("%Y%m%d"));
+    let labels: Vec<String> = markets
+        .iter()
+        .map(|(label, market)| format!("{label}:{market}"))
+        .collect();
+    let line = json!({
+        "ts": now.to_rfc3339(),
+        "venue": "lighter",
+        "type": "ws_gap",
+        "reason": reason,
+        "markets": labels,
+    });
+    {
+        let _guard = LIQ_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("cannot open {path}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = writeln!(file, "{line}") {
+            log::error!("write failed for lighter ws_gap: {e}");
+        }
+    }
+    log::info!("WS_GAP lighter reason={reason}");
 }
 
 fn write_liq(log_dir: &str, venue: &str, t: &LiqTrade) {
