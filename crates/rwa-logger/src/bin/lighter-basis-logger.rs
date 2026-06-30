@@ -29,6 +29,10 @@ const DEFAULT_MAX_STALE_SECS: u64 = 60;
 /// loop only replies to server pings otherwise, so send a proactive control Ping
 /// on this cadence (mirrors the live connector's 20s heartbeat).
 const LIGHTER_WS_PING_SECS: u64 = 20;
+/// If no inbound frame (order_book/market_stats update, server ping, or pong to
+/// our keepalive) arrives within this window the socket is treated as
+/// read-stalled and reconnected to obtain a fresh snapshot.
+const LIGHTER_WS_IDLE_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BasisMarket {
@@ -210,6 +214,8 @@ async fn run_ws_loop(
         .checked_sub(Duration::from_secs(poll_secs))
         .unwrap_or_else(Instant::now);
     let mut last_ping = Instant::now();
+    let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
+    let mut last_inbound = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         if last_write.elapsed() >= Duration::from_secs(poll_secs) {
@@ -234,6 +240,16 @@ async fn run_ws_loop(
             last_ping = Instant::now();
         }
 
+        // A read-stalled (half-open) socket would otherwise loop here forever,
+        // writing stale-error rows but never reconnecting; bail to get a fresh
+        // snapshot from a new subscription.
+        if last_inbound.elapsed() > idle_timeout {
+            return Err(format!(
+                "no inbound frame for {}s; reconnecting",
+                last_inbound.elapsed().as_secs()
+            ));
+        }
+
         let next = match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(next) => next,
             Err(_) => continue,
@@ -242,6 +258,7 @@ async fn run_ws_loop(
             return Err("stream closed".to_string());
         };
         let msg = next.map_err(|e| format!("ws read failed: {e}"))?;
+        last_inbound = Instant::now();
         match msg {
             Message::Ping(payload) => {
                 ws.send(Message::Pong(payload))

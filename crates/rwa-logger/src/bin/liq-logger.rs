@@ -27,6 +27,10 @@ const USER_AGENT: &str = "rwa-logger/0.1 (+bot-strategy#571/#663)";
 /// connector sends a control Ping every 20s (src/lighter_connector/ws.rs); mirror
 /// that here so a quiet trade stream is not disconnected between liquidations.
 const LIGHTER_WS_PING_SECS: u64 = 20;
+/// If no inbound frame (trade, server ping, or pong to our keepalive) arrives
+/// within this window the socket is treated as read-stalled and reconnected. A
+/// healthy connection answers our 20s ping, so 3 missed cycles means it is dead.
+const LIGHTER_WS_IDLE_TIMEOUT_SECS: u64 = 60;
 /// Serializes appends to the shared daily `liq_*.jsonl`: the Lighter WS task and
 /// the Extended blocking poller both reach `write_liq` concurrently, and their
 /// `writeln!` calls would otherwise interleave and corrupt JSONL rows.
@@ -523,10 +527,20 @@ async fn lighter_ws_once(
     let mut acknowledged = HashSet::new();
     let mut ping_interval = tokio::time::interval(Duration::from_secs(LIGHTER_WS_PING_SECS));
     ping_interval.tick().await; // consume the immediate first tick
+    let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
+    let mut last_inbound = tokio::time::Instant::now();
 
     while running.load(Ordering::SeqCst) {
         let next = tokio::select! {
             _ = ping_interval.tick() => {
+                // A read-stalled (half-open) socket would otherwise ping forever
+                // without ever reading a frame; bail so the outer loop reconnects.
+                if last_inbound.elapsed() > idle_timeout {
+                    return Err(format!(
+                        "no inbound frame for {}s; reconnecting",
+                        last_inbound.elapsed().as_secs()
+                    ));
+                }
                 // Proactive client keepalive: the liquidation stream is often quiet
                 // for minutes, so we cannot rely on reacting to a server ping.
                 ws.send(Message::Ping(Vec::new()))
@@ -540,6 +554,7 @@ async fn lighter_ws_once(
             return Err("stream closed".to_string());
         };
         let msg = next.map_err(|e| format!("ws read failed: {e}"))?;
+        last_inbound = tokio::time::Instant::now();
         match msg {
             Message::Ping(payload) => {
                 ws.send(Message::Pong(payload))
