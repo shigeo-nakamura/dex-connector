@@ -3,6 +3,18 @@ use super::*;
 use std::env;
 
 #[test]
+fn lighter_rest_fallback_disable_flag_accepts_truthy_values() {
+    assert!(env_flag_enabled(Some("1")));
+    assert!(env_flag_enabled(Some("true")));
+    assert!(env_flag_enabled(Some("YES")));
+    assert!(env_flag_enabled(Some(" on ")));
+    assert!(!env_flag_enabled(Some("0")));
+    assert!(!env_flag_enabled(Some("false")));
+    assert!(!env_flag_enabled(Some("")));
+    assert!(!env_flag_enabled(None));
+}
+
+#[test]
 fn parses_plain_numeric_order_id_for_cancel() {
     assert_eq!(parse_cancel_order_index("12345"), Some(12345));
 }

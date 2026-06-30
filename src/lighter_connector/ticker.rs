@@ -65,6 +65,15 @@ impl LighterConnector {
             // `price_timestamp` is now ms (bot-strategy#274 / #276).
             let price_age_ms = current_time.saturating_sub(price_timestamp);
             if price_age_ms > 30_000 {
+                if lighter_rest_fallback_disabled() {
+                    log::warn!(
+                        "WebSocket price is stale ({}ms old); REST fallback disabled",
+                        price_age_ms
+                    );
+                    return Err(DexError::Transient(format!(
+                        "websocket price for {symbol} is stale ({price_age_ms}ms old) and REST fallback is disabled"
+                    )));
+                }
                 log::warn!(
                     "WebSocket price is stale ({}ms old), falling back to REST API",
                     price_age_ms
@@ -101,6 +110,12 @@ impl LighterConnector {
                     exchange_ts: Some(price_timestamp),
                 });
             }
+        }
+
+        if lighter_rest_fallback_disabled() {
+            return Err(DexError::Transient(format!(
+                "websocket price for {symbol} is unavailable and REST fallback is disabled"
+            )));
         }
 
         // Fallback to REST API if WebSocket data is not available.
@@ -165,6 +180,12 @@ impl LighterConnector {
         &self,
         symbol: &str,
     ) -> Result<LastTradesResponse, DexError> {
+        if lighter_rest_fallback_disabled() {
+            return Err(DexError::Transient(format!(
+                "recent trades REST for {symbol} is disabled"
+            )));
+        }
+
         // Get market_id for the symbol
         let market_id = self.resolve_market_info(symbol).await?.market_id;
 

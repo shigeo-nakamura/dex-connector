@@ -1,85 +1,41 @@
-//! Liquidation event logger PoC (bot-strategy#571 — true-liquidation fade).
+//! Liquidation event logger PoC (bot-strategy#571 / #663).
 //!
-//! Phase 0 (read-only) collector that records CONFIRMED liquidation/deleverage
-//! trades on Lighter and Extended, so the "fade the overshoot of a real
-//! liquidation cascade" idea (#571) can be characterized offline. It does NOT
-//! place orders and needs no auth/signing.
-//!
-//! Why this is different from the rejected spread-derived cascade-fade
-//! (project: cascade-fade-rejected): the trigger here is the venue's own
-//! liquidation TAG on each trade, not a price/spread move. A degraded-book
-//! artifact (a fake 1000s-bps move from a thin book) cannot enter this dataset
-//! unless the venue itself tagged the trade as a liquidation. The first thing
-//! #571 must learn is simply the EVENT FREQUENCY on BTC/ETH — if real
-//! liquidations are only a handful per day, there is no statistics to build and
-//! the idea is NO-GO. This logger answers that cheaply.
-//!
-//! ## Mechanism (REST poll, no WS/SDK — keeps the arm64 deploy build light)
-//!
-//! Both venues expose the liquidation marker on their public recent-trades REST.
-//! Lighter `GET {base}/api/v1/recentTrades?market_id={id}&limit={n}` returns
-//! `trades[].type` in {trade, liquidation, deleverage, market-settlement};
-//! anything other than "trade" is captured. Extended
-//! `GET {base}/info/markets/{market}/trades?limit={n}` returns `data[].tT` in
-//! {TRADE, LIQUIDATION, DELEVERAGE}; anything other than "TRADE" is captured.
-//!
-//! Each new (non-normal) trade is de-duplicated by (venue, market, trade_id)
-//! against a bounded seen-set and appended as one JSONL line. Normal trades are
-//! dropped. The de-dup key includes the market because a venue may reuse a
-//! trade id across markets.
-//!
-//! ### Sampling caveat (logged, never silent)
-//! recent-trades is a sliding window, so on a very high-volume market a burst
-//! between two polls could push liquidations out of the window unseen. When a
-//! poll returns a full `limit` page whose ids are FULLY DISJOINT from the
-//! previous poll's page for that market (i.e. the window turned over between
-//! polls), we WARN that liquidations may have been skipped — the resulting
-//! counts are then a lower bound. The check uses ALL page ids, not just
-//! liquidation rows, so it fires even on an all-normal-trade turnover. Lower
-//! `LIQ_POLL_SECS` / raise `LIQ_FETCH_LIMIT` if this fires often.
-//!
-//! ## Env vars
-//! At least one of the two market specs must be non-empty:
-//! - `LIGHTER_LIQ_MARKETS`  — comma-separated `label:market_id` (e.g. `BTC:1,ETH:0`)
-//! - `EXTENDED_LIQ_MARKETS` — comma-separated `label:market` (e.g. `BTC:BTC-USD,ETH:ETH-USD`)
-//! - `LIQ_LOG_DIR`     (default `.`)    — output dir for daily JSONL
-//! - `LIQ_POLL_SECS`   (default `5`)    — poll cadence (clamped to >=1s)
-//! - `LIQ_FETCH_LIMIT` (default `100`)  — recent-trades page size per market
-//!   (Lighter caps this at 100; larger values are clamped for the Lighter leg)
-//! - `LIGHTER_BASE_URL`  (default `https://mainnet.zklighter.elliot.ai`)
-//! - `EXTENDED_BASE_URL` (default `https://api.starknet.extended.exchange/api/v1`)
-//! - `LIQ_SEEN_CAP`    (default `20000`) — per-venue de-dup ring size
-//!
-//! ## Output
-//! `<LIQ_LOG_DIR>/liq_YYYYMMDD.jsonl`, one line per NEW liquidation trade:
-//! `{"ts":..,"venue":"lighter","label":"BTC","market":"1","trade_id":"..",
-//!   "type":"liquidation","side":"buy","price":..,"size":..,"usd":..,
-//!   "trade_ts_ms":..,"raw":{..}}`
+//! Records confirmed liquidation/deleverage trades. Lighter is consumed from
+//! the public `trade/{market_id}` WebSocket stream so this logger does not spend
+//! the live bot's Lighter REST budget. Extended remains on its public REST
+//! recent-trades endpoint because that venue has a separate rate-limit domain.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::Message;
 
 use rwa_logger::{parse_pairs, resolve_poll_secs};
 
-const DEFAULT_LIGHTER_BASE: &str = "https://mainnet.zklighter.elliot.ai";
+const DEFAULT_LIGHTER_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 const DEFAULT_EXTENDED_BASE: &str = "https://api.starknet.extended.exchange/api/v1";
 const DEFAULT_FETCH_LIMIT: u64 = 100;
 const DEFAULT_SEEN_CAP: usize = 20_000;
-/// Lighter `recentTrades` rejects `limit > 100` with code 20001, so the
-/// per-poll page is clamped to this for the Lighter leg regardless of config.
-const LIGHTER_MAX_LIMIT: u64 = 100;
-/// Extended's WAF returns 403 to requests with no User-Agent (reqwest sends
-/// none by default), so the client sets an explicit one.
-const USER_AGENT: &str = "rwa-logger/0.1 (+bot-strategy#571)";
+const USER_AGENT: &str = "rwa-logger/0.1 (+bot-strategy#571/#663)";
+/// Lighter drops a WS client that sends no frame within ~2 minutes. The live
+/// connector sends a control Ping every 20s (src/lighter_connector/ws.rs); mirror
+/// that here so a quiet trade stream is not disconnected between liquidations.
+const LIGHTER_WS_PING_SECS: u64 = 20;
+/// If no inbound frame (trade, server ping, or pong to our keepalive) arrives
+/// within this window the socket is treated as read-stalled and reconnected. A
+/// healthy connection answers our 20s ping, so 3 missed cycles means it is dead.
+const LIGHTER_WS_IDLE_TIMEOUT_SECS: u64 = 60;
+/// Serializes appends to the shared daily `liq_*.jsonl`: the Lighter WS task and
+/// the Extended blocking poller both reach `write_liq` concurrently, and their
+/// `writeln!` calls would otherwise interleave and corrupt JSONL rows.
+static LIQ_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Parse a numeric field that may arrive as a JSON string ("67191.4") or a
-/// JSON number. Empty string -> None.
 fn fnum(node: &Value, key: &str) -> Option<f64> {
     match node.get(key) {
         Some(Value::String(s)) if !s.is_empty() => s.parse::<f64>().ok(),
@@ -88,21 +44,6 @@ fn fnum(node: &Value, key: &str) -> Option<f64> {
     }
 }
 
-/// A liquidation trade normalized across venues, ready to serialize.
-struct LiqTrade {
-    label: String,
-    market: String,
-    trade_id: String,
-    kind: String, // venue's tag, lowercased: liquidation | deleverage | market-settlement
-    side: Option<String>,
-    price: Option<f64>,
-    size: Option<f64>,
-    usd: Option<f64>,
-    trade_ts_ms: Option<i64>,
-    raw: Value,
-}
-
-/// Lighter trade id as a string (prefers the loss-free `trade_id_str`).
 fn lighter_id(t: &Value) -> String {
     t.get("trade_id_str")
         .and_then(|v| v.as_str())
@@ -111,7 +52,6 @@ fn lighter_id(t: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Extended trade id (`i`) as a string.
 fn extended_id(t: &Value) -> String {
     t.get("i")
         .map(|v| match v {
@@ -121,47 +61,107 @@ fn extended_id(t: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Extract liquidation trades from a Lighter `recentTrades` body. Returns
-/// (liq_trades, ALL page trade ids). A row is a liquidation iff its `type` is
-/// present and not "trade". The full id list (incl. normal trades) feeds the
-/// window-turnover saturation check.
-fn lighter_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, Vec<String>) {
-    let arr = body.get("trades").and_then(|t| t.as_array());
-    let mut out = Vec::new();
-    let mut page_ids = Vec::new();
-    if let Some(a) = arr {
-        for t in a {
-            let id = lighter_id(t);
-            page_ids.push(id.clone());
-            let kind = t.get("type").and_then(|v| v.as_str()).unwrap_or("trade");
-            if kind == "trade" {
-                continue;
-            }
-            // Taker side: if the maker sat on the ask, the taker bought.
-            let side = t
-                .get("is_maker_ask")
-                .and_then(|v| v.as_bool())
-                .map(|maker_ask| if maker_ask { "buy" } else { "sell" }.to_string());
-            out.push(LiqTrade {
-                label: label.to_string(),
-                market: market.to_string(),
-                trade_id: id,
-                kind: kind.to_string(),
-                side,
-                price: fnum(t, "price"),
-                size: fnum(t, "size"),
-                usd: fnum(t, "usd_amount"),
-                trade_ts_ms: t.get("timestamp").and_then(|v| v.as_i64()),
-                raw: t.clone(),
-            });
-        }
-    }
-    (out, page_ids)
+struct LiqTrade {
+    label: String,
+    market: String,
+    trade_id: String,
+    kind: String,
+    side: Option<String>,
+    price: Option<f64>,
+    size: Option<f64>,
+    usd: Option<f64>,
+    trade_ts_ms: Option<i64>,
+    raw: Value,
 }
 
-/// Extract liquidation trades from an Extended `trades` body. Returns
-/// (liq_trades, ALL page trade ids). A row is a liquidation iff its `tT` is
-/// present and not "TRADE".
+/// Market id from an error frame's `channel` (e.g. `trade/0` -> `0`), if present.
+/// Lighter doesn't document the error shape, so this is best-effort: errors that
+/// carry no channel are logged but don't change health.
+fn error_frame_market(msg: &Value) -> Option<String> {
+    msg.get("channel")
+        .and_then(|v| v.as_str())
+        .and_then(|channel| channel.rsplit(['/', ':']).next())
+        .map(str::to_string)
+}
+
+fn lighter_liqs_from_ws(
+    msg: &Value,
+    labels_by_market: &HashMap<String, String>,
+) -> (Vec<LiqTrade>, Option<String>) {
+    let market = msg
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .and_then(|channel| channel.rsplit(['/', ':']).next())
+        .map(str::to_string);
+    let Some(market) = market else {
+        return (Vec::new(), None);
+    };
+    let label = labels_by_market
+        .get(&market)
+        .cloned()
+        .unwrap_or_else(|| market.clone());
+
+    let mut out = Vec::new();
+    append_lighter_liqs_from_array(
+        msg.get("liquidation_trades").and_then(|v| v.as_array()),
+        &label,
+        &market,
+        true,
+        &mut out,
+    );
+    append_lighter_liqs_from_array(
+        msg.get("trades").and_then(|v| v.as_array()),
+        &label,
+        &market,
+        false,
+        &mut out,
+    );
+    (out, Some(market))
+}
+
+fn append_lighter_liqs_from_array(
+    rows: Option<&Vec<Value>>,
+    label: &str,
+    market: &str,
+    liquidation_feed: bool,
+    out: &mut Vec<LiqTrade>,
+) {
+    let Some(rows) = rows else {
+        return;
+    };
+    for row in rows {
+        let trade = row.get("trade").unwrap_or(row);
+        let kind = trade
+            .get("type")
+            .or_else(|| row.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(if liquidation_feed {
+                "liquidation"
+            } else {
+                "trade"
+            });
+        if !liquidation_feed && kind == "trade" {
+            continue;
+        }
+        let side = trade
+            .get("is_maker_ask")
+            .and_then(|v| v.as_bool())
+            .map(|maker_ask| if maker_ask { "buy" } else { "sell" }.to_string());
+        out.push(LiqTrade {
+            label: label.to_string(),
+            market: market.to_string(),
+            trade_id: lighter_id(trade),
+            kind: kind.to_string(),
+            side,
+            price: fnum(trade, "price"),
+            size: fnum(trade, "size"),
+            usd: fnum(trade, "usd_amount"),
+            trade_ts_ms: trade.get("timestamp").and_then(|v| v.as_i64()),
+            raw: row.clone(),
+        });
+    }
+}
+
 fn extended_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, Vec<String>) {
     let arr = body.get("data").and_then(|d| d.as_array());
     let mut out = Vec::new();
@@ -195,7 +195,6 @@ fn extended_liqs(body: &Value, label: &str, market: &str) -> (Vec<LiqTrade>, Vec
     (out, page_ids)
 }
 
-/// Bounded de-dup set: remembers up to `cap` recent ids, evicting oldest first.
 struct SeenRing {
     set: HashSet<String>,
     order: VecDeque<String>,
@@ -210,7 +209,7 @@ impl SeenRing {
             cap: cap.max(1),
         }
     }
-    /// Insert id; returns true if it was NEW (not seen before).
+
     fn insert(&mut self, id: &str) -> bool {
         if self.set.contains(id) {
             return false;
@@ -224,13 +223,15 @@ impl SeenRing {
         }
         true
     }
+
     #[cfg(test)]
     fn contains(&self, id: &str) -> bool {
         self.set.contains(id)
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let lighter_spec = std::env::var("LIGHTER_LIQ_MARKETS").unwrap_or_default();
@@ -239,8 +240,7 @@ fn main() {
     let extended_markets = parse_or_empty("EXTENDED_LIQ_MARKETS", &extended_spec);
     if lighter_markets.is_empty() && extended_markets.is_empty() {
         log::error!(
-            "at least one of LIGHTER_LIQ_MARKETS / EXTENDED_LIQ_MARKETS must be a non-empty \
-             label:market spec"
+            "at least one of LIGHTER_LIQ_MARKETS / EXTENDED_LIQ_MARKETS must be a non-empty label:market spec"
         );
         std::process::exit(2);
     }
@@ -252,8 +252,8 @@ fn main() {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(DEFAULT_FETCH_LIMIT);
-    let lighter_base =
-        std::env::var("LIGHTER_BASE_URL").unwrap_or_else(|_| DEFAULT_LIGHTER_BASE.to_string());
+    let lighter_ws_url =
+        std::env::var("LIGHTER_WS_URL").unwrap_or_else(|_| DEFAULT_LIGHTER_WS_URL.to_string());
     let extended_base =
         std::env::var("EXTENDED_BASE_URL").unwrap_or_else(|_| DEFAULT_EXTENDED_BASE.to_string());
     let seen_cap = std::env::var("LIQ_SEEN_CAP")
@@ -263,27 +263,13 @@ fn main() {
         .unwrap_or(DEFAULT_SEEN_CAP);
 
     log::info!(
-        "liq-logger starting: lighter={} market(s), extended={} market(s), poll={}s, limit={}, dir={}",
+        "liq-logger starting: lighter_ws={} market(s), extended_rest={} market(s), poll={}s, limit={}, dir={}",
         lighter_markets.len(),
         extended_markets.len(),
         poll_secs,
         limit,
         log_dir
     );
-
-    let lighter_limit = limit.min(LIGHTER_MAX_LIMIT);
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(USER_AGENT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("failed to build http client: {e}");
-            std::process::exit(1);
-        }
-    };
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -294,64 +280,148 @@ fn main() {
         });
     }
 
-    let mut lighter_seen = SeenRing::new(seen_cap);
+    let total_liq = Arc::new(AtomicU64::new(0));
+    let lighter_ok = Arc::new(AtomicUsize::new(0));
+    let extended_ok = Arc::new(AtomicUsize::new(0));
+
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Single heartbeat source, independent of which collectors are enabled, so a
+    // Lighter-only config still emits `[HEARTBEAT]` (verify-liq-logger.sh needs
+    // it) even though Lighter liquidations are rare.
+    tasks.push(tokio::spawn(heartbeat_task(
+        poll_secs,
+        Arc::clone(&running),
+        Arc::clone(&lighter_ok),
+        lighter_markets.len(),
+        Arc::clone(&extended_ok),
+        extended_markets.len(),
+        Arc::clone(&total_liq),
+    )));
+
+    if !lighter_markets.is_empty() {
+        tasks.push(tokio::spawn(lighter_ws_task(
+            lighter_ws_url,
+            log_dir.clone(),
+            lighter_markets.clone(),
+            seen_cap,
+            Arc::clone(&running),
+            Arc::clone(&lighter_ok),
+            Arc::clone(&total_liq),
+        )));
+    }
+
+    if !extended_markets.is_empty() {
+        // Extended polling uses a blocking HTTP client and std::thread::sleep.
+        // Run it on a dedicated blocking thread (not an async worker) so it can
+        // never monopolize the runtime and starve the spawned Lighter WS task on
+        // a single-vCPU host.
+        let running = Arc::clone(&running);
+        let extended_ok = Arc::clone(&extended_ok);
+        let total_liq = Arc::clone(&total_liq);
+        let log_dir = log_dir.clone();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .user_agent(USER_AGENT)
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("failed to build http client: {e}");
+                    std::process::exit(1);
+                }
+            };
+            extended_poll_loop(
+                client,
+                extended_markets,
+                extended_base,
+                log_dir,
+                limit,
+                poll_secs,
+                seen_cap,
+                running,
+                extended_ok,
+                total_liq,
+            );
+        }));
+    }
+
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    log::info!(
+        "liq-logger stopped (total_liq={})",
+        total_liq.load(Ordering::SeqCst)
+    );
+}
+
+/// Periodic `[HEARTBEAT]` emitter. Runs regardless of which collectors are
+/// enabled so a Lighter-only logger (where liquidations are rare) still produces
+/// the heartbeat line that `deploy/verify-liq-logger.sh` polls for.
+#[allow(clippy::too_many_arguments)]
+async fn heartbeat_task(
+    poll_secs: u64,
+    running: Arc<AtomicBool>,
+    lighter_ok: Arc<AtomicUsize>,
+    lighter_total: usize,
+    extended_ok: Arc<AtomicUsize>,
+    extended_total: usize,
+    total_liq: Arc<AtomicU64>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(poll_secs.max(1)));
+    let mut last_reported_total = 0u64;
+    while running.load(Ordering::SeqCst) {
+        interval.tick().await;
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        let total_now = total_liq.load(Ordering::SeqCst);
+        let new_since_last = total_now.saturating_sub(last_reported_total);
+        last_reported_total = total_now;
+        log::info!(
+            "[HEARTBEAT] poll ok: lighter={}/{}, extended={}/{}, new_liq={}, total_liq={}",
+            lighter_ok.load(Ordering::SeqCst),
+            lighter_total,
+            extended_ok.load(Ordering::SeqCst),
+            extended_total,
+            new_since_last,
+            total_now
+        );
+    }
+}
+
+/// Blocking Extended recent-trades poll loop. Runs on a dedicated blocking
+/// thread (see `main`) so its `reqwest::blocking` calls and `thread::sleep` do
+/// not occupy an async worker.
+#[allow(clippy::too_many_arguments)]
+fn extended_poll_loop(
+    client: reqwest::blocking::Client,
+    markets: Vec<(String, String)>,
+    base: String,
+    log_dir: String,
+    limit: u64,
+    poll_secs: u64,
+    seen_cap: usize,
+    running: Arc<AtomicBool>,
+    extended_ok: Arc<AtomicUsize>,
+    total_liq: Arc<AtomicU64>,
+) {
     let mut extended_seen = SeenRing::new(seen_cap);
-    // Previous poll's full page id set, per market, for the turnover check.
-    let mut lighter_prev: HashMap<String, HashSet<String>> = HashMap::new();
     let mut extended_prev: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut total_liq: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let mut new_this_cycle: u64 = 0;
-        let mut lighter_ok = 0usize;
-        let mut extended_ok = 0usize;
+        let mut ok_this_cycle = 0usize;
 
-        for (label, market_id) in &lighter_markets {
-            if !running.load(Ordering::SeqCst) {
-                break;
-            }
-            let url = format!("{}/api/v1/recentTrades", lighter_base.trim_end_matches('/'));
-            match client
-                .get(&url)
-                .query(&[
-                    ("market_id", market_id.as_str()),
-                    ("limit", &lighter_limit.to_string()),
-                ])
-                .send()
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    match resp.json::<Value>() {
-                        Ok(body) if status.is_success() => {
-                            lighter_ok += 1;
-                            let (liqs, page_ids) = lighter_liqs(&body, label, market_id);
-                            new_this_cycle += record(
-                                &log_dir,
-                                "lighter",
-                                &liqs,
-                                &page_ids,
-                                lighter_limit,
-                                &mut lighter_seen,
-                                &mut lighter_prev,
-                                market_id,
-                                label,
-                            );
-                        }
-                        Ok(body) => log::warn!("lighter {label}: recentTrades {status}: {body}"),
-                        Err(e) => log::warn!("lighter {label}: {status}, body not JSON: {e}"),
-                    }
-                }
-                Err(e) => log::warn!("lighter {label}: request failed: {e}"),
-            }
-        }
-
-        for (label, market) in &extended_markets {
+        for (label, market) in &markets {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
             let url = format!(
                 "{}/info/markets/{}/trades",
-                extended_base.trim_end_matches('/'),
+                base.trim_end_matches('/'),
                 market
             );
             match client
@@ -363,9 +433,9 @@ fn main() {
                     let status = resp.status();
                     match resp.json::<Value>() {
                         Ok(body) if status.is_success() => {
-                            extended_ok += 1;
+                            ok_this_cycle += 1;
                             let (liqs, page_ids) = extended_liqs(&body, label, market);
-                            new_this_cycle += record(
+                            new_this_cycle += record_page(
                                 &log_dir,
                                 "extended",
                                 &liqs,
@@ -385,18 +455,11 @@ fn main() {
             }
         }
 
-        total_liq += new_this_cycle;
-        // Heartbeat: lets a deploy verify confirm liveness without waiting for a
-        // (rare) liquidation to occur — assert both venues poll OK, not rows.
-        log::info!(
-            "[HEARTBEAT] poll ok: lighter={}/{}, extended={}/{}, new_liq={}, total_liq={}",
-            lighter_ok,
-            lighter_markets.len(),
-            extended_ok,
-            extended_markets.len(),
-            new_this_cycle,
-            total_liq
-        );
+        if new_this_cycle > 0 {
+            total_liq.fetch_add(new_this_cycle, Ordering::SeqCst);
+        }
+        // Publish this cycle's health for the heartbeat task to report.
+        extended_ok.store(ok_this_cycle, Ordering::SeqCst);
 
         let mut slept = 0u64;
         while slept < poll_secs && running.load(Ordering::SeqCst) {
@@ -404,12 +467,178 @@ fn main() {
             slept += 1;
         }
     }
-
-    log::info!("liq-logger stopped (total_liq={total_liq})");
 }
 
-/// Parse a spec that is allowed to be empty (returns []), erroring out the
-/// process only on a malformed non-empty spec.
+async fn lighter_ws_task(
+    ws_url: String,
+    log_dir: String,
+    markets: Vec<(String, String)>,
+    seen_cap: usize,
+    running: Arc<AtomicBool>,
+    ok_count: Arc<AtomicUsize>,
+    total_liq: Arc<AtomicU64>,
+) {
+    let labels_by_market: HashMap<String, String> = markets
+        .iter()
+        .map(|(label, market)| (market.clone(), label.clone()))
+        .collect();
+    let mut seen = SeenRing::new(seen_cap);
+    while running.load(Ordering::SeqCst) {
+        ok_count.store(0, Ordering::SeqCst);
+        match lighter_ws_once(
+            &ws_url,
+            &log_dir,
+            &markets,
+            &labels_by_market,
+            &mut seen,
+            &running,
+            &ok_count,
+            &total_liq,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                if running.load(Ordering::SeqCst) {
+                    log::warn!("lighter WS stream ended: {e}; reconnecting in 2s");
+                    // Liquidations during the down/backoff/resubscribe window are
+                    // not observed (we deliberately don't REST-backfill — the whole
+                    // point of #663 is to stop spending the live bot's Lighter REST
+                    // budget). Emit an explicit gap marker so the event-frequency
+                    // dataset isn't silently undercounted across the gap.
+                    write_liq_gap(&log_dir, &markets, &e);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn lighter_ws_once(
+    ws_url: &str,
+    log_dir: &str,
+    markets: &[(String, String)],
+    labels_by_market: &HashMap<String, String>,
+    seen: &mut SeenRing,
+    running: &Arc<AtomicBool>,
+    ok_count: &Arc<AtomicUsize>,
+    total_liq: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    log::info!("Lighter liquidation WS connected: {ws_url}");
+    // Subscribe immediately after the handshake. The production connector
+    // (src/lighter_connector/ws.rs) and the Lighter WS reference both send
+    // subscribe frames directly; gating on an undocumented `type:"connected"`
+    // welcome would leave subscriptions unsent if the server never emits one.
+    for (_label, market) in markets {
+        let sub = json!({"type": "subscribe", "channel": format!("trade/{market}")});
+        ws.send(Message::Text(sub.to_string()))
+            .await
+            .map_err(|e| format!("subscribe failed: {e}"))?;
+    }
+    log::info!("sent {} Lighter trade WS subscriptions", markets.len());
+    // Health is "subscribed and not rejected", NOT "saw a trade": the Lighter
+    // trade channel sends no subscribed/trade ack and trades are sparse, so a
+    // quiet-but-subscribed market would otherwise read 0/N forever and fail
+    // verify. Start optimistic, then drop a market from the set if the venue
+    // sends an error frame for it (see below). A dead socket is caught by the
+    // idle-timeout reconnect (resets to 0 via the caller).
+    let mut healthy: HashSet<String> = markets.iter().map(|(_, m)| m.clone()).collect();
+    ok_count.store(healthy.len(), Ordering::SeqCst);
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(LIGHTER_WS_PING_SECS));
+    ping_interval.tick().await; // consume the immediate first tick
+    let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
+    let mut last_inbound = tokio::time::Instant::now();
+
+    while running.load(Ordering::SeqCst) {
+        let next = tokio::select! {
+            _ = ping_interval.tick() => {
+                // A read-stalled (half-open) socket would otherwise ping forever
+                // without ever reading a frame; bail so the outer loop reconnects.
+                if last_inbound.elapsed() > idle_timeout {
+                    return Err(format!(
+                        "no inbound frame for {}s; reconnecting",
+                        last_inbound.elapsed().as_secs()
+                    ));
+                }
+                // Proactive client keepalive: the liquidation stream is often quiet
+                // for minutes, so we cannot rely on reacting to a server ping.
+                ws.send(Message::Ping(Vec::new()))
+                    .await
+                    .map_err(|e| format!("client ping failed: {e}"))?;
+                continue;
+            }
+            next = ws.next() => next,
+        };
+        let Some(next) = next else {
+            return Err("stream closed".to_string());
+        };
+        let msg = next.map_err(|e| format!("ws read failed: {e}"))?;
+        last_inbound = tokio::time::Instant::now();
+        match msg {
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .map_err(|e| format!("pong failed: {e}"))?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(frame) => return Err(format!("close frame: {frame:?}")),
+            Message::Text(text) => {
+                let value: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("non-JSON Lighter trade WS text ignored: {e}");
+                        continue;
+                    }
+                };
+                let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if msg_type == "connected" {
+                    // Optional welcome frame; subscriptions were already sent after
+                    // the handshake, so nothing to do here.
+                    log::debug!("Lighter trade WS connected frame");
+                    continue;
+                }
+                if msg_type == "ping" {
+                    ws.send(Message::Text(json!({"type": "pong"}).to_string()))
+                        .await
+                        .map_err(|e| format!("app pong failed: {e}"))?;
+                    continue;
+                }
+                if let Some(err) = value.get("error") {
+                    // A rejected subscription must drop that market from health so
+                    // verify catches it instead of passing on a stale N/N.
+                    match error_frame_market(&value) {
+                        Some(market) if healthy.remove(&market) => {
+                            ok_count.store(healthy.len(), Ordering::SeqCst);
+                            log::warn!(
+                                "Lighter trade WS rejected market {market}: {err}; health {}/{}",
+                                healthy.len(),
+                                markets.len()
+                            );
+                        }
+                        _ => log::warn!("Lighter trade WS error frame: {err}"),
+                    }
+                    continue;
+                }
+                if msg_type != "subscribed/trade" && msg_type != "update/trade" {
+                    log::trace!("ignored Lighter trade WS type={msg_type}");
+                    continue;
+                }
+                let (liqs, _market) = lighter_liqs_from_ws(&value, labels_by_market);
+                let written = record_stream(log_dir, "lighter", &liqs, seen);
+                if written > 0 {
+                    total_liq.fetch_add(written, Ordering::SeqCst);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn parse_or_empty(name: &str, spec: &str) -> Vec<(String, String)> {
     if spec.trim().is_empty() {
         return Vec::new();
@@ -423,16 +652,8 @@ fn parse_or_empty(name: &str, spec: &str) -> Vec<(String, String)> {
     }
 }
 
-/// Append the NEW (not-yet-seen) liquidations to today's JSONL and emit the
-/// sliding-window saturation warning. Returns the count of new rows written.
-///
-/// `page_ids` is EVERY trade id in the page (normal + liquidation), and
-/// `prev_page_ids` holds the previous poll's page id set for this market. The
-/// saturation check fires on the full page turning over (zero overlap with the
-/// previous page) — independent of whether a liquidation happened to be in the
-/// page — so a window that could have hidden a liquidation is never silent.
 #[allow(clippy::too_many_arguments)]
-fn record(
+fn record_page(
     log_dir: &str,
     venue: &str,
     liqs: &[LiqTrade],
@@ -446,34 +667,31 @@ fn record(
     let cur: HashSet<String> = page_ids.iter().cloned().collect();
     if page_ids.len() as u64 >= limit {
         if let Some(prev) = prev_page_ids.get(market) {
-            // Zero overlap between a full page and the previous page means the
-            // window fully turned over since last poll — trades (possibly
-            // liquidations) in between were never observed, so counts are a
-            // lower bound.
             if !prev.is_empty() && prev.is_disjoint(&cur) {
                 log::warn!(
-                    "{venue} {label}: full page ({}) with no overlap vs previous poll — \
-                     liquidations may have been skipped; lower LIQ_POLL_SECS or raise \
-                     LIQ_FETCH_LIMIT (counts are a lower bound)",
+                    "{venue} {label}: full page ({}) with no overlap vs previous poll; liquidations may have been skipped",
                     page_ids.len()
                 );
             }
         }
     }
     prev_page_ids.insert(market.to_string(), cur);
+    record_stream(log_dir, venue, liqs, seen)
+}
 
+fn record_stream(log_dir: &str, venue: &str, liqs: &[LiqTrade], seen: &mut SeenRing) -> u64 {
     let mut written = 0u64;
     for t in liqs {
         if t.trade_id.is_empty() {
-            log::warn!("{venue} {label}: liquidation row with empty trade_id, skipping dedup");
+            log::warn!(
+                "{venue} {}: liquidation row with empty trade_id, skipping dedup",
+                t.label
+            );
             continue;
         }
-        // De-dup key is market-scoped: a venue may reuse a trade id across
-        // markets, so a bare trade_id shared by the per-venue ring could drop a
-        // real liquidation in another market.
         let key = format!("{}:{}", t.market, t.trade_id);
         if !seen.insert(&key) {
-            continue; // already logged
+            continue;
         }
         write_liq(log_dir, venue, t);
         written += 1;
@@ -481,16 +699,43 @@ fn record(
     written
 }
 
+/// Append an explicit coverage-gap marker to the daily file when the Lighter WS
+/// reconnects, so downstream event-frequency analysis can see that liquidations
+/// may be missing across the disconnect/backoff window (a lower-bound marker;
+/// we do not REST-backfill by design — see bot-strategy#663).
+fn write_liq_gap(log_dir: &str, markets: &[(String, String)], reason: &str) {
+    let now = chrono::Utc::now();
+    let path = format!("{}/liq_{}.jsonl", log_dir, now.format("%Y%m%d"));
+    let labels: Vec<String> = markets
+        .iter()
+        .map(|(label, market)| format!("{label}:{market}"))
+        .collect();
+    let line = json!({
+        "ts": now.to_rfc3339(),
+        "venue": "lighter",
+        "type": "ws_gap",
+        "reason": reason,
+        "markets": labels,
+    });
+    {
+        let _guard = LIQ_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("cannot open {path}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = writeln!(file, "{line}") {
+            log::error!("write failed for lighter ws_gap: {e}");
+        }
+    }
+    log::info!("WS_GAP lighter reason={reason}");
+}
+
 fn write_liq(log_dir: &str, venue: &str, t: &LiqTrade) {
     let now = chrono::Utc::now();
     let path = format!("{}/liq_{}.jsonl", log_dir, now.format("%Y%m%d"));
-    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            log::error!("cannot open {path}: {e}");
-            return;
-        }
-    };
     let line = json!({
         "ts": now.to_rfc3339(),
         "venue": venue,
@@ -505,8 +750,20 @@ fn write_liq(log_dir: &str, venue: &str, t: &LiqTrade) {
         "trade_ts_ms": t.trade_ts_ms,
         "raw": t.raw,
     });
-    if let Err(e) = writeln!(file, "{line}") {
-        log::error!("write failed for {venue} {}: {e}", t.label);
+    {
+        // Hold the lock across open+append so concurrent writers (Lighter WS task
+        // + Extended blocking poller) cannot interleave rows in the daily file.
+        let _guard = LIQ_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("cannot open {path}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = writeln!(file, "{line}") {
+            log::error!("write failed for {venue} {}: {e}", t.label);
+        }
     }
     log::info!(
         "LIQUIDATION {venue} {} {} price={:?} size={:?} side={:?}",
@@ -521,24 +778,40 @@ fn write_liq(log_dir: &str, venue: &str, t: &LiqTrade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn lighter_filters_only_liquidations() {
-        let body = json!({"code":200,"trades":[
-            {"trade_id_str":"1","type":"trade","price":"100","size":"1","usd_amount":"100","is_maker_ask":true,"timestamp":1781541099583i64},
-            {"trade_id_str":"2","type":"liquidation","price":"99","size":"2","usd_amount":"198","is_maker_ask":false,"timestamp":1781541099999i64},
-            {"trade_id_str":"3","type":"deleverage","price":"98","size":"3","usd_amount":"294","is_maker_ask":true,"timestamp":1781541100000i64}
-        ]});
-        let (liqs, page_ids) = lighter_liqs(&body, "BTC", "1");
-        // page_ids holds EVERY row (incl. the normal trade), not just liquidations.
-        assert_eq!(page_ids, vec!["1", "2", "3"]);
-        assert_eq!(liqs.len(), 2);
-        assert_eq!(liqs[0].trade_id, "2");
-        assert_eq!(liqs[0].kind, "liquidation");
-        assert_eq!(liqs[0].side.as_deref(), Some("sell")); // is_maker_ask=false -> taker sold
-        assert_eq!(liqs[0].price, Some(99.0));
-        assert_eq!(liqs[1].kind, "deleverage");
-        assert_eq!(liqs[1].side.as_deref(), Some("buy")); // is_maker_ask=true -> taker bought
+    fn lighter_ws_extracts_non_trade_rows() {
+        let msg = json!({
+            "type": "update/trade",
+            "channel": "trade:1",
+            "trades": [
+                {"trade_id_str": "1", "type": "trade"},
+                {"trade_id_str": "2", "type": "liquidation", "price": "10", "size": "3"}
+            ],
+            "liquidation_trades": []
+        });
+        let labels = HashMap::from([("1".to_string(), "BTC".to_string())]);
+        let (rows, market) = lighter_liqs_from_ws(&msg, &labels);
+        assert_eq!(market.as_deref(), Some("1"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "BTC");
+        assert_eq!(rows[0].trade_id, "2");
+        assert_eq!(rows[0].kind, "liquidation");
+    }
+
+    #[test]
+    fn error_frame_market_extracts_channel_id() {
+        assert_eq!(
+            error_frame_market(&json!({"error": "bad", "channel": "trade/7"})).as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            error_frame_market(&json!({"error": "bad", "channel": "trade:3"})).as_deref(),
+            Some("3")
+        );
+        // No channel -> unattributable (logged, health unchanged).
+        assert_eq!(error_frame_market(&json!({"error": "bad"})), None);
     }
 
     #[test]
@@ -569,29 +842,25 @@ mod tests {
     #[test]
     fn seen_ring_dedupes_and_evicts() {
         let mut r = SeenRing::new(2);
-        assert!(r.insert("a")); // new
-        assert!(!r.insert("a")); // dup
+        assert!(r.insert("a"));
+        assert!(!r.insert("a"));
         assert!(r.insert("b"));
-        assert!(r.insert("c")); // evicts "a"
+        assert!(r.insert("c"));
         assert!(!r.contains("a"));
         assert!(r.contains("b"));
         assert!(r.contains("c"));
-        assert!(r.insert("a")); // "a" is new again after eviction
+        assert!(r.insert("a"));
     }
 
     #[test]
-    fn saturation_warns_on_full_turnover_even_with_no_liquidations() {
-        // Two consecutive full pages of NORMAL trades with disjoint ids: the
-        // window turned over, so the count is a lower bound. The old code only
-        // checked liquidation ids and would have stayed silent here.
+    fn saturation_tracks_full_turnover_even_with_no_liquidations() {
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
         let mut seen = SeenRing::new(100);
         let mut prev: HashMap<String, HashSet<String>> = HashMap::new();
         let limit = 3u64;
 
-        // First poll seeds prev; no warning possible yet (prev empty).
-        let w0 = record(
+        let w0 = record_page(
             dir,
             "lighter",
             &[],
@@ -605,9 +874,7 @@ mod tests {
         assert_eq!(w0, 0);
         assert_eq!(prev.get("1").unwrap().len(), 3);
 
-        // Second poll: full page, ids fully disjoint from the first -> turnover.
-        // No liquidations present, yet prev is recorded for the next round.
-        let w1 = record(
+        let w1 = record_page(
             dir,
             "lighter",
             &[],
@@ -627,12 +894,9 @@ mod tests {
 
     #[test]
     fn dedup_is_market_scoped() {
-        // Same trade_id "5" on two different markets must both be logged: a bare
-        // trade_id key in a shared per-venue ring would drop the second.
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
         let mut seen = SeenRing::new(100);
-        let mut prev: HashMap<String, HashSet<String>> = HashMap::new();
 
         let liq = |market: &str| LiqTrade {
             label: "L".into(),
@@ -647,47 +911,12 @@ mod tests {
             raw: Value::Null,
         };
 
-        let a = record(
-            dir,
-            "lighter",
-            &[liq("0")],
-            &id_vec(&["5"]),
-            100,
-            &mut seen,
-            &mut prev,
-            "0",
-            "ETH",
-        );
-        let b = record(
-            dir,
-            "lighter",
-            &[liq("1")],
-            &id_vec(&["5"]),
-            100,
-            &mut seen,
-            &mut prev,
-            "1",
-            "BTC",
-        );
-        assert_eq!(a, 1, "first market's liquidation logged");
-        assert_eq!(b, 1, "same id on a different market must also log");
-        // Re-seeing market 0's id 5 is a dup and must be dropped.
-        let c = record(
-            dir,
-            "lighter",
-            &[liq("0")],
-            &id_vec(&["5"]),
-            100,
-            &mut seen,
-            &mut prev,
-            "0",
-            "ETH",
-        );
-        assert_eq!(c, 0, "same market+id is a duplicate");
-    }
-
-    fn id_vec(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+        let a = record_stream(dir, "lighter", &[liq("0")], &mut seen);
+        let b = record_stream(dir, "lighter", &[liq("1")], &mut seen);
+        let c = record_stream(dir, "lighter", &[liq("0")], &mut seen);
+        assert_eq!(a, 1);
+        assert_eq!(b, 1);
+        assert_eq!(c, 0);
     }
 
     #[test]
@@ -697,5 +926,9 @@ mod tests {
         assert_eq!(fnum(&v, "n"), Some(42.5));
         assert_eq!(fnum(&v, "empty"), None);
         assert_eq!(fnum(&v, "missing"), None);
+    }
+
+    fn id_vec(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
     }
 }

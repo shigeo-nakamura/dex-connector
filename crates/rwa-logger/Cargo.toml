@@ -17,6 +17,9 @@ chrono = { version = "0.4.26", default-features = false, features = ["clock"] }
 ctrlc = "3.1.9"
 log = "0.4.19"
 env_logger = "0.10"
+futures-util = "0.3"
+tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-tungstenite = { version = "0.20.0", features = ["rustls-tls-webpki-roots"] }
 
 [[bin]]
 name = "rwa-spot-logger"

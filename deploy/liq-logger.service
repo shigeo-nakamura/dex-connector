@@ -13,9 +13,10 @@ Type=simple
 ExecStart=/opt/rwa-logger/bin/liq-logger
 Environment=RUST_LOG=info
 Environment=LIQ_LOG_DIR=/opt/debot-rwa
-# Poll fast: Lighter caps recentTrades at 100 rows, so on high-volume BTC/ETH a
-# slow cadence can let the window turn over between polls (the logger WARNs when
-# this happens). 2s keeps the miss window small while staying trivially light.
+# Lighter uses the public trade/{market_id} WebSocket so it does not spend the
+# live bot REST budget. LIQ_POLL_SECS controls Extended REST polling and the
+# heartbeat cadence.
+Environment=LIGHTER_WS_URL=wss://mainnet.zklighter.elliot.ai/stream
 Environment=LIQ_POLL_SECS=2
 # Lighter market ids: ETH=0, BTC=1. Extended: BTC-USD / ETH-USD.
 Environment=LIGHTER_LIQ_MARKETS=ETH:0,BTC:1
