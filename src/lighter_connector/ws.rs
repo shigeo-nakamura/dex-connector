@@ -17,7 +17,9 @@
 //! `handle_*` helpers are called via `Self::*` inside this file.
 
 use super::market_cache::MarketCache;
-use super::models::{LighterOrderBook, LighterOrderBookCacheEntry, LighterPosition};
+use super::models::{
+    LighterOrderBook, LighterOrderBookCacheEntry, LighterOrderBookEntry, LighterPosition,
+};
 use super::parsing::{parse_canceled_order, parse_filled_order, value_to_decimal};
 use super::{
     outage_detector::{OutageDetector, OutageSignal, OutageTransition},
@@ -1175,48 +1177,164 @@ impl LighterConnector {
                             symbol
                         );
 
-                        // Update current price from best bid/ask
-                        if let (Some(best_bid), Some(best_ask)) = (ob.bids.first(), ob.asks.first())
-                        {
+                        // Symbol resolution above already returned when the
+                        // market_id was missing, so this never fires; it just
+                        // lets the merge below use a definite id.
+                        let Some(market_id) = market_id else {
+                            return;
+                        };
+
+                        // Book-update time: prefer the exchange `last_updated_at`
+                        // (µs since epoch, same field the price-update path uses)
+                        // so all bots observing this feed agree on book age;
+                        // fall back to local wall-clock at receive. Computed for
+                        // every frame so delta frames that touch only one side
+                        // still advance book_ts_ms.
+                        let book_ts_ms = message
+                            .get("last_updated_at")
+                            .and_then(|v| v.as_u64())
+                            .map(|us| us / 1_000)
+                            .unwrap_or_else(|| {
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64
+                            });
+
+                        // Input for the cross-symbol contamination guard, read
+                        // before taking the order-book write guard so the guard
+                        // scope below stays await-free.
+                        let known_price = {
+                            let prices = current_price.read().await;
+                            prices.get(&symbol).map(|&(price, _)| price)
+                        };
+
+                        // bot-strategy#684: `update/order_book` frames are
+                        // per-level deltas — they carry only the levels that
+                        // changed since the previous frame, with size "0.00000"
+                        // marking a removed level. Only `subscribed/order_book`
+                        // (sent once per (re)subscription) is a full snapshot.
+                        // Wholesale side replacement therefore corrupts the
+                        // cache: `.first()` becomes "whichever level last
+                        // changed" instead of top-of-book. Merge per level.
+                        let is_snapshot = msg_type == "subscribed/order_book";
+                        let merged_top = {
+                            let mut ob_guard = order_book.write().await;
+                            let merged_ob = if is_snapshot {
+                                let mut snapshot = ob;
+                                Self::normalize_order_book_snapshot(&mut snapshot);
+                                snapshot
+                            } else {
+                                // Merge the delta into the cached book. A delta
+                                // before any snapshot shouldn't happen (the
+                                // server always opens with
+                                // `subscribed/order_book`), but merge onto an
+                                // empty book as a best-effort seed if it does.
+                                let mut book = ob_guard
+                                    .get(&market_id)
+                                    .map(|entry| entry.order_book.clone())
+                                    .unwrap_or_else(|| LighterOrderBook {
+                                        bids: Vec::new(),
+                                        asks: Vec::new(),
+                                    });
+                                Self::apply_order_book_delta(&mut book, ob);
+                                book
+                            };
+
+                            let best_bid_price = merged_ob
+                                .bids
+                                .first()
+                                .and_then(|entry| Decimal::from_str(&entry.price).ok());
+                            let best_ask_price = merged_ob
+                                .asks
+                                .first()
+                                .and_then(|entry| Decimal::from_str(&entry.price).ok());
+
+                            if merged_ob.bids.is_empty() || merged_ob.asks.is_empty() {
+                                log::warn!(
+                                    "[WS_OB] one-sided book after merge for {} (market_id={}): \
+                                     bids={} asks={}; caching as-is until the next snapshot",
+                                    symbol,
+                                    market_id,
+                                    merged_ob.bids.len(),
+                                    merged_ob.asks.len()
+                                );
+                            } else if let (Some(bid), Some(ask)) = (best_bid_price, best_ask_price)
+                            {
+                                if bid >= ask {
+                                    log::warn!(
+                                        "[WS_OB] crossed book after merge for {} (market_id={}): \
+                                         best_bid={} >= best_ask={}; caching as-is until the next snapshot",
+                                        symbol,
+                                        market_id,
+                                        bid,
+                                        ask
+                                    );
+                                }
+                            }
+
+                            // Cross-symbol contamination guard: if we already
+                            // have a known price for this symbol, reject frames
+                            // that would put the merged top-of-book more than
+                            // 50% away from it (drop the frame, keep the
+                            // previous cache).
+                            if let (Some(bid), Some(ask), Some(known_price)) =
+                                (best_bid_price, best_ask_price, known_price)
+                            {
+                                let mid_price = (bid + ask) / Decimal::from(2);
+                                if known_price > Decimal::ZERO && mid_price > Decimal::ZERO {
+                                    let ratio = if mid_price > known_price {
+                                        mid_price / known_price
+                                    } else {
+                                        known_price / mid_price
+                                    };
+                                    if ratio > Decimal::new(15, 1) {
+                                        // 1.5x = 50% deviation
+                                        log::info!(
+                                            "[WS_OB] REJECTED contaminated OB for {} (market_id={}): \
+                                             bid={} ask={} mid={} deviates >50% from known price",
+                                            symbol,
+                                            market_id,
+                                            bid,
+                                            ask,
+                                            mid_price
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+
+                            let merged_top = (
+                                merged_ob.bids.first().cloned(),
+                                merged_ob.asks.first().cloned(),
+                            );
+                            ob_guard.insert(
+                                market_id,
+                                LighterOrderBookCacheEntry {
+                                    order_book: merged_ob,
+                                    updated_at: Instant::now(),
+                                    book_ts_ms,
+                                },
+                            );
+                            merged_top
+                        };
+                        log::debug!(
+                            "[WS_OB] cached order book for {} (market_id={}, channel='{}')",
+                            symbol,
+                            market_id,
+                            channel
+                        );
+
+                        // Update current price from the merged book's best
+                        // bid/ask. Pre-#684 this read the frame's own first
+                        // levels, which for a delta frame is just whatever
+                        // level happened to change last.
+                        if let (Some(best_bid), Some(best_ask)) = merged_top {
                             if let (Ok(bid_price), Ok(ask_price)) = (
                                 string_to_decimal(Some(best_bid.price.clone())),
                                 string_to_decimal(Some(best_ask.price.clone())),
                             ) {
                                 let mid_price = (bid_price + ask_price) / Decimal::from(2);
-
-                                // Cross-symbol contamination guard: if we already have a
-                                // known price for this symbol, reject OB updates where
-                                // bid/ask deviates more than 50% from it.
-                                let is_contaminated = {
-                                    let prices = current_price.read().await;
-                                    if let Some(&(known_price, _)) = prices.get(&symbol) {
-                                        if known_price > Decimal::ZERO {
-                                            let ratio = if mid_price > known_price {
-                                                mid_price / known_price
-                                            } else {
-                                                known_price / mid_price
-                                            };
-                                            ratio > Decimal::new(15, 1) // 1.5x = 50% deviation
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                };
-
-                                if is_contaminated {
-                                    log::info!(
-                                        "[WS_OB] REJECTED contaminated OB for {} (market_id={:?}): \
-                                         bid={} ask={} mid={} deviates >50% from known price",
-                                        symbol,
-                                        market_id,
-                                        bid_price,
-                                        ask_price,
-                                        mid_price
-                                    );
-                                    return;
-                                }
 
                                 // Prefer the exchange-side `last_updated_at` (microseconds since
                                 // epoch) so that all bots observing the same WS feed share an
@@ -1267,61 +1385,6 @@ impl LighterConnector {
                                 );
                             }
                         }
-                        if let Some(market_id) = market_id {
-                            // Book-update time: prefer the exchange `last_updated_at`
-                            // (µs since epoch, same field the price-update path uses)
-                            // so all bots observing this feed agree on book age;
-                            // fall back to local wall-clock at receive. Recomputed
-                            // here (outside the bid/ask block above) so delta frames
-                            // that touch only one side still advance book_ts_ms.
-                            let book_ts_ms = message
-                                .get("last_updated_at")
-                                .and_then(|v| v.as_u64())
-                                .map(|us| us / 1_000)
-                                .unwrap_or_else(|| {
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_millis() as u64
-                                });
-                            {
-                                let mut ob_guard = order_book.write().await;
-                                // For delta updates, merge with existing cache:
-                                // keep the existing side if the new update has no entries for it
-                                let merged_ob = if let Some(existing) = ob_guard.get(&market_id) {
-                                    let merged_bids = if ob.bids.is_empty() {
-                                        existing.order_book.bids.clone()
-                                    } else {
-                                        ob.bids
-                                    };
-                                    let merged_asks = if ob.asks.is_empty() {
-                                        existing.order_book.asks.clone()
-                                    } else {
-                                        ob.asks
-                                    };
-                                    LighterOrderBook {
-                                        bids: merged_bids,
-                                        asks: merged_asks,
-                                    }
-                                } else {
-                                    ob
-                                };
-                                ob_guard.insert(
-                                    market_id,
-                                    LighterOrderBookCacheEntry {
-                                        order_book: merged_ob,
-                                        updated_at: Instant::now(),
-                                        book_ts_ms,
-                                    },
-                                );
-                            }
-                            log::debug!(
-                                "[WS_OB] cached order book for {} (market_id={}, channel='{}')",
-                                symbol,
-                                market_id,
-                                channel
-                            );
-                        }
                     }
                 }
             }
@@ -1352,6 +1415,79 @@ impl LighterConnector {
             }
             _ => {
                 log::trace!("Unhandled WebSocket message type: {}", msg_type);
+            }
+        }
+    }
+
+    /// Normalize a `subscribed/order_book` snapshot before caching:
+    /// defensively drop zero-size levels (the venue's removal marker —
+    /// snapshots shouldn't contain any) and sort both sides best-first
+    /// (bids descending, asks ascending by price). Observed snapshots
+    /// already arrive sorted, but every consumer assumes `.first()` is
+    /// top-of-book, so we don't rely on it (bot-strategy#684).
+    fn normalize_order_book_snapshot(ob: &mut LighterOrderBook) {
+        let is_zero_size = |entry: &LighterOrderBookEntry| {
+            Decimal::from_str(&entry.size)
+                .map(|size| size.is_zero())
+                .unwrap_or(false)
+        };
+        ob.bids.retain(|entry| !is_zero_size(entry));
+        ob.asks.retain(|entry| !is_zero_size(entry));
+        // Unparseable prices sort to the end of the side, never to the top.
+        ob.bids.sort_by_cached_key(|entry| {
+            std::cmp::Reverse(Decimal::from_str(&entry.price).unwrap_or(Decimal::MIN))
+        });
+        ob.asks
+            .sort_by_cached_key(|entry| Decimal::from_str(&entry.price).unwrap_or(Decimal::MAX));
+    }
+
+    /// Apply an `update/order_book` delta to a cached book
+    /// (bot-strategy#684). Each delta entry replaces the level at its
+    /// price, size "0.00000" deletes that level, and prices not in the
+    /// book are inserted in place. Sides keep the best-first invariant
+    /// (bids descending / asks ascending) established by
+    /// `normalize_order_book_snapshot`.
+    fn apply_order_book_delta(book: &mut LighterOrderBook, delta: LighterOrderBook) {
+        Self::apply_order_book_side_delta(&mut book.bids, delta.bids, true);
+        Self::apply_order_book_side_delta(&mut book.asks, delta.asks, false);
+    }
+
+    fn apply_order_book_side_delta(
+        side: &mut Vec<LighterOrderBookEntry>,
+        deltas: Vec<LighterOrderBookEntry>,
+        descending: bool,
+    ) {
+        for entry in deltas {
+            let Ok(price) = Decimal::from_str(&entry.price) else {
+                log::warn!(
+                    "[WS_OB] skipping delta level with unparseable price '{}'",
+                    entry.price
+                );
+                continue;
+            };
+            // The venue marks removed levels with size "0.00000". An
+            // unparseable size falls through to the upsert branch so the
+            // raw string is stored unchanged, matching how snapshot
+            // entries are kept verbatim for downstream parsing.
+            let is_removal = Decimal::from_str(&entry.size)
+                .map(|size| size.is_zero())
+                .unwrap_or(false);
+            let position = side.binary_search_by(|existing| {
+                let existing_price = Decimal::from_str(&existing.price).unwrap_or_default();
+                if descending {
+                    price.cmp(&existing_price)
+                } else {
+                    existing_price.cmp(&price)
+                }
+            });
+            match (position, is_removal) {
+                (Ok(index), true) => {
+                    side.remove(index);
+                }
+                (Ok(index), false) => side[index] = entry,
+                // Removal of a level we never had: no-op.
+                (Err(_), true) => {}
+                (Err(index), false) => side.insert(index, entry),
             }
         }
     }
@@ -2325,6 +2461,344 @@ mod fake_exchange_tests {
 
         connector.is_running.store(false, Ordering::SeqCst);
         server.abort();
+    }
+}
+
+/// Unit tests for the order-book snapshot/delta cache merge
+/// (bot-strategy#684). Frames are trimmed from a live capture of
+/// `wss://mainnet.zklighter.elliot.ai/stream` channel `order_book/1`
+/// (2026-07-02): `subscribed/order_book` carries the full book (bids
+/// descending, asks ascending, no zero-size levels) and every
+/// `update/order_book` is a per-level delta where size "0.00000" marks
+/// a removed level.
+#[cfg(test)]
+mod order_book_merge_tests {
+    use super::*;
+    use crate::lighter_connector::market_cache::MarketInfo;
+    use serde_json::json;
+
+    struct WsCaches {
+        current_price: Arc<RwLock<HashMap<String, (Decimal, u64)>>>,
+        order_book: Arc<RwLock<HashMap<u32, LighterOrderBookCacheEntry>>>,
+        filled_orders: Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
+        canceled_orders: Arc<RwLock<HashMap<String, Vec<CanceledOrder>>>>,
+        cached_open_orders: Arc<RwLock<HashMap<String, Vec<OpenOrder>>>>,
+        account_state: Arc<RwLock<AccountState>>,
+        positions_ready: Arc<AtomicBool>,
+        funding_rate_cache: Arc<RwLock<HashMap<u32, Decimal>>>,
+        market_cache: Arc<RwLock<MarketCache>>,
+        price_update_tx: tokio::sync::broadcast::Sender<crate::PriceUpdate>,
+    }
+
+    impl WsCaches {
+        async fn new() -> Self {
+            let market_cache = Arc::new(RwLock::new(MarketCache::default()));
+            {
+                let info = MarketInfo {
+                    canonical_symbol: "BTC".to_string(),
+                    market_id: 1,
+                    price_decimals: 1,
+                    size_decimals: 5,
+                    min_order: Some(Decimal::new(1, 5)),
+                };
+                let mut cache = market_cache.write().await;
+                cache.by_symbol.insert("BTC".to_string(), info.clone());
+                cache.by_id.insert(1, info);
+            }
+            let (price_update_tx, _) = tokio::sync::broadcast::channel(16);
+            Self {
+                current_price: Arc::new(RwLock::new(HashMap::new())),
+                order_book: Arc::new(RwLock::new(HashMap::new())),
+                filled_orders: Arc::new(RwLock::new(HashMap::new())),
+                canceled_orders: Arc::new(RwLock::new(HashMap::new())),
+                cached_open_orders: Arc::new(RwLock::new(HashMap::new())),
+                account_state: Arc::new(RwLock::new(AccountState::default())),
+                positions_ready: Arc::new(AtomicBool::new(false)),
+                funding_rate_cache: Arc::new(RwLock::new(HashMap::new())),
+                market_cache,
+                price_update_tx,
+            }
+        }
+
+        async fn dispatch(&self, frame: Value) {
+            LighterConnector::handle_websocket_message(
+                frame,
+                &self.current_price,
+                &self.order_book,
+                &self.filled_orders,
+                &self.canceled_orders,
+                &self.cached_open_orders,
+                &self.account_state,
+                &self.positions_ready,
+                &self.funding_rate_cache,
+                42,
+                &self.market_cache,
+                "BTC",
+                &self.price_update_tx,
+            )
+            .await;
+        }
+
+        async fn cached_book(&self) -> LighterOrderBook {
+            self.order_book
+                .read()
+                .await
+                .get(&1)
+                .expect("BTC order book cached")
+                .order_book
+                .clone()
+        }
+
+        async fn cached_mid(&self) -> Decimal {
+            self.current_price
+                .read()
+                .await
+                .get("BTC")
+                .expect("BTC mid cached")
+                .0
+        }
+    }
+
+    fn snapshot_frame() -> Value {
+        json!({
+            "type": "subscribed/order_book",
+            "channel": "order_book:1",
+            "offset": 7_389_342u64,
+            "timestamp": 1_783_025_893_947u64,
+            "last_updated_at": 1_783_025_893_823_741u64,
+            "order_book": {
+                "code": 0,
+                "offset": 7_389_342u64,
+                "nonce": 16_035_030_647u64,
+                "begin_nonce": 16_035_030_647u64,
+                "last_updated_at": 1_783_025_893_823_741u64,
+                "bids": [
+                    { "price": "61560.5", "size": "0.18151" },
+                    { "price": "61560.3", "size": "0.80272" },
+                    { "price": "61560.2", "size": "0.02867" }
+                ],
+                "asks": [
+                    { "price": "61563.6", "size": "0.01441" },
+                    { "price": "61565.7", "size": "0.01109" },
+                    { "price": "61566.2", "size": "0.03762" }
+                ]
+            }
+        })
+    }
+
+    fn delta_frame(bids: Value, asks: Value) -> Value {
+        json!({
+            "type": "update/order_book",
+            "channel": "order_book:1",
+            "offset": 7_389_379u64,
+            "timestamp": 1_783_025_898_747u64,
+            "last_updated_at": 1_783_025_898_738_448u64,
+            "order_book": {
+                "code": 0,
+                "offset": 7_389_379u64,
+                "nonce": 16_035_030_693u64,
+                "begin_nonce": 16_035_030_647u64,
+                "last_updated_at": 1_783_025_898_738_448u64,
+                "bids": bids,
+                "asks": asks
+            }
+        })
+    }
+
+    fn levels(side: &[LighterOrderBookEntry]) -> Vec<(&str, &str)> {
+        side.iter()
+            .map(|entry| (entry.price.as_str(), entry.size.as_str()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn snapshot_then_delta_upserts_levels() {
+        let caches = WsCaches::new().await;
+        caches.dispatch(snapshot_frame()).await;
+
+        let book = caches.cached_book().await;
+        assert_eq!(book.bids.len(), 3);
+        assert_eq!(book.asks.len(), 3);
+        assert_eq!(book.bids[0].price, "61560.5");
+        assert_eq!(book.asks[0].price, "61563.6");
+
+        // Delta: new best bid inserted, existing bid resized, best ask resized.
+        caches
+            .dispatch(delta_frame(
+                json!([
+                    { "price": "61561.0", "size": "0.10000" },
+                    { "price": "61560.3", "size": "0.50000" }
+                ]),
+                json!([{ "price": "61563.6", "size": "0.02000" }]),
+            ))
+            .await;
+
+        let book = caches.cached_book().await;
+        assert_eq!(
+            levels(&book.bids),
+            vec![
+                ("61561.0", "0.10000"),
+                ("61560.5", "0.18151"),
+                ("61560.3", "0.50000"),
+                ("61560.2", "0.02867"),
+            ]
+        );
+        assert_eq!(
+            levels(&book.asks),
+            vec![
+                ("61563.6", "0.02000"),
+                ("61565.7", "0.01109"),
+                ("61566.2", "0.03762"),
+            ]
+        );
+        // Mid derives from the merged top-of-book, not the raw delta frame.
+        assert_eq!(
+            caches.cached_mid().await,
+            Decimal::new(615_623, 1) // (61561.0 + 61563.6) / 2
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_zero_size_removes_levels() {
+        let caches = WsCaches::new().await;
+        caches.dispatch(snapshot_frame()).await;
+
+        // Remove the best ask; removal of a price we never had is a no-op.
+        caches
+            .dispatch(delta_frame(
+                json!([{ "price": "61559.0", "size": "0.00000" }]),
+                json!([{ "price": "61563.6", "size": "0.00000" }]),
+            ))
+            .await;
+
+        let book = caches.cached_book().await;
+        assert_eq!(
+            levels(&book.asks),
+            vec![("61565.7", "0.01109"), ("61566.2", "0.03762")]
+        );
+        assert_eq!(
+            levels(&book.bids),
+            vec![
+                ("61560.5", "0.18151"),
+                ("61560.3", "0.80272"),
+                ("61560.2", "0.02867"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_sided_delta_leaves_other_side_intact() {
+        let caches = WsCaches::new().await;
+        caches.dispatch(snapshot_frame()).await;
+
+        caches
+            .dispatch(delta_frame(
+                json!([{ "price": "61560.5", "size": "0.20000" }]),
+                json!([]),
+            ))
+            .await;
+
+        let book = caches.cached_book().await;
+        assert_eq!(
+            levels(&book.asks),
+            vec![
+                ("61563.6", "0.01441"),
+                ("61565.7", "0.01109"),
+                ("61566.2", "0.03762"),
+            ]
+        );
+        assert_eq!(book.bids[0].size, "0.20000");
+        assert_eq!(book.bids.len(), 3);
+        // Mid still uses both sides of the merged book even though the
+        // delta frame carried no asks.
+        assert_eq!(
+            caches.cached_mid().await,
+            Decimal::new(6_156_205, 2) // (61560.5 + 61563.6) / 2
+        );
+    }
+
+    #[tokio::test]
+    async fn unsorted_snapshot_gets_sorted_best_first() {
+        let caches = WsCaches::new().await;
+        let mut frame = snapshot_frame();
+        frame["order_book"]["bids"] = json!([
+            { "price": "61560.2", "size": "0.02867" },
+            { "price": "61560.5", "size": "0.18151" },
+            { "price": "61560.3", "size": "0.80272" }
+        ]);
+        frame["order_book"]["asks"] = json!([
+            { "price": "61566.2", "size": "0.03762" },
+            { "price": "61563.6", "size": "0.01441" },
+            { "price": "61565.7", "size": "0.01109" }
+        ]);
+        caches.dispatch(frame).await;
+
+        let book = caches.cached_book().await;
+        assert_eq!(
+            levels(&book.bids),
+            vec![
+                ("61560.5", "0.18151"),
+                ("61560.3", "0.80272"),
+                ("61560.2", "0.02867"),
+            ]
+        );
+        assert_eq!(
+            levels(&book.asks),
+            vec![
+                ("61563.6", "0.01441"),
+                ("61565.7", "0.01109"),
+                ("61566.2", "0.03762"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn crossed_book_after_delta_logs_and_does_not_panic() {
+        let caches = WsCaches::new().await;
+        caches.dispatch(snapshot_frame()).await;
+
+        // A bid arriving above the best ask crosses the merged book. The
+        // guard warns but keeps serving the merged state (no panic, no
+        // cache wipe); the next snapshot resets it.
+        caches
+            .dispatch(delta_frame(
+                json!([{ "price": "61564.0", "size": "0.05000" }]),
+                json!([]),
+            ))
+            .await;
+
+        let book = caches.cached_book().await;
+        assert_eq!(book.bids[0].price, "61564.0");
+        assert_eq!(book.asks[0].price, "61563.6");
+        assert_eq!(book.bids.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn resubscribe_snapshot_replaces_cached_book() {
+        let caches = WsCaches::new().await;
+        caches.dispatch(snapshot_frame()).await;
+        caches
+            .dispatch(delta_frame(
+                json!([{ "price": "61561.0", "size": "0.10000" }]),
+                json!([]),
+            ))
+            .await;
+
+        // A fresh `subscribed/order_book` (e.g. after reconnect) is the
+        // reset point: the cache must match the snapshot exactly, without
+        // leftovers from earlier deltas.
+        caches.dispatch(snapshot_frame()).await;
+
+        let book = caches.cached_book().await;
+        assert_eq!(
+            levels(&book.bids),
+            vec![
+                ("61560.5", "0.18151"),
+                ("61560.3", "0.80272"),
+                ("61560.2", "0.02867"),
+            ]
+        );
+        assert_eq!(book.asks.len(), 3);
     }
 }
 
