@@ -301,13 +301,13 @@ async fn main() {
 
     if !lighter_markets.is_empty() {
         tasks.push(tokio::spawn(lighter_ws_task(
-            lighter_ws_url,
-            log_dir.clone(),
-            lighter_markets.clone(),
+            LighterWsCtx::new(lighter_ws_url, log_dir.clone(), lighter_markets.clone()),
+            LighterWsState {
+                running: Arc::clone(&running),
+                ok_count: Arc::clone(&lighter_ok),
+                total_liq: Arc::clone(&total_liq),
+            },
             seen_cap,
-            Arc::clone(&running),
-            Arc::clone(&lighter_ok),
-            Arc::clone(&total_liq),
         )));
     }
 
@@ -469,44 +469,53 @@ fn extended_poll_loop(
     }
 }
 
-async fn lighter_ws_task(
+/// Immutable inputs of the Lighter WS collector, shared across reconnect
+/// attempts.
+struct LighterWsCtx {
     ws_url: String,
     log_dir: String,
     markets: Vec<(String, String)>,
-    seen_cap: usize,
+    labels_by_market: HashMap<String, String>,
+}
+
+impl LighterWsCtx {
+    fn new(ws_url: String, log_dir: String, markets: Vec<(String, String)>) -> Self {
+        let labels_by_market = markets
+            .iter()
+            .map(|(label, market)| (market.clone(), label.clone()))
+            .collect();
+        Self {
+            ws_url,
+            log_dir,
+            markets,
+            labels_by_market,
+        }
+    }
+}
+
+/// Shared progress/health state the Lighter WS collector publishes for the
+/// heartbeat task.
+struct LighterWsState {
     running: Arc<AtomicBool>,
     ok_count: Arc<AtomicUsize>,
     total_liq: Arc<AtomicU64>,
-) {
-    let labels_by_market: HashMap<String, String> = markets
-        .iter()
-        .map(|(label, market)| (market.clone(), label.clone()))
-        .collect();
+}
+
+async fn lighter_ws_task(ctx: LighterWsCtx, state: LighterWsState, seen_cap: usize) {
     let mut seen = SeenRing::new(seen_cap);
-    while running.load(Ordering::SeqCst) {
-        ok_count.store(0, Ordering::SeqCst);
-        match lighter_ws_once(
-            &ws_url,
-            &log_dir,
-            &markets,
-            &labels_by_market,
-            &mut seen,
-            &running,
-            &ok_count,
-            &total_liq,
-        )
-        .await
-        {
+    while state.running.load(Ordering::SeqCst) {
+        state.ok_count.store(0, Ordering::SeqCst);
+        match lighter_ws_once(&ctx, &state, &mut seen).await {
             Ok(()) => {}
             Err(e) => {
-                if running.load(Ordering::SeqCst) {
+                if state.running.load(Ordering::SeqCst) {
                     log::warn!("lighter WS stream ended: {e}; reconnecting in 2s");
                     // Liquidations during the down/backoff/resubscribe window are
                     // not observed (we deliberately don't REST-backfill — the whole
                     // point of #663 is to stop spending the live bot's Lighter REST
                     // budget). Emit an explicit gap marker so the event-frequency
                     // dataset isn't silently undercounted across the gap.
-                    write_liq_gap(&log_dir, &markets, &e);
+                    write_liq_gap(&ctx.log_dir, &ctx.markets, &e);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -514,46 +523,40 @@ async fn lighter_ws_task(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn lighter_ws_once(
-    ws_url: &str,
-    log_dir: &str,
-    markets: &[(String, String)],
-    labels_by_market: &HashMap<String, String>,
+    ctx: &LighterWsCtx,
+    state: &LighterWsState,
     seen: &mut SeenRing,
-    running: &Arc<AtomicBool>,
-    ok_count: &Arc<AtomicUsize>,
-    total_liq: &Arc<AtomicU64>,
 ) -> Result<(), String> {
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url)
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(ctx.ws_url.as_str())
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
-    log::info!("Lighter liquidation WS connected: {ws_url}");
+    log::info!("Lighter liquidation WS connected: {}", ctx.ws_url);
     // Subscribe immediately after the handshake. The production connector
     // (src/lighter_connector/ws.rs) and the Lighter WS reference both send
     // subscribe frames directly; gating on an undocumented `type:"connected"`
     // welcome would leave subscriptions unsent if the server never emits one.
-    for (_label, market) in markets {
+    for (_label, market) in &ctx.markets {
         let sub = json!({"type": "subscribe", "channel": format!("trade/{market}")});
         ws.send(Message::Text(sub.to_string()))
             .await
             .map_err(|e| format!("subscribe failed: {e}"))?;
     }
-    log::info!("sent {} Lighter trade WS subscriptions", markets.len());
+    log::info!("sent {} Lighter trade WS subscriptions", ctx.markets.len());
     // Health is "subscribed and not rejected", NOT "saw a trade": the Lighter
     // trade channel sends no subscribed/trade ack and trades are sparse, so a
     // quiet-but-subscribed market would otherwise read 0/N forever and fail
     // verify. Start optimistic, then drop a market from the set if the venue
     // sends an error frame for it (see below). A dead socket is caught by the
     // idle-timeout reconnect (resets to 0 via the caller).
-    let mut healthy: HashSet<String> = markets.iter().map(|(_, m)| m.clone()).collect();
-    ok_count.store(healthy.len(), Ordering::SeqCst);
+    let mut healthy: HashSet<String> = ctx.markets.iter().map(|(_, m)| m.clone()).collect();
+    state.ok_count.store(healthy.len(), Ordering::SeqCst);
     let mut ping_interval = tokio::time::interval(Duration::from_secs(LIGHTER_WS_PING_SECS));
     ping_interval.tick().await; // consume the immediate first tick
     let idle_timeout = Duration::from_secs(LIGHTER_WS_IDLE_TIMEOUT_SECS);
     let mut last_inbound = tokio::time::Instant::now();
 
-    while running.load(Ordering::SeqCst) {
+    while state.running.load(Ordering::SeqCst) {
         let next = tokio::select! {
             _ = ping_interval.tick() => {
                 // A read-stalled (half-open) socket would otherwise ping forever
@@ -612,11 +615,11 @@ async fn lighter_ws_once(
                     // verify catches it instead of passing on a stale N/N.
                     match error_frame_market(&value) {
                         Some(market) if healthy.remove(&market) => {
-                            ok_count.store(healthy.len(), Ordering::SeqCst);
+                            state.ok_count.store(healthy.len(), Ordering::SeqCst);
                             log::warn!(
                                 "Lighter trade WS rejected market {market}: {err}; health {}/{}",
                                 healthy.len(),
-                                markets.len()
+                                ctx.markets.len()
                             );
                         }
                         _ => log::warn!("Lighter trade WS error frame: {err}"),
@@ -627,10 +630,10 @@ async fn lighter_ws_once(
                     log::trace!("ignored Lighter trade WS type={msg_type}");
                     continue;
                 }
-                let (liqs, _market) = lighter_liqs_from_ws(&value, labels_by_market);
-                let written = record_stream(log_dir, "lighter", &liqs, seen);
+                let (liqs, _market) = lighter_liqs_from_ws(&value, &ctx.labels_by_market);
+                let written = record_stream(&ctx.log_dir, "lighter", &liqs, seen);
                 if written > 0 {
-                    total_liq.fetch_add(written, Ordering::SeqCst);
+                    state.total_liq.fetch_add(written, Ordering::SeqCst);
                 }
             }
             _ => {}
