@@ -36,6 +36,32 @@ static WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// closing the connection).
 const WS_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Injectable WS timing knobs, mirroring the Lighter connector's seam
+/// (bot-strategy#538). Extended has no client-driven heartbeat — the server
+/// pings and the client replies inline — so the stall watchdog is the only
+/// timing that matters here. Production always uses `default()`.
+#[derive(Clone, Copy)]
+pub(super) struct WsTimingConfig {
+    pub(super) stall_timeout: Duration,
+}
+
+impl Default for WsTimingConfig {
+    fn default() -> Self {
+        Self {
+            stall_timeout: WS_STALL_TIMEOUT,
+        }
+    }
+}
+
+#[cfg(test)]
+impl WsTimingConfig {
+    fn fast_for_tests() -> Self {
+        Self {
+            stall_timeout: Duration::from_millis(200),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct WrappedStreamResponse<T> {
@@ -273,6 +299,7 @@ pub(super) async fn stream_orderbooks(
     url: &str,
     symbol: &str,
     order_book_cache: &Arc<RwLock<HashMap<String, OrderBookCacheEntry>>>,
+    timing: &WsTimingConfig,
 ) -> Result<(), DexError> {
     let conn_id = next_ws_conn_id();
     let mut ws = match connect_ws(url, None).await {
@@ -294,17 +321,17 @@ pub(super) async fn stream_orderbooks(
         ws_state.context("orderbook", Some(symbol), url)
     );
     let result = loop {
-        let next = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+        let next = match tokio::time::timeout(timing.stall_timeout, ws.next()).await {
             Ok(next) => next,
             Err(_elapsed) => {
                 log::warn!(
                     "WebSocket stalled — no frame for {}s, forcing reconnect ({})",
-                    WS_STALL_TIMEOUT.as_secs(),
+                    timing.stall_timeout.as_secs(),
                     ws_state.context("orderbook", Some(symbol), url)
                 );
                 break Err(DexError::Transient(format!(
                     "ws stalled: no frame in {}s ({})",
-                    WS_STALL_TIMEOUT.as_secs(),
+                    timing.stall_timeout.as_secs(),
                     ws_state.context("orderbook", Some(symbol), url)
                 )));
             }
@@ -412,6 +439,7 @@ pub(super) async fn stream_trades(
     url: &str,
     symbol: &str,
     last_trades: &Arc<RwLock<HashMap<String, Vec<LastTrade>>>>,
+    timing: &WsTimingConfig,
 ) -> Result<(), DexError> {
     let conn_id = next_ws_conn_id();
     let mut ws = match connect_ws(url, None).await {
@@ -428,18 +456,18 @@ pub(super) async fn stream_trades(
         ws_state.context("trades", Some(symbol), url)
     );
     loop {
-        let next = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+        let next = match tokio::time::timeout(timing.stall_timeout, ws.next()).await {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(_elapsed) => {
                 log::warn!(
                     "WebSocket stalled — no frame for {}s, forcing reconnect ({})",
-                    WS_STALL_TIMEOUT.as_secs(),
+                    timing.stall_timeout.as_secs(),
                     ws_state.context("trades", Some(symbol), url)
                 );
                 return Err(DexError::Transient(format!(
                     "ws stalled: no frame in {}s ({})",
-                    WS_STALL_TIMEOUT.as_secs(),
+                    timing.stall_timeout.as_secs(),
                     ws_state.context("trades", Some(symbol), url)
                 )));
             }
@@ -523,6 +551,7 @@ pub(super) async fn stream_trades(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // one param per connector-owned cache; grouping would obscure ownership.
 pub(super) async fn stream_account(
     url: &str,
     api_key: &str,
@@ -531,6 +560,7 @@ pub(super) async fn stream_account(
     order_id_map: &Arc<RwLock<HashMap<i64, String>>>,
     filled_orders: &Arc<RwLock<HashMap<String, Vec<FilledOrder>>>>,
     positions_cache: &Arc<RwLock<Option<Vec<PositionSnapshot>>>>,
+    timing: &WsTimingConfig,
 ) -> Result<(), DexError> {
     let conn_id = next_ws_conn_id();
     let mut ws = match connect_ws(url, Some(api_key)).await {
@@ -551,18 +581,18 @@ pub(super) async fn stream_account(
     );
     let mut logged_once = false;
     loop {
-        let next = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+        let next = match tokio::time::timeout(timing.stall_timeout, ws.next()).await {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(_elapsed) => {
                 log::warn!(
                     "WebSocket stalled — no frame for {}s, forcing reconnect ({})",
-                    WS_STALL_TIMEOUT.as_secs(),
+                    timing.stall_timeout.as_secs(),
                     ws_state.context("account", None, url)
                 );
                 return Err(DexError::Transient(format!(
                     "ws stalled: no frame in {}s ({})",
-                    WS_STALL_TIMEOUT.as_secs(),
+                    timing.stall_timeout.as_secs(),
                     ws_state.context("account", None, url)
                 )));
             }
@@ -858,8 +888,9 @@ mod fake_exchange_tests {
     async fn orderbook_stream_can_restart_and_refresh_cache() {
         let (url, server) = extended_orderbook_server().await;
         let cache = Arc::new(RwLock::new(HashMap::new()));
+        let timing = WsTimingConfig::fast_for_tests();
 
-        stream_orderbooks(&url, "BTC", &cache)
+        stream_orderbooks(&url, "BTC", &cache, &timing)
             .await
             .expect("first orderbook stream");
         assert_cached_best(
@@ -870,9 +901,110 @@ mod fake_exchange_tests {
         )
         .await;
 
-        stream_orderbooks(&url, "BTC", &cache)
+        stream_orderbooks(&url, "BTC", &cache, &timing)
             .await
             .expect("second orderbook stream");
+        assert_cached_best(
+            &cache,
+            Decimal::new(600100, 1),
+            Decimal::new(600110, 1),
+            1_782_400_001_000,
+        )
+        .await;
+
+        server.abort();
+    }
+
+    /// Fake server for the silent-stall scenario (bot-strategy#347 pattern):
+    /// the first connection sends one snapshot and then goes quiet without
+    /// closing; the second connection sends a refreshed snapshot and closes
+    /// cleanly.
+    async fn extended_stalling_orderbook_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Extended stalling orderbook");
+        let url = format!("ws://{}", listener.local_addr().expect("listener addr"));
+
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept first client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept first WS");
+            let frame = json!({
+                "type": "SNAPSHOT",
+                "data": {
+                    "m": "BTC-USD",
+                    "b": [{ "p": "60000.0", "q": "1.0" }],
+                    "a": [{ "p": "60001.0", "q": "2.0" }]
+                },
+                "ts": 1_782_400_000_000i64,
+                "seq": 1
+            });
+            ws.send(Message::Text(frame.to_string()))
+                .await
+                .expect("send first snapshot");
+            // Silently stall: keep the socket open in a background task so
+            // the listener stays free for the reconnect.
+            let stalled = tokio::spawn(async move {
+                let _ws = ws;
+                futures::future::pending::<()>().await;
+            });
+
+            let (stream, _) = listener.accept().await.expect("accept reconnect client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept reconnect WS");
+            let frame = json!({
+                "type": "SNAPSHOT",
+                "data": {
+                    "m": "BTC-USD",
+                    "b": [{ "p": "60010.0", "q": "1.0" }],
+                    "a": [{ "p": "60011.0", "q": "2.0" }]
+                },
+                "ts": 1_782_400_001_000i64,
+                "seq": 2
+            });
+            ws.send(Message::Text(frame.to_string()))
+                .await
+                .expect("send reconnect snapshot");
+            let _ = ws.send(Message::Close(None)).await;
+            stalled.abort();
+        });
+
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn orderbook_silent_stall_forces_reconnect_and_cache_survives() {
+        let (url, server) = extended_stalling_orderbook_server().await;
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        let timing = WsTimingConfig::fast_for_tests();
+
+        // First stream: gets one snapshot, then the server goes silent
+        // without closing. The stall watchdog must fire and surface a
+        // Transient error so the spawn-loop reconnects.
+        let err = stream_orderbooks(&url, "BTC", &cache, &timing)
+            .await
+            .expect_err("stall watchdog should force a reconnect");
+        assert!(
+            err.to_string().contains("ws stalled"),
+            "expected stall error, got: {err}"
+        );
+
+        // The cached book must survive the stall (bot-strategy#141: callers
+        // see staleness via ORDERBOOK_STALE_AFTER, not an eager wipe).
+        assert_cached_best(
+            &cache,
+            Decimal::new(600000, 1),
+            Decimal::new(600010, 1),
+            1_782_400_000_000,
+        )
+        .await;
+
+        // Reconnect: the refreshed snapshot replaces the stale book.
+        stream_orderbooks(&url, "BTC", &cache, &timing)
+            .await
+            .expect("reconnect orderbook stream");
         assert_cached_best(
             &cache,
             Decimal::new(600100, 1),
@@ -901,6 +1033,7 @@ mod fake_exchange_tests {
             &order_id_map,
             &filled_orders,
             &positions_cache,
+            &WsTimingConfig::fast_for_tests(),
         )
         .await
         .expect("account stream");
@@ -927,6 +1060,142 @@ mod fake_exchange_tests {
 
         server.abort();
     }
+
+    /// Fake server for the fill-during-reconnect-window scenario: the first
+    /// connection delivers only the order (establishing the id → externalId
+    /// mapping) and drops; the fill for that order arrives on the reconnect
+    /// connection, with no orders array to re-establish the mapping.
+    async fn extended_reconnect_fill_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Extended reconnect-fill");
+        let url = format!("ws://{}", listener.local_addr().expect("listener addr"));
+
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept first client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept first WS");
+            let orders_frame = json!({
+                "type": "SNAPSHOT",
+                "data": {
+                    "orders": [{
+                        "id": 12345,
+                        "accountId": 42,
+                        "externalId": "external-12345",
+                        "market": "BTC-USD",
+                        "type": "LIMIT",
+                        "side": "BUY",
+                        "status": "OPEN",
+                        "statusReason": null,
+                        "price": "60000.0",
+                        "averagePrice": null,
+                        "qty": "0.010",
+                        "filledQty": "0.000",
+                        "reduceOnly": false,
+                        "postOnly": false,
+                        "createdTime": 1782400000000i64,
+                        "updatedTime": 1782400000001i64,
+                        "expiryTime": null
+                    }]
+                },
+                "ts": 1782400000001i64,
+                "seq": 1
+            });
+            ws.send(Message::Text(orders_frame.to_string()))
+                .await
+                .expect("send orders frame");
+            let _ = ws.send(Message::Close(None)).await;
+
+            let (stream, _) = listener.accept().await.expect("accept reconnect client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept reconnect WS");
+            let trades_frame = json!({
+                "type": "SNAPSHOT",
+                "data": {
+                    "trades": [{
+                        "id": 777,
+                        "accountId": 42,
+                        "market": "BTC-USD",
+                        "orderId": 12345,
+                        "side": "BUY",
+                        "price": "60000.0",
+                        "qty": "0.010",
+                        "value": "600.0",
+                        "fee": "0.2",
+                        "isTaker": true,
+                        "tradeType": "TRADE",
+                        "createdTime": 1782400000002i64
+                    }]
+                },
+                "ts": 1782400000002i64,
+                "seq": 2
+            });
+            ws.send(Message::Text(trades_frame.to_string()))
+                .await
+                .expect("send trades frame");
+            let _ = ws.send(Message::Close(None)).await;
+        });
+
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn fill_arriving_after_reconnect_maps_order_id_without_loss() {
+        let (url, server) = extended_reconnect_fill_server().await;
+        let balance_cache = Arc::new(RwLock::new(None));
+        let open_orders_cache = Arc::new(RwLock::new(HashMap::new()));
+        let order_id_map = Arc::new(RwLock::new(HashMap::new()));
+        let filled_orders = Arc::new(RwLock::new(HashMap::new()));
+        let positions_cache = Arc::new(RwLock::new(None));
+        let timing = WsTimingConfig::fast_for_tests();
+
+        // First connection: order only, then the server drops the stream.
+        stream_account(
+            &url,
+            "test-key",
+            &balance_cache,
+            &open_orders_cache,
+            &order_id_map,
+            &filled_orders,
+            &positions_cache,
+            &timing,
+        )
+        .await
+        .expect("first account stream");
+        assert!(
+            filled_orders.read().await.is_empty(),
+            "no fill should exist before the reconnect"
+        );
+
+        // Reconnect: the fill arrives with only the exchange-side orderId.
+        // The id → externalId mapping learned on the first connection must
+        // survive the reconnect so the fill joins to the caller's order id.
+        stream_account(
+            &url,
+            "test-key",
+            &balance_cache,
+            &open_orders_cache,
+            &order_id_map,
+            &filled_orders,
+            &positions_cache,
+            &timing,
+        )
+        .await
+        .expect("reconnect account stream");
+
+        let orders = filled_orders.read().await;
+        let btc_fills = orders.get("BTC").expect("BTC fills after reconnect");
+        assert_eq!(btc_fills.len(), 1, "exactly one fill, no loss/duplication");
+        let fill = &btc_fills[0];
+        assert_eq!(fill.order_id, "external-12345");
+        assert_eq!(fill.trade_id, "777");
+        assert_eq!(fill.filled_side, Some(OrderSide::Long));
+        assert_eq!(fill.filled_size, Some(Decimal::new(10, 3)));
+
+        server.abort();
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1209,7 @@ mod stall_tests {
         // every stream re-uses the same value. Locking it down keeps the
         // bot-strategy#347 fix's behavior obvious to future readers.
         assert_eq!(WS_STALL_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(WsTimingConfig::default().stall_timeout, WS_STALL_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]
