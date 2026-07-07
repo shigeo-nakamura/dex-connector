@@ -323,8 +323,10 @@ impl ExtendedConnector {
                 let symbol = symbol.clone();
                 let policy = reconnect_policy;
                 handles.push(tokio::spawn(async move {
+                    let timing = ws::WsTimingConfig::default();
                     loop {
-                        if let Err(err) = stream_orderbooks(&url, &symbol, &order_book_cache).await
+                        if let Err(err) =
+                            stream_orderbooks(&url, &symbol, &order_book_cache, &timing).await
                         {
                             log::warn!("orderbook stream error: {err}");
                         }
@@ -339,8 +341,10 @@ impl ExtendedConnector {
                 let symbol = symbol.clone();
                 let policy = reconnect_policy;
                 handles.push(tokio::spawn(async move {
+                    let timing = ws::WsTimingConfig::default();
                     loop {
-                        if let Err(err) = stream_trades(&url, &symbol, &last_trades).await {
+                        if let Err(err) = stream_trades(&url, &symbol, &last_trades, &timing).await
+                        {
                             log::warn!("public trades stream error: {err}");
                         }
                         policy.wait(0).await;
@@ -358,6 +362,7 @@ impl ExtendedConnector {
             let positions_cache = Arc::clone(&self.positions_cache);
             let policy = reconnect_policy;
             handles.push(tokio::spawn(async move {
+                let timing = ws::WsTimingConfig::default();
                 loop {
                     if let Err(err) = stream_account(
                         &url,
@@ -367,6 +372,7 @@ impl ExtendedConnector {
                         &order_id_map,
                         &filled_orders,
                         &positions_cache,
+                        &timing,
                     )
                     .await
                     {
