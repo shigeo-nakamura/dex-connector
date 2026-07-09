@@ -281,7 +281,10 @@ impl DexConnector for HyperliquidConnector {
         Ok(OrderBookSnapshot {
             bids: convert(&book.levels[0])?,
             asks: convert(&book.levels[1])?,
-            book_ts_ms: Some(book.time),
+            // REST-polled book: no genuine feed age, so this must stay None
+            // per the OrderBookSnapshot contract (bot-strategy#552) until the
+            // connector has a streaming book source.
+            book_ts_ms: None,
         })
     }
 
