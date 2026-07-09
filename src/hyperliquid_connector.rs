@@ -428,8 +428,14 @@ fn calculate_min_tick(price: Decimal, sz_decimals: u32, is_spot: bool) -> Decima
     };
     let scale_by_sig = if integer_digits >= 5 {
         0
-    } else {
+    } else if integer_digits > 0 {
         (5 - integer_digits) as u32
+    } else {
+        // Sub-dollar prices: significant figures start at the first non-zero
+        // fractional digit, so each leading zero extends the allowed scale.
+        let fraction = price_str.split('.').nth(1).unwrap_or("");
+        let leading_zeros = fraction.chars().take_while(|c| *c == '0').count() as u32;
+        leading_zeros + 5
     };
     let max_decimals: u32 = if is_spot { 8 } else { 6 };
     let scale_by_dec = max_decimals.saturating_sub(sz_decimals);
@@ -460,6 +466,21 @@ mod tests {
         assert_eq!(
             calculate_min_tick(Decimal::from_str("81.3405").unwrap(), 2, false),
             Decimal::new(1, 3)
+        );
+        // Sub-dollar: sig figs start at the first non-zero fractional digit
+        // (0.001234 → 5 sig figs would allow 7 decimals, capped at 6).
+        assert_eq!(
+            calculate_min_tick(Decimal::from_str("0.001234").unwrap(), 0, false),
+            Decimal::new(1, 6)
+        );
+        assert_eq!(
+            calculate_min_tick(Decimal::from_str("0.12345").unwrap(), 0, false),
+            Decimal::new(1, 5)
+        );
+        // szDecimals still caps the scale for sub-dollar prices.
+        assert_eq!(
+            calculate_min_tick(Decimal::from_str("0.001234").unwrap(), 2, false),
+            Decimal::new(1, 4)
         );
     }
 
