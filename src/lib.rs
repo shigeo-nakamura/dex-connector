@@ -7,6 +7,8 @@ mod dex_connector;
 mod dex_request;
 #[cfg(feature = "extended-sdk")]
 mod extended_connector;
+#[cfg(feature = "hyperliquid-sdk")]
+mod hyperliquid_connector;
 #[cfg(feature = "lighter-sdk")]
 pub mod lighter_connector;
 // The rate limiter was split into its own crate (bot-strategy#118) so the
@@ -26,6 +28,8 @@ pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
 #[cfg(feature = "extended-sdk")]
 pub use extended_connector::*;
+#[cfg(feature = "hyperliquid-sdk")]
+pub use hyperliquid_connector::*;
 #[cfg(feature = "lighter-sdk")]
 pub use lighter_connector::*;
 
