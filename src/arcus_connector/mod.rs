@@ -23,6 +23,11 @@ use tokio::task::JoinHandle;
 const DEFAULT_BASE_URL: &str = "https://api.arcus.xyz";
 const DEFAULT_WEBSOCKET_URL: &str = "wss://api.arcus.xyz/v1/ws";
 const DEFAULT_OB_STALE_SECS: u64 = 10;
+// Cached market metadata (funding rate, oracle price, open interest, volume,
+// trade count) refresh interval. Without this, a healthy order-book stream
+// would let get_ticker return the metadata snapshot cached at start()
+// indefinitely (bot-strategy#749 review).
+pub(super) const MARKET_METADATA_TTL_MS: u64 = 30_000;
 
 type BookCache = Arc<RwLock<HashMap<String, BookState>>>;
 
@@ -58,6 +63,7 @@ pub struct ArcusConnector {
     tracked_markets: Vec<TrackedMarket>,
     ob_stale_ms: u64,
     market_info: Arc<RwLock<HashMap<String, MarketInfo>>>,
+    market_info_fetched_ms: Arc<RwLock<HashMap<String, u64>>>,
     books: BookCache,
     price_update_tx: broadcast::Sender<PriceUpdate>,
     ws_task: Mutex<Option<JoinHandle<()>>>,
@@ -93,6 +99,7 @@ impl ArcusConnector {
             tracked_markets,
             ob_stale_ms,
             market_info: Arc::new(RwLock::new(HashMap::new())),
+            market_info_fetched_ms: Arc::new(RwLock::new(HashMap::new())),
             books: Arc::new(RwLock::new(HashMap::new())),
             price_update_tx,
             ws_task: Mutex::new(None),
@@ -390,11 +397,15 @@ impl DexConnector for ArcusConnector {
     }
 
     async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
-        self.market_info
-            .read()
-            .await
-            .values()
-            .any(|market| market.status != "ONLINE")
+        if self.tracked_markets.is_empty() {
+            return false;
+        }
+        let markets = self.market_info.read().await;
+        self.tracked_markets.iter().any(|tracked| {
+            markets
+                .get(&tracked.market)
+                .is_some_and(|market| market.status != "ONLINE")
+        })
     }
 
     async fn sign_evm_65b(&self, _message: &str) -> Result<String, DexError> {
@@ -456,8 +467,29 @@ pub(super) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arcus_connector::models::{MarketsResponse, WsBookContents};
+    use crate::arcus_connector::models::{MarketInfo, MarketsResponse, WsBookContents};
     use std::str::FromStr;
+
+    fn market_info_fixture(market: &str, status: &str) -> MarketInfo {
+        MarketInfo {
+            market: market.to_string(),
+            market_id: 1,
+            status: status.to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USD".to_string(),
+            tick_size: Decimal::from_str("0.1").unwrap(),
+            step_size: Decimal::from_str("0.01").unwrap(),
+            tick_tiers: Vec::new(),
+            min_order_notional: None,
+            oracle_price: None,
+            mark_price: None,
+            last_trade_price: None,
+            funding_rate: None,
+            volume24h: None,
+            trades24h: None,
+            open_interest: None,
+        }
+    }
 
     #[test]
     fn normalizes_arcus_market_symbols_and_deduplicates() {
@@ -574,6 +606,69 @@ mod tests {
             .expect("recovery top");
         assert_eq!(top.mid, Decimal::from(101));
         assert_eq!(book.last_sequence_id(), 20);
+    }
+
+    #[test]
+    fn freshness_uses_local_receive_time_not_exchange_clock() {
+        let mut book = BookState::default();
+        // Exchange clock is far ahead of local wall-clock time.
+        let skewed_exchange_ts_us = 9_999_999_000_000u64;
+        let snapshot = WsBookContents {
+            bids: vec![["100".into(), "1".into()]],
+            asks: vec![["101".into(), "1".into()]],
+            last_sequence_id: 1,
+            global_sequence_id: 1,
+            timestamp: Some(skewed_exchange_ts_us),
+        };
+        let received_at = 1_000u64;
+        book.replace_from_ws("BTC-USD", &snapshot, received_at)
+            .expect("snapshot");
+
+        assert!(book.is_fresh(received_at, 5_000));
+        // The exposed timestamp still reflects the exchange clock.
+        assert_eq!(
+            book.top().unwrap().timestamp_ms,
+            skewed_exchange_ts_us / 1_000
+        );
+
+        // 10s of local wall-clock time pass with no further update. Judged
+        // against the skewed-ahead exchange clock this would look fresh
+        // forever; judged against the local receive time it must go stale.
+        let ten_seconds_later = received_at + 10_000;
+        assert!(!book.is_fresh(ten_seconds_later, 5_000));
+    }
+
+    #[tokio::test]
+    async fn maintenance_status_ignores_untracked_markets() {
+        let connector = ArcusConnector::new(ArcusConnectorConfig {
+            tracked_symbols: vec!["BTC".to_string()],
+            ..ArcusConnectorConfig::default()
+        })
+        .expect("Arcus connector");
+
+        {
+            let mut markets = connector.market_info.write().await;
+            markets.insert(
+                "BTC-USD".to_string(),
+                market_info_fixture("BTC-USD", "ONLINE"),
+            );
+            // An untracked market goes into maintenance; a BTC-only
+            // connector must not report it.
+            markets.insert(
+                "SOL-USD".to_string(),
+                market_info_fixture("SOL-USD", "MAINTENANCE"),
+            );
+        }
+        assert!(!connector.is_upcoming_maintenance(24).await);
+
+        connector
+            .market_info
+            .write()
+            .await
+            .get_mut("BTC-USD")
+            .expect("BTC-USD entry")
+            .status = "MAINTENANCE".to_string();
+        assert!(connector.is_upcoming_maintenance(24).await);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use super::book::BookState;
 use super::models::{MarketInfo, MarketsResponse, OrderbookSnapshotWire, TradesResponse};
-use super::ArcusConnector;
+use super::{ArcusConnector, MARKET_METADATA_TTL_MS};
 use crate::{DexError, LastTrade, LastTradesResponse, OrderBookSnapshot};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -25,16 +25,46 @@ impl ArcusConnector {
                 "Arcus GET /v1/markets returned no markets".to_string(),
             ));
         }
+        let now = super::now_ms();
+        let fetched_ms = parsed.keys().map(|market| (market.clone(), now)).collect();
         *self.market_info.write().await = parsed;
+        *self.market_info_fetched_ms.write().await = fetched_ms;
         Ok(())
     }
 
+    /// Returns cached market metadata, transparently refreshing it over REST
+    /// once it is older than `MARKET_METADATA_TTL_MS`. This keeps funding
+    /// rate, oracle price, open interest, volume, and trade count from going
+    /// permanently stale on a connector with a healthy WebSocket book, since
+    /// `start()` only populates this cache once (bot-strategy#749 review).
     pub(super) async fn market_info_for(&self, symbol: &str) -> Result<MarketInfo, DexError> {
         let market = super::normalize_market(symbol);
-        if let Some(info) = self.market_info.read().await.get(&market).cloned() {
-            return Ok(info);
+        if self.market_info_is_fresh(&market).await {
+            if let Some(info) = self.market_info.read().await.get(&market).cloned() {
+                return Ok(info);
+            }
         }
-        self.fetch_market_info(&market).await
+        match self.fetch_market_info(&market).await {
+            Ok(info) => Ok(info),
+            Err(err) => match self.market_info.read().await.get(&market).cloned() {
+                Some(stale) => {
+                    log::warn!(
+                        "[arcus] market metadata refresh failed for {market}, using stale cache: {err}"
+                    );
+                    Ok(stale)
+                }
+                None => Err(err),
+            },
+        }
+    }
+
+    async fn market_info_is_fresh(&self, market: &str) -> bool {
+        let now = super::now_ms();
+        self.market_info_fetched_ms
+            .read()
+            .await
+            .get(market)
+            .is_some_and(|fetched_ms| now.saturating_sub(*fetched_ms) <= MARKET_METADATA_TTL_MS)
     }
 
     pub(super) async fn fetch_market_info(&self, market: &str) -> Result<MarketInfo, DexError> {
@@ -56,6 +86,10 @@ impl ArcusConnector {
             .write()
             .await
             .insert(info.market.clone(), info.clone());
+        self.market_info_fetched_ms
+            .write()
+            .await
+            .insert(info.market.clone(), super::now_ms());
         Ok(info)
     }
 

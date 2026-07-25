@@ -17,8 +17,26 @@ pub(super) struct BookState {
     asks: BTreeMap<Decimal, Decimal>,
     last_sequence_id: u64,
     global_sequence_id: u64,
+    // Exchange-supplied timestamp, exposed via `top().timestamp_ms` and
+    // `snapshot().book_ts_ms`. Exchange clock skew must not affect this.
     last_update_ms: u64,
+    // Local receive time, used only for `is_fresh`. Keeping this separate
+    // from `last_update_ms` means exchange clock skew can't make a fresh
+    // book look stale (or a frozen book look fresh).
+    last_received_ms: u64,
     ready: bool,
+}
+
+struct ReplaceSnapshot<'a> {
+    bids: &'a [[String; 2]],
+    asks: &'a [[String; 2]],
+    last_sequence_id: u64,
+    global_sequence_id: u64,
+    // Exchange-supplied timestamp (or the local receive time if the
+    // exchange did not provide one), exposed to callers.
+    timestamp_ms: u64,
+    // Local receive time, used only for freshness bookkeeping.
+    received_ms: u64,
 }
 
 impl BookState {
@@ -30,11 +48,14 @@ impl BookState {
     ) -> Result<Option<BookTop>, DexError> {
         self.replace(
             market,
-            &snapshot.bids,
-            &snapshot.asks,
-            snapshot.last_sequence_id,
-            snapshot.global_sequence_id,
-            microseconds_to_millis(snapshot.timestamp).unwrap_or(now_ms),
+            ReplaceSnapshot {
+                bids: &snapshot.bids,
+                asks: &snapshot.asks,
+                last_sequence_id: snapshot.last_sequence_id,
+                global_sequence_id: snapshot.global_sequence_id,
+                timestamp_ms: microseconds_to_millis(snapshot.timestamp).unwrap_or(now_ms),
+                received_ms: now_ms,
+            },
         )
     }
 
@@ -46,36 +67,36 @@ impl BookState {
     ) -> Result<Option<BookTop>, DexError> {
         self.replace(
             market,
-            &contents.bids,
-            &contents.asks,
-            contents.last_sequence_id,
-            contents.global_sequence_id,
-            contents
-                .timestamp
-                .and_then(microseconds_to_millis)
-                .unwrap_or(now_ms),
+            ReplaceSnapshot {
+                bids: &contents.bids,
+                asks: &contents.asks,
+                last_sequence_id: contents.last_sequence_id,
+                global_sequence_id: contents.global_sequence_id,
+                timestamp_ms: contents
+                    .timestamp
+                    .and_then(microseconds_to_millis)
+                    .unwrap_or(now_ms),
+                received_ms: now_ms,
+            },
         )
     }
 
     fn replace(
         &mut self,
         market: &str,
-        bids: &[[String; 2]],
-        asks: &[[String; 2]],
-        last_sequence_id: u64,
-        global_sequence_id: u64,
-        timestamp_ms: u64,
+        fields: ReplaceSnapshot<'_>,
     ) -> Result<Option<BookTop>, DexError> {
-        let parsed_bids = parse_levels(market, "bids", bids)?;
-        let parsed_asks = parse_levels(market, "asks", asks)?;
+        let parsed_bids = parse_levels(market, "bids", fields.bids)?;
+        let parsed_asks = parse_levels(market, "asks", fields.asks)?;
 
         self.bids.clear();
         self.asks.clear();
         insert_snapshot_levels(&mut self.bids, parsed_bids);
         insert_snapshot_levels(&mut self.asks, parsed_asks);
-        self.last_sequence_id = last_sequence_id;
-        self.global_sequence_id = global_sequence_id;
-        self.last_update_ms = timestamp_ms;
+        self.last_sequence_id = fields.last_sequence_id;
+        self.global_sequence_id = fields.global_sequence_id;
+        self.last_update_ms = fields.timestamp_ms;
+        self.last_received_ms = fields.received_ms;
         self.ready = true;
         Ok(self.top())
     }
@@ -115,6 +136,7 @@ impl BookState {
             .timestamp
             .and_then(microseconds_to_millis)
             .unwrap_or(now_ms);
+        self.last_received_ms = now_ms;
         Ok(self.top())
     }
 
@@ -124,13 +146,14 @@ impl BookState {
         self.last_sequence_id = 0;
         self.global_sequence_id = 0;
         self.last_update_ms = 0;
+        self.last_received_ms = 0;
         self.ready = false;
     }
 
     pub(super) fn is_fresh(&self, now_ms: u64, stale_after_ms: u64) -> bool {
         self.ready
-            && self.last_update_ms > 0
-            && now_ms.saturating_sub(self.last_update_ms) <= stale_after_ms
+            && self.last_received_ms > 0
+            && now_ms.saturating_sub(self.last_received_ms) <= stale_after_ms
     }
 
     pub(super) fn top(&self) -> Option<BookTop> {
