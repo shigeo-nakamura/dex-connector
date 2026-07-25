@@ -1,3 +1,5 @@
+mod account;
+mod auth;
 mod book;
 mod models;
 mod rest;
@@ -15,6 +17,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -31,12 +34,41 @@ pub(super) const MARKET_METADATA_TTL_MS: u64 = 30_000;
 
 type BookCache = Arc<RwLock<HashMap<String, BookState>>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ArcusConnectorConfig {
     pub base_url: String,
     pub websocket_url: String,
     pub tracked_symbols: Vec<String>,
     pub ob_stale_secs: Option<u64>,
+    /// Master Ethereum address owning the Arcus API key. Account reads need
+    /// only this value; leaving it unset keeps the P0 connector read-only.
+    pub address: Option<String>,
+    /// Arcus subaccount index authorized for authenticated mutations (0-9).
+    pub account_index: u8,
+    /// Raw 32-byte Ed25519 public key as hex.
+    pub api_key: Option<String>,
+    /// Raw 32-byte Ed25519 seed as hex. Never logged; mutations remain disabled
+    /// when this is absent.
+    pub api_private_key_hex: Option<String>,
+}
+
+impl fmt::Debug for ArcusConnectorConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArcusConnectorConfig")
+            .field("base_url", &self.base_url)
+            .field("websocket_url", &self.websocket_url)
+            .field("tracked_symbols", &self.tracked_symbols)
+            .field("ob_stale_secs", &self.ob_stale_secs)
+            .field("address", &self.address)
+            .field("account_index", &self.account_index)
+            .field("api_key", &self.api_key)
+            .field(
+                "api_private_key_hex",
+                &self.api_private_key_hex.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for ArcusConnectorConfig {
@@ -46,6 +78,10 @@ impl Default for ArcusConnectorConfig {
             websocket_url: DEFAULT_WEBSOCKET_URL.to_string(),
             tracked_symbols: Vec::new(),
             ob_stale_secs: None,
+            address: None,
+            account_index: 0,
+            api_key: None,
+            api_private_key_hex: None,
         }
     }
 }
@@ -67,6 +103,7 @@ pub struct ArcusConnector {
     books: BookCache,
     price_update_tx: broadcast::Sender<PriceUpdate>,
     ws_task: Mutex<Option<JoinHandle<()>>>,
+    auth: Option<auth::ArcusAuth>,
 }
 
 pub fn create_arcus_connector(
@@ -77,6 +114,27 @@ pub fn create_arcus_connector(
 
 impl ArcusConnector {
     pub fn new(config: ArcusConnectorConfig) -> Result<Self, DexError> {
+        if config.account_index > 9 {
+            return Err(DexError::InvalidInput {
+                field: "account_index".to_string(),
+                value: config.account_index.to_string(),
+            });
+        }
+        let auth = match config.address.as_deref() {
+            Some(address) => Some(auth::ArcusAuth::new(
+                address.to_string(),
+                config.account_index,
+                config.api_key.clone(),
+                config.api_private_key_hex.clone(),
+            )?),
+            None if config.api_key.is_some() || config.api_private_key_hex.is_some() => {
+                return Err(DexError::InvalidInput {
+                    field: "address".to_string(),
+                    value: "required when Arcus API keys are configured".to_string(),
+                });
+            }
+            None => None,
+        };
         let client = Client::builder()
             .user_agent("debot/1.0")
             .connect_timeout(Duration::from_secs(5))
@@ -103,6 +161,7 @@ impl ArcusConnector {
             books: Arc::new(RwLock::new(HashMap::new())),
             price_update_tx,
             ws_task: Mutex::new(None),
+            auth,
         })
     }
 
@@ -118,7 +177,7 @@ impl ArcusConnector {
 
     fn unsupported(operation: &str) -> DexError {
         DexError::Permanent(format!(
-            "Arcus {operation} is not enabled in the read-only connector slice (bot-strategy#749)"
+            "Arcus {operation} is not implemented in the current connector slice (bot-strategy#749)"
         ))
     }
 }
@@ -154,7 +213,7 @@ impl DexConnector for ArcusConnector {
         }
 
         if self.tracked_markets.is_empty() {
-            log::info!("[arcus] read-only connector started without WS subscriptions");
+            log::info!("[arcus] connector started without WS subscriptions");
             return Ok(());
         }
 
@@ -166,7 +225,7 @@ impl DexConnector for ArcusConnector {
             ws::websocket_loop(websocket_url, tracked_markets, books, price_update_tx).await;
         }));
         log::info!(
-            "[arcus] read-only connector started (markets={})",
+            "[arcus] connector started (markets={})",
             self.tracked_markets
                 .iter()
                 .map(|tracked| tracked.market.as_str())
@@ -206,8 +265,8 @@ impl DexConnector for ArcusConnector {
         }))
     }
 
-    async fn set_leverage(&self, _symbol: &str, _leverage: u32) -> Result<(), DexError> {
-        Err(Self::unsupported("set_leverage"))
+    async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), DexError> {
+        self.apply_leverage(symbol, leverage).await
     }
 
     async fn get_ticker(
@@ -274,20 +333,30 @@ impl DexConnector for ArcusConnector {
         Err(Self::unsupported("get_canceled_orders"))
     }
 
-    async fn get_open_orders(&self, _symbol: &str) -> Result<OpenOrdersResponse, DexError> {
-        Err(Self::unsupported("get_open_orders"))
+    async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+        self.fetch_open_orders(symbol).await
     }
 
-    async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
-        Err(Self::unsupported("get_balance"))
+    async fn get_balance(&self, symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
+        if let Some(symbol) = symbol {
+            if !matches!(symbol.to_ascii_uppercase().as_str(), "USD" | "USDG") {
+                return Err(DexError::InvalidInput {
+                    field: "symbol".to_string(),
+                    value: symbol.to_string(),
+                });
+            }
+        }
+        let account = self.fetch_account().await?;
+        account::balance_response(&account)
     }
 
     async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
-        Err(Self::unsupported("get_combined_balance"))
+        let account = self.fetch_account().await?;
+        account::combined_balance_response(&account)
     }
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
-        Err(Self::unsupported("get_positions"))
+        self.fetch_positions().await
     }
 
     async fn get_last_trades(&self, symbol: &str) -> Result<LastTradesResponse, DexError> {
@@ -491,11 +560,42 @@ pub(super) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+pub(super) fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arcus_connector::models::{MarketInfo, MarketsResponse, WsBookContents};
     use std::str::FromStr;
+
+    const PUBLIC_TEST_ACCOUNT: &str = "0x000069ac39f341ffdd98819f4bfc9f0462245508";
+
+    #[test]
+    fn config_debug_redacts_private_key() {
+        let config = ArcusConnectorConfig {
+            api_private_key_hex: Some("secret-seed".to_string()),
+            ..ArcusConnectorConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("secret-seed"));
+    }
+
+    #[test]
+    fn rejects_authentication_without_address() {
+        let err = ArcusConnector::new(ArcusConnectorConfig {
+            api_key: Some("00".repeat(32)),
+            ..ArcusConnectorConfig::default()
+        })
+        .err()
+        .expect("address must be required");
+        assert!(matches!(err, DexError::InvalidInput { field, .. } if field == "address"));
+    }
 
     fn market_info_fixture(market: &str, status: &str) -> MarketInfo {
         MarketInfo {
@@ -724,7 +824,7 @@ mod tests {
             )
             .await
             .expect_err("P0 must not place orders");
-        assert!(err.to_string().contains("read-only connector slice"));
+        assert!(err.to_string().contains("current connector slice"));
     }
 
     #[tokio::test]
@@ -782,6 +882,30 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Arcus public testnet API network access"]
+    async fn public_testnet_account_smoke() {
+        let connector = ArcusConnector::new(ArcusConnectorConfig {
+            base_url: "https://api.testnet.arcus.xyz".to_string(),
+            websocket_url: "wss://api.testnet.arcus.xyz/v1/ws".to_string(),
+            address: Some(PUBLIC_TEST_ACCOUNT.to_string()),
+            ..ArcusConnectorConfig::default()
+        })
+        .expect("Arcus testnet account connector");
+
+        let balance = connector.get_balance(None).await.expect("account balance");
+        assert!(balance.equity != Decimal::ZERO);
+        let positions = connector.get_positions().await.expect("account positions");
+        assert!(!positions.is_empty());
+        assert!(positions
+            .iter()
+            .all(|position| position.size > Decimal::ZERO));
+        connector
+            .get_open_orders("BTC")
+            .await
+            .expect("account open orders");
+    }
+
+    #[tokio::test]
     #[ignore = "requires Arcus public API network access"]
     async fn public_mainnet_ws_smoke() {
         let connector = ArcusConnector::new(ArcusConnectorConfig {
@@ -817,6 +941,7 @@ mod tests {
             websocket_url: "wss://api.testnet.arcus.xyz/v1/ws".to_string(),
             tracked_symbols: vec!["BTC".to_string()],
             ob_stale_secs: None,
+            ..ArcusConnectorConfig::default()
         })
         .expect("Arcus testnet connector");
         let mut updates = connector

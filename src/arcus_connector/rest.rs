@@ -153,7 +153,11 @@ impl ArcusConnector {
         Ok(LastTradesResponse { trades })
     }
 
-    async fn request_json<T>(&self, request: RequestBuilder, operation: &str) -> Result<T, DexError>
+    pub(super) async fn request_json<T>(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+    ) -> Result<T, DexError>
     where
         T: DeserializeOwned,
     {
@@ -174,7 +178,16 @@ impl ArcusConnector {
                     .map(|value| format!(" retry_after={value}"))
                     .unwrap_or_default()
             );
-            return if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            return if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after_secs = retry_after
+                    .as_deref()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                Err(DexError::RateLimited {
+                    until_unix: chrono::Utc::now().timestamp() + retry_after_secs,
+                })
+            } else if status.is_server_error() {
                 Err(DexError::Transient(detail))
             } else {
                 Err(DexError::Permanent(detail))
