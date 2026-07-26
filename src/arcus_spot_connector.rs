@@ -873,8 +873,16 @@ fn is_retryable_status(status: StatusCode) -> bool {
 /// attempt, so retrying just burns the configured attempt budget and, on
 /// the final attempt, would otherwise mislabel the terminal error as
 /// `retryable: true` for callers that honor `ArcusSpotError::retryable()`.
+///
+/// `is_connect()` only covers failures during connection establishment; an
+/// already-established connection dropped before headers arrive, or a reset
+/// HTTP/2 stream, surfaces as `is_request()`/`is_body()` instead and is just
+/// as transient — excluding them left `get_json` giving up after one attempt
+/// on an ordinary dropped connection even with attempts to spare (Codex
+/// review). `is_decode()` (malformed response encoding) and `is_builder()` /
+/// `is_redirect()` remain non-retryable: those fail identically every time.
 fn is_retryable_transport_error(source: &reqwest::Error) -> bool {
-    source.is_timeout() || source.is_connect()
+    source.is_timeout() || source.is_connect() || source.is_request() || source.is_body()
 }
 
 fn retry_after_duration(value: Option<&HeaderValue>, now: SystemTime) -> Option<Duration> {
@@ -1066,6 +1074,57 @@ mod tests {
         assert_eq!(observation.attempts, 2);
         assert_eq!(observation.payload.len(), 2);
         assert_eq!(client.verified_token("nvda").await.unwrap().symbol, "NVDA");
+        server.await.unwrap();
+    }
+
+    // Codex review on PR #43: an already-established connection dropped
+    // before headers arrive (or a reset HTTP/2 stream) surfaces from reqwest
+    // as `is_request()`/`is_body()`, not `is_connect()` — the first version
+    // of `is_retryable_transport_error` only checked timeout/connect, so a
+    // plain dropped connection (accepted, then closed with no response
+    // bytes) stopped `get_json` after one attempt even with attempts left.
+    #[tokio::test]
+    async fn get_json_retries_a_dropped_connection() {
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            TOKEN_FIXTURE.len(),
+            TOKEN_FIXTURE
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // First connection: accept and read the request, then drop the
+            // socket without writing any response bytes.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            drop(socket);
+
+            // Second connection: respond normally.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(success.as_bytes()).await.unwrap();
+        });
+
+        let base_url = format!("http://{address}");
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 2,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 0,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+
+        let observation = client.refresh_tokens().await.unwrap();
+        assert_eq!(
+            observation.attempts, 2,
+            "a dropped connection must be retried, not treated as a permanent failure"
+        );
+        assert_eq!(observation.payload.len(), 2);
         server.await.unwrap();
     }
 
