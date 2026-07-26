@@ -623,6 +623,14 @@ impl ArcusSpotClient {
             let status = response.status();
             let retry_after =
                 retry_after_duration(response.headers().get(RETRY_AFTER), SystemTime::now());
+            if let Some(delay) = retry_after {
+                // A quota-wide cooldown applies to every cloned client
+                // sharing this `Arc`, not just this call's own retry —
+                // record it in the shared pacing gate immediately, even on
+                // a terminal attempt that won't retry itself, so `pace()`
+                // holds off other/later callers too (Codex review).
+                self.record_retry_after(delay).await;
+            }
             let body = match response.bytes().await {
                 Ok(body) => body,
                 Err(source) => {
@@ -679,6 +687,22 @@ impl ArcusSpotClient {
             });
         }
         unreachable!("Arcus Spot request loop validates max_attempts >= 1")
+    }
+
+    /// Push the shared pacing gate out to at least `now + delay` (bounded by
+    /// `max_retry_delay_ms`) so every future `pace()` call — on this client
+    /// or any of its clones — waits out a server-advertised, quota-wide
+    /// cooldown instead of only the caller that happened to observe it.
+    async fn record_retry_after(&self, delay: Duration) {
+        let bounded = std::cmp::min(
+            delay,
+            Duration::from_millis(self.inner.config.max_retry_delay_ms),
+        );
+        let resume_at = Instant::now() + bounded;
+        let mut next_request_at = self.inner.next_request_at.lock().await;
+        if resume_at > *next_request_at {
+            *next_request_at = resume_at;
+        }
     }
 
     async fn sleep_before_retry(&self, attempt: u32, retry_after: Option<Duration>) {
@@ -1001,6 +1025,53 @@ mod tests {
         assert_eq!(nvda.unwrap().symbol, "NVDA");
         assert_eq!(amd.unwrap().symbol, "AMD");
         assert_eq!(nvda_again.unwrap().symbol, "NVDA");
+        server.await.unwrap();
+    }
+
+    // Codex review on PR #43: a quota-wide 429 Retry-After previously only
+    // delayed the caller that received it (via sleep_before_retry); other
+    // callers sharing the same client kept using the unmodified
+    // next_request_at pacing gate and could send during the advertised
+    // cooldown. max_attempts=1 means the first call surfaces the 429
+    // immediately without retrying itself, isolating the shared pacing
+    // state as the only thing that can delay the second, independent call.
+    #[tokio::test]
+    async fn rate_limit_cooldown_applies_to_next_caller_even_without_its_own_retry() {
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            TOKEN_FIXTURE.len(),
+            TOKEN_FIXTURE
+        );
+        let (base_url, server) = spawn_http_sequence(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            success,
+        ])
+        .await;
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 1,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 5_000,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+
+        let first = client.refresh_tokens().await;
+        assert!(
+            first.is_err(),
+            "a single-attempt client must surface the 429 instead of retrying itself"
+        );
+
+        let started = Instant::now();
+        let second = client.refresh_tokens().await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "a later independent call must still respect the quota-wide Retry-After cooldown, waited only {:?}",
+            started.elapsed()
+        );
+        assert_eq!(second.payload.len(), 2);
         server.await.unwrap();
     }
 
