@@ -15,6 +15,14 @@ Environment=RWA_QUOTE_REQUEST_GAP_MS=250
 Environment=RWA_QUOTE_NOTIONALS_USD=25,100,500
 # Public Jupiter-verified SPL mints with decimals. Mirrors rwa-spot-logger
 # labels so price-only dislocations can be compared against executable quotes.
+# SPACEXpre is intentionally excluded here (bot-strategy#564): its Jupiter
+# response carries an unresolved scaledUiConfig multiplier (1 -> 5), and this
+# logger's raw_token_amount/raw_to_ui only do decimals-based conversion, so
+# buy/sell price and spread_bps would be off by the scaling factor while
+# still being recorded as ROUTABLE. Add it back once the multiplier's effect
+# on outAmount is verified and, if needed, applied before emitting spread
+# fields; until then rwa-spot-logger's price-only feed is the source of truth
+# for this leg.
 Environment=RWA_QUOTE_TOKENS=TSLAx:XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB:8,NVDAx:Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh:8,AAPLx:XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp:8,METAx:Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu:8,SPYx:XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W:8,MSTRx:XsP7xzNPvEHS1m6qfanPUGjNmdnmsLKEoNAnHjdxxyZ:8,SPCX:SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb:6,SPCXx:Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8:8,SPCXon:wzAyQTorWyoVXuJKj2x8EqKEGJpS13z6EWE9z5Aondo:9
 Restart=always
 RestartSec=10
