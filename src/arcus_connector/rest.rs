@@ -184,6 +184,12 @@ impl ArcusConnector {
                     .and_then(parse_retry_after_secs)
                     .unwrap_or(1)
                     .max(1);
+                // DexError::RateLimited only carries `until_unix` (it's a
+                // shared, venue-agnostic variant), so the operation, body,
+                // and Retry-After detail above would otherwise be dropped
+                // entirely rather than just left out of the typed error
+                // (bot-strategy#749 review).
+                log::warn!("Arcus rate-limited: {detail}");
                 Err(DexError::RateLimited {
                     until_unix: chrono::Utc::now().timestamp() + retry_after_secs,
                 })
