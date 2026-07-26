@@ -317,10 +317,13 @@ impl DexConnector for ArcusConnector {
             // A caller-supplied test price is synthetic, not an
             // exchange-reported observation; don't attribute it to the
             // unrelated book update's timestamp (bot-strategy#749 review).
+            // When Arcus itself omitted the timestamp, `exchange_timestamp_ms`
+            // is `None` rather than the local receive time substituted into
+            // `timestamp_ms` (bot-strategy#749 review).
             exchange_ts: if test_price.is_some() {
                 None
             } else {
-                top.map(|book| book.timestamp_ms)
+                top.and_then(|book| book.exchange_timestamp_ms)
             },
         })
     }
@@ -763,6 +766,58 @@ mod tests {
         // forever; judged against the local receive time it must go stale.
         let ten_seconds_later = received_at + 10_000;
         assert!(!book.is_fresh(ten_seconds_later, 5_000));
+    }
+
+    #[test]
+    fn missing_ws_timestamp_is_not_exposed_as_exchange_timestamp() {
+        let mut book = BookState::default();
+        // Arcus omits `timestamp` (permitted by `WsBookContents`); the book
+        // still needs a receive-time fallback for `timestamp_ms`/freshness,
+        // but must not report that fallback as an exchange-reported time
+        // (bot-strategy#749 review).
+        let snapshot = WsBookContents {
+            bids: vec![["100".into(), "1".into()]],
+            asks: vec![["101".into(), "1".into()]],
+            last_sequence_id: 1,
+            global_sequence_id: 1,
+            timestamp: None,
+        };
+        let received_at = 1_000u64;
+        book.replace_from_ws("BTC-USD", &snapshot, received_at)
+            .expect("snapshot");
+
+        let top = book.top().unwrap();
+        assert_eq!(top.timestamp_ms, received_at);
+        assert_eq!(top.exchange_timestamp_ms, None);
+
+        // A subsequent delta that also omits the timestamp must keep the
+        // same behavior.
+        let delta = WsBookContents {
+            bids: vec![["100".into(), "2".into()]],
+            asks: vec![],
+            last_sequence_id: 2,
+            global_sequence_id: 2,
+            timestamp: None,
+        };
+        let top = book
+            .apply_delta("BTC-USD", &delta, received_at + 500)
+            .expect("delta")
+            .unwrap();
+        assert_eq!(top.exchange_timestamp_ms, None);
+
+        // Once Arcus supplies a real timestamp again, it must be exposed.
+        let delta_with_ts = WsBookContents {
+            bids: vec![["100".into(), "3".into()]],
+            asks: vec![],
+            last_sequence_id: 3,
+            global_sequence_id: 3,
+            timestamp: Some(2_000_000),
+        };
+        let top = book
+            .apply_delta("BTC-USD", &delta_with_ts, received_at + 1_000)
+            .expect("delta")
+            .unwrap();
+        assert_eq!(top.exchange_timestamp_ms, Some(2_000));
     }
 
     #[tokio::test]
