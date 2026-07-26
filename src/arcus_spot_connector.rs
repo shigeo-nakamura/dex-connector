@@ -675,6 +675,37 @@ impl ArcusSpotClient {
             let body = match response.bytes().await {
                 Ok(body) => body,
                 Err(source) => {
+                    // Headers already delivered a definitive status; prefer
+                    // that over reclassifying this as a generic transport
+                    // failure. A non-retryable status (e.g. 404) must not
+                    // spend the retry budget just because the body then
+                    // failed to read, and the reported error should surface
+                    // the real HTTP status instead of a misleading
+                    // `retryable: true` transport failure (Codex review).
+                    if !status.is_success() {
+                        let retryable = is_retryable_status(status);
+                        if retryable && attempt < self.inner.config.max_attempts {
+                            self.sleep_before_retry(attempt, retry_after).await;
+                            continue;
+                        }
+                        return Err(ArcusSpotError::Http {
+                            endpoint: endpoint.to_string(),
+                            status: status.as_u16(),
+                            classification: if status == StatusCode::TOO_MANY_REQUESTS {
+                                ArcusSpotFailureClass::RateLimited
+                            } else {
+                                ArcusSpotFailureClass::Http
+                            },
+                            retryable,
+                            attempts: attempt,
+                            retry_after_ms: retry_after.map(duration_millis_u64),
+                            body: format!("<body unavailable: {source}>"),
+                        });
+                    }
+                    // A successful status but a body that still failed to
+                    // read (truncated / connection dropped mid-stream) has
+                    // no status-based signal to lean on — a genuine
+                    // transport-level failure.
                     let classification = if source.is_timeout() {
                         ArcusSpotFailureClass::Timeout
                     } else {
@@ -1126,6 +1157,64 @@ mod tests {
         );
         assert_eq!(observation.payload.len(), 2);
         server.await.unwrap();
+    }
+
+    // Codex review on PR #43: headers already delivered a definitive,
+    // non-retryable status (404) before the body failed to read (truncated:
+    // Content-Length claims more than is actually sent). The body-read error
+    // alone looks like a generic transient transport failure, but the
+    // status is authoritative and must win — report the 404, not a
+    // retryable transport error, and don't burn the attempt budget on it.
+    #[tokio::test]
+    async fn body_read_failure_after_non_retryable_status_reports_that_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .await
+                .unwrap();
+        });
+
+        let base_url = format!("http://{address}");
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 3,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 0,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+
+        let error = client.refresh_tokens().await.unwrap_err();
+        server.await.unwrap();
+
+        match error {
+            ArcusSpotError::Http {
+                status,
+                retryable,
+                attempts,
+                ..
+            } => {
+                assert_eq!(status, 404);
+                assert!(
+                    !retryable,
+                    "a 404 must not be reported as retryable just because its body failed to read"
+                );
+                assert_eq!(
+                    attempts, 1,
+                    "a non-retryable status must fail immediately, not exhaust attempts on the body-read error"
+                );
+            }
+            other => panic!("expected Http error with status 404, got {other:?}"),
+        }
     }
 
     // Codex review on PR #43: concurrent lookups on a cold cache each used to
