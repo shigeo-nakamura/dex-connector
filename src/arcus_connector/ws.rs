@@ -57,6 +57,23 @@ pub(super) async fn run_ws_once(
     books: &BookCache,
     price_update_tx: &broadcast::Sender<PriceUpdate>,
 ) -> Result<(), DexError> {
+    run_ws_once_with_timeout(
+        websocket_url,
+        tracked_markets,
+        books,
+        price_update_tx,
+        WS_STALL_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_ws_once_with_timeout(
+    websocket_url: &str,
+    tracked_markets: &[TrackedMarket],
+    books: &BookCache,
+    price_update_tx: &broadcast::Sender<PriceUpdate>,
+    stall_timeout: Duration,
+) -> Result<(), DexError> {
     let (mut ws, _) = tokio_tungstenite::connect_async(websocket_url)
         .await
         .map_err(|err| DexError::WebSocketError(format!("Arcus connect failed: {err}")))?;
@@ -79,20 +96,29 @@ pub(super) async fn run_ws_once(
             })?;
     }
 
+    // Track elapsed time since the last *order-book* message rather than
+    // since any inbound frame. A connection can stay alive indefinitely on
+    // Ping/Pong keepalives alone while `l2OrderbookUpdates` has silently
+    // stopped; resetting the watchdog on every frame would mask exactly the
+    // stall this timeout exists to catch (bot-strategy#749 review).
+    let mut last_book_msg = Instant::now();
     loop {
-        let message = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+        let remaining = stall_timeout.saturating_sub(last_book_msg.elapsed());
+        let message = match tokio::time::timeout(remaining, ws.next()).await {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(_) => {
                 return Err(DexError::WebSocketError(format!(
-                    "Arcus WebSocket stalled: no frame within {}s",
-                    WS_STALL_TIMEOUT.as_secs()
+                    "Arcus WebSocket stalled: no order-book message within {}s",
+                    stall_timeout.as_secs()
                 )));
             }
         };
         match message.map_err(|err| DexError::WebSocketError(err.to_string()))? {
             Message::Text(text) => {
-                handle_text(&text, tracked_markets, books, price_update_tx).await?;
+                if handle_text(&text, tracked_markets, books, price_update_tx).await? {
+                    last_book_msg = Instant::now();
+                }
             }
             Message::Ping(payload) => {
                 ws.send(Message::Pong(payload))
@@ -113,12 +139,15 @@ pub(super) async fn run_ws_once(
     ))
 }
 
+/// Returns `Ok(true)` when `text` was an `l2Orderbook*` channel message,
+/// so the caller can distinguish a live order-book feed from other frames
+/// (errors, unrelated channels) for stall-watchdog purposes.
 async fn handle_text(
     text: &str,
     tracked_markets: &[TrackedMarket],
     books: &BookCache,
     price_update_tx: &broadcast::Sender<PriceUpdate>,
-) -> Result<(), DexError> {
+) -> Result<bool, DexError> {
     let value: Value = serde_json::from_str(text)?;
     let kind = value
         .get("type")
@@ -135,12 +164,12 @@ async fn handle_text(
         .and_then(Value::as_str)
         .unwrap_or_default();
     if !channel.starts_with("l2Orderbook") {
-        return Ok(());
+        return Ok(false);
     }
 
     let envelope: WsBookEnvelope = serde_json::from_value(value)?;
     let Some(contents) = envelope.contents else {
-        return Ok(());
+        return Ok(true);
     };
     let market = super::normalize_market(&envelope.id);
     let output_symbol = tracked_markets
@@ -169,7 +198,7 @@ async fn handle_text(
             timestamp: top.timestamp_ms,
         });
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn clear_books(books: &BookCache) {
@@ -325,5 +354,51 @@ mod tests {
             "expected stall timeout to fire on a silent stream, got {:?}",
             result.is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn stall_timeout_fires_despite_ping_only_keepalive() {
+        // PR #41 review: a connection that stays technically alive via
+        // Ping/Pong keepalives while `l2OrderbookUpdates` has silently
+        // stopped must still be treated as stalled. Resetting the watchdog
+        // on every inbound frame (instead of only order-book messages)
+        // would mask this and never reconnect.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Arcus ping-only server");
+        let url = format!("ws://{}", listener.local_addr().expect("listener addr"));
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut ws = accept_async(stream).await.expect("upgrade WS");
+            // Consume the subscribe frame, then send only Pings — never an
+            // order-book message — until the client gives up.
+            let _ = ws.next().await;
+            loop {
+                if ws.send(Message::Ping(vec![])).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let tracked = vec![TrackedMarket {
+            market: "BTC-USD".to_string(),
+            output_symbol: "BTC".to_string(),
+        }];
+        let books: BookCache = Arc::new(RwLock::new(HashMap::<String, BookState>::new()));
+        let (tx, _rx) = broadcast::channel(16);
+
+        let result =
+            run_ws_once_with_timeout(&url, &tracked, &books, &tx, Duration::from_millis(150)).await;
+
+        assert!(
+            result
+                .expect_err("ping-only keepalive must not suppress the stall watchdog")
+                .to_string()
+                .contains("stalled"),
+            "expected a stall error"
+        );
+        server.abort();
     }
 }
