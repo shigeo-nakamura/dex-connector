@@ -17,6 +17,7 @@ default = ["lighter-sdk"]
 lighter-sdk = ["dep:libc", "dep:lighter-ratelimit"]
 extended-sdk = ["dep:rust-crypto-lib-base", "dep:starknet"]
 hyperliquid-sdk = []
+arcus-spot-sdk = []
 
 [dependencies]
 chrono = { version = "0.4.26", default-features = false, features = ["clock", "serde"] }

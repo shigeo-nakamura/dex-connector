@@ -1,0 +1,24 @@
+{
+  "recommended": "arcus",
+  "all": [
+    {
+      "venue": "arcus",
+      "buyAmount": "9393852601996744",
+      "sellAmount": "24183796856106408",
+      "fees": []
+    },
+    {
+      "venue": "rialto",
+      "buyAmount": "9372723728557896",
+      "sellAmount": "24183796856106408",
+      "fees": []
+    },
+    {
+      "venue": "lifi",
+      "buyAmount": "9384461757223746",
+      "sellAmount": "24183796856106408",
+      "fees": []
+    }
+  ],
+  "errors": []
+}
