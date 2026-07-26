@@ -1,0 +1,68 @@
+{
+  "trades": [
+    {
+      "id": "205504",
+      "chainId": 4663,
+      "blockNumber": "19756998",
+      "blockTimestamp": "2026-07-26T09:18:20.000Z",
+      "txHash": "0x4ad8d9ba85fa59b154ea50ba84bbcbcc4b88ae1aff825911308f24557bf8f4f3",
+      "logIndex": 38,
+      "swapShell": "0x4262efbd176f02824af27010bea218429c33c7e8",
+      "taker": "0xfcdb54a0a135dd3257cd36260e7aed6bff131a8d",
+      "tokenIn": "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec",
+      "tokenOut": "0x86923f96303d656e4aa86d9d42d1e57ad2023fdc",
+      "minAmountOut": "24406153820498754",
+      "amountIn": "62757776408482226",
+      "quotedAmountIn": "62757776408482226",
+      "quotedAmountOut": "24528797809546487",
+      "amountOut": "24540232533760835",
+      "tokenInBenchmarkPrice": "0",
+      "tokenOutBenchmarkPrice": "0",
+      "router": "0xc94135b63772b91d79d0a2daab2a8801f32359bd",
+      "routeTag": "RIALTO",
+      "routeTagRaw": "0x5249414c544f0000000000000000000000000000000000000000000000000000",
+      "success": true,
+      "reason": "",
+      "tokenInWrapped": false,
+      "tokenOutWrapped": false,
+      "rawTokenIn": "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec",
+      "rawTokenOut": "0x86923f96303d656e4aa86d9d42d1e57ad2023fdc",
+      "pnl": {
+        "priced": false,
+        "usdNotional": null,
+        "feeUsd": "0",
+        "tokenExecPriceUsd": null,
+        "priceImprovementUsd": null,
+        "slippageHeadroomUsd": null,
+        "side": null,
+        "baseToken": null,
+        "baseQty": null,
+        "realizedPnlUsd": null,
+        "avgCostUsd": null,
+        "matchedQty": null,
+        "positionQtyAfter": null
+      }
+    }
+  ],
+  "tokens": {
+    "4663:0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec": {
+      "chainId": 4663,
+      "address": "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec",
+      "symbol": "NVDA",
+      "name": "NVIDIA • Robinhood Token",
+      "decimals": 18,
+      "underlying": null,
+      "firstSeenBlock": "461780"
+    },
+    "4663:0x86923f96303d656e4aa86d9d42d1e57ad2023fdc": {
+      "chainId": 4663,
+      "address": "0x86923f96303d656e4aa86d9d42d1e57ad2023fdc",
+      "symbol": "AMD",
+      "name": "AMD • Robinhood Token",
+      "decimals": 18,
+      "underlying": null,
+      "firstSeenBlock": "1115210"
+    }
+  },
+  "nextCursor": "MTg2OTU5MDk6MjQ"
+}
