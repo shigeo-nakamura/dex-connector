@@ -98,6 +98,11 @@ name = "lighter-spike"
 path = "src/bin/lighter-spike.rs"
 required-features = ["lighter-sdk"]
 
+[[bin]]
+name = "arcus-spot-recorder"
+path = "src/bin/arcus-spot-recorder.rs"
+required-features = ["arcus-spot-sdk"]
+
 [dev-dependencies]
 rusoto_core = "0.48"
 rusoto_kms = "0.48"
