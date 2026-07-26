@@ -322,7 +322,16 @@ struct ArcusSpotClientInner {
     router_base_url: Url,
     meta_base_url: Url,
     http: Client,
+    /// FIFO pacing queue: each `pace()` call reserves the next slot
+    /// `min_request_interval_ms` after the previous reservation. Distinct
+    /// from `rate_limit_until` — mixing the two made a caller queued behind
+    /// several others misread their reservations as a 429 cooldown floor
+    /// and wait for it, bursting once idle (Codex review).
     next_request_at: Mutex<Instant>,
+    /// Quota-wide floor from the most recently observed 429 `Retry-After`;
+    /// `pace()` never sends before this, on top of (not instead of) each
+    /// caller's own FIFO reservation above.
+    rate_limit_until: Mutex<Instant>,
     token_cache: RwLock<TokenCache>,
     /// Coalesces the first `refresh_tokens` call triggered from
     /// `verified_token` so concurrent lookups on an uninitialized cache
@@ -357,6 +366,7 @@ impl ArcusSpotClient {
                 meta_base_url,
                 http,
                 next_request_at: Mutex::new(Instant::now()),
+                rate_limit_until: Mutex::new(Instant::now()),
                 token_cache: RwLock::new(TokenCache::default()),
                 token_refresh_once: OnceCell::new(),
             }),
@@ -566,28 +576,30 @@ impl ArcusSpotClient {
 
     async fn pace(&self) {
         let interval = Duration::from_millis(self.inner.config.min_request_interval_ms);
-        let mut target = {
+        let fifo_slot = {
             let mut next_request_at = self.inner.next_request_at.lock().await;
             let now = Instant::now();
             let scheduled_at = std::cmp::max(*next_request_at, now);
             *next_request_at = scheduled_at + interval;
             scheduled_at
         };
+        let mut target = std::cmp::max(fifo_slot, *self.inner.rate_limit_until.lock().await);
         loop {
             let now = Instant::now();
             if now >= target {
                 return;
             }
             tokio::time::sleep(target - now).await;
-            // A concurrent record_retry_after may have pushed the shared
-            // gate out past our reservation while we were asleep — a 429
+            // A concurrent record_retry_after may have pushed the rate-limit
+            // floor out past our target while we were asleep — a 429
             // observed by another caller that entered pace() after us but
             // whose response landed before we woke. Recheck against the
-            // current gate and keep waiting for the new floor instead of
-            // sending on a now-stale reservation (Codex review).
-            let gate = *self.inner.next_request_at.lock().await;
-            if gate > target {
-                target = gate;
+            // current floor (not `next_request_at`, which is just other
+            // callers' own FIFO reservations and would misread as a
+            // cooldown — Codex review) and keep waiting if it grew.
+            let floor = *self.inner.rate_limit_until.lock().await;
+            if floor > target {
+                target = floor;
                 continue;
             }
             return;
@@ -715,9 +727,9 @@ impl ArcusSpotClient {
             Duration::from_millis(self.inner.config.max_retry_delay_ms),
         );
         let resume_at = Instant::now() + bounded;
-        let mut next_request_at = self.inner.next_request_at.lock().await;
-        if resume_at > *next_request_at {
-            *next_request_at = resume_at;
+        let mut rate_limit_until = self.inner.rate_limit_until.lock().await;
+        if resume_at > *rate_limit_until {
+            *rate_limit_until = resume_at;
         }
     }
 
@@ -1126,6 +1138,62 @@ mod tests {
              instead of sending at its original ~300ms reservation, waited only {:?}",
             gap
         );
+    }
+
+    // Codex review on PR #43: the first recheck-the-gate fix mixed the FIFO
+    // reservation counter with the 429 cooldown floor in one variable. With
+    // no 429 ever involved, three concurrent callers each advance that same
+    // counter, so a caller queued behind the others read the counter's tail
+    // (left by callers queued *after* it) as if it were a cooldown extension
+    // and waited for it — collapsing distinct slots into a burst, or waiting
+    // far longer than min_request_interval_ms. Requests must land roughly
+    // interval-apart, neither bursted together nor needlessly delayed.
+    #[tokio::test]
+    async fn concurrent_pacing_preserves_distinct_fifo_slots_without_a_cooldown() {
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            TOKEN_FIXTURE.len(),
+            TOKEN_FIXTURE
+        );
+        let (base_url, log, server) =
+            spawn_logged_http_sequence(vec![success.clone(), success.clone(), success]).await;
+
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 200,
+            max_attempts: 1,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 5_000,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let a = client.clone();
+        let b = client.clone();
+        let c = client.clone();
+
+        let (r1, r2, r3) = tokio::join!(a.refresh_tokens(), b.refresh_tokens(), c.refresh_tokens());
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+
+        server.await.unwrap();
+        let timestamps = log.lock().unwrap().clone();
+        assert_eq!(
+            timestamps.len(),
+            3,
+            "expected exactly three requests at the server"
+        );
+        for (i, window) in timestamps.windows(2).enumerate() {
+            let gap = window[1].duration_since(window[0]);
+            assert!(
+                gap >= Duration::from_millis(170) && gap <= Duration::from_millis(280),
+                "request {} arrived {:?} after the previous one; expected ~200ms FIFO \
+                 spacing, not a burst (too small) or an inflated wait (too large)",
+                i + 2,
+                gap
+            );
+        }
     }
 
     // Codex review on PR #43: a quota-wide 429 Retry-After previously only
