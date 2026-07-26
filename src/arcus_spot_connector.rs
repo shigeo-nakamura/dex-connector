@@ -322,15 +322,16 @@ struct ArcusSpotClientInner {
     router_base_url: Url,
     meta_base_url: Url,
     http: Client,
-    /// FIFO pacing queue: each `pace()` call reserves the next slot
-    /// `min_request_interval_ms` after the previous reservation. Distinct
-    /// from `rate_limit_until` — mixing the two made a caller queued behind
-    /// several others misread their reservations as a 429 cooldown floor
-    /// and wait for it, bursting once idle (Codex review).
+    /// FIFO pacing queue tail: each reservation (via `reserve_pacing_slot`)
+    /// claims the next slot `min_request_interval_ms` after the previous
+    /// one. `record_retry_after` also folds a 429 cooldown into this same
+    /// tail, so slots claimed afterward already start at/after the floor.
     next_request_at: Mutex<Instant>,
-    /// Quota-wide floor from the most recently observed 429 `Retry-After`;
-    /// `pace()` never sends before this, on top of (not instead of) each
-    /// caller's own FIFO reservation above.
+    /// Quota-wide floor from the most recently observed 429 `Retry-After`.
+    /// Read-only signal for `pace()`: a caller already asleep on a stale
+    /// reservation compares against this (not `next_request_at`, which also
+    /// moves from ordinary concurrent reservations and would misread those
+    /// as a cooldown) to decide whether it needs to re-claim its slot.
     rate_limit_until: Mutex<Instant>,
     token_cache: RwLock<TokenCache>,
     /// Coalesces the first `refresh_tokens` call triggered from
@@ -574,32 +575,40 @@ impl ArcusSpotClient {
         Ok(observation.map(|_| entry))
     }
 
-    async fn pace(&self) {
+    /// Claim the next FIFO pacing slot: `min_request_interval_ms` after the
+    /// previous reservation, or now if the queue is idle. `record_retry_after`
+    /// folds a 429 cooldown into this same tail, so a slot claimed after that
+    /// point already starts at/after the floor.
+    async fn reserve_pacing_slot(&self) -> Instant {
         let interval = Duration::from_millis(self.inner.config.min_request_interval_ms);
-        let fifo_slot = {
-            let mut next_request_at = self.inner.next_request_at.lock().await;
-            let now = Instant::now();
-            let scheduled_at = std::cmp::max(*next_request_at, now);
-            *next_request_at = scheduled_at + interval;
-            scheduled_at
-        };
-        let mut target = std::cmp::max(fifo_slot, *self.inner.rate_limit_until.lock().await);
+        let mut next_request_at = self.inner.next_request_at.lock().await;
+        let now = Instant::now();
+        let scheduled_at = std::cmp::max(*next_request_at, now);
+        *next_request_at = scheduled_at + interval;
+        scheduled_at
+    }
+
+    async fn pace(&self) {
+        let mut target = self.reserve_pacing_slot().await;
         loop {
             let now = Instant::now();
             if now >= target {
                 return;
             }
             tokio::time::sleep(target - now).await;
-            // A concurrent record_retry_after may have pushed the rate-limit
-            // floor out past our target while we were asleep — a 429
-            // observed by another caller that entered pace() after us but
-            // whose response landed before we woke. Recheck against the
-            // current floor (not `next_request_at`, which is just other
-            // callers' own FIFO reservations and would misread as a
-            // cooldown — Codex review) and keep waiting if it grew.
+            // `rate_limit_until` only moves when record_retry_after observes
+            // a 429, so this is false on every ordinary wake — cheap, and
+            // never mistakes another caller's own FIFO reservation for a
+            // cooldown (that was the bug in an earlier version of this fix).
+            // When a cooldown recorded while we slept did push past our
+            // reservation, re-claim a slot through the normal queue rather
+            // than jumping straight to the floor: record_retry_after already
+            // folded the floor into the tail, so re-reserving keeps us
+            // interval-spaced relative to any other caller doing the same,
+            // instead of everyone landing on the same instant (Codex review).
             let floor = *self.inner.rate_limit_until.lock().await;
             if floor > target {
-                target = floor;
+                target = self.reserve_pacing_slot().await;
                 continue;
             }
             return;
@@ -727,9 +736,19 @@ impl ArcusSpotClient {
             Duration::from_millis(self.inner.config.max_retry_delay_ms),
         );
         let resume_at = Instant::now() + bounded;
-        let mut rate_limit_until = self.inner.rate_limit_until.lock().await;
-        if resume_at > *rate_limit_until {
-            *rate_limit_until = resume_at;
+        {
+            let mut rate_limit_until = self.inner.rate_limit_until.lock().await;
+            if resume_at > *rate_limit_until {
+                *rate_limit_until = resume_at;
+            }
+        }
+        // Fold the floor into the FIFO tail too, so any slot claimed (or
+        // re-claimed by a caller already queued — see pace()) after this
+        // point is queued starting at/after the cooldown instead of at
+        // whatever position the queue had already reached.
+        let mut next_request_at = self.inner.next_request_at.lock().await;
+        if resume_at > *next_request_at {
+            *next_request_at = resume_at;
         }
     }
 
@@ -1137,6 +1156,71 @@ mod tests {
             "the queued second caller must wait out the 429 cooldown observed by the first \
              instead of sending at its original ~300ms reservation, waited only {:?}",
             gap
+        );
+    }
+
+    // Codex review on PR #43: with a 200ms interval and a 1s cooldown, two
+    // callers originally queued at ~200ms and ~400ms (both before the
+    // cooldown floor) must not both collapse onto the same ~1s wake time —
+    // they must re-claim FIFO slots after the floor and stay interval-spaced
+    // relative to each other, not just relative to the caller that hit the
+    // 429.
+    #[tokio::test]
+    async fn queued_callers_stay_interval_spaced_after_a_shared_cooldown() {
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            TOKEN_FIXTURE.len(),
+            TOKEN_FIXTURE
+        );
+        let (base_url, log, server) = spawn_logged_http_sequence(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            success.clone(),
+            success,
+        ])
+        .await;
+
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 200,
+            max_attempts: 1,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 5_000,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let a = client.clone();
+        let b = client.clone();
+        let c = client.clone();
+
+        let (first, second, third) =
+            tokio::join!(a.refresh_tokens(), b.refresh_tokens(), c.refresh_tokens());
+        assert!(
+            first.is_err(),
+            "tokio::join!'s poll order sends the first caller's request first, which must hit the 429"
+        );
+        second.unwrap();
+        third.unwrap();
+
+        server.await.unwrap();
+        let timestamps = log.lock().unwrap().clone();
+        assert_eq!(
+            timestamps.len(),
+            3,
+            "expected exactly three requests at the server"
+        );
+        let cooldown_gap = timestamps[1].duration_since(timestamps[0]);
+        assert!(
+            cooldown_gap >= Duration::from_millis(900),
+            "the second request must wait out the cooldown observed by the first, waited only {:?}",
+            cooldown_gap
+        );
+        let queued_gap = timestamps[2].duration_since(timestamps[1]);
+        assert!(
+            queued_gap >= Duration::from_millis(170) && queued_gap <= Duration::from_millis(280),
+            "the two callers queued behind the cooldown must remain ~200ms interval-spaced \
+             relative to each other, not collapse onto the same wake time; gap was {:?}",
+            queued_gap
         );
     }
 
