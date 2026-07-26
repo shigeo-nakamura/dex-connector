@@ -591,27 +591,31 @@ impl ArcusSpotClient {
     async fn pace(&self) {
         let mut target = self.reserve_pacing_slot().await;
         loop {
+            // Checked on every iteration — including the very first, before
+            // any sleep — so a due-now reservation still can't skip past a
+            // cooldown that another caller's record_retry_after recorded
+            // just before or after we reserved (Codex review: the previous
+            // version only checked this after actually sleeping, so an
+            // immediate slot returned without ever consulting the floor).
+            // `rate_limit_until` only moves when a 429 is observed, so this
+            // is false on every ordinary call — cheap, and never mistakes
+            // another caller's own FIFO reservation for a cooldown (that was
+            // the bug in an earlier version of this fix).
+            let floor = *self.inner.rate_limit_until.lock().await;
+            if floor > target {
+                // Re-claim through the normal queue rather than jumping
+                // straight to the floor: record_retry_after already folded
+                // it into the FIFO tail, so re-reserving keeps us
+                // interval-spaced relative to any other caller doing the
+                // same, instead of everyone landing on the same instant.
+                target = self.reserve_pacing_slot().await;
+                continue;
+            }
             let now = Instant::now();
             if now >= target {
                 return;
             }
             tokio::time::sleep(target - now).await;
-            // `rate_limit_until` only moves when record_retry_after observes
-            // a 429, so this is false on every ordinary wake — cheap, and
-            // never mistakes another caller's own FIFO reservation for a
-            // cooldown (that was the bug in an earlier version of this fix).
-            // When a cooldown recorded while we slept did push past our
-            // reservation, re-claim a slot through the normal queue rather
-            // than jumping straight to the floor: record_retry_after already
-            // folded the floor into the tail, so re-reserving keeps us
-            // interval-spaced relative to any other caller doing the same,
-            // instead of everyone landing on the same instant (Codex review).
-            let floor = *self.inner.rate_limit_until.lock().await;
-            if floor > target {
-                target = self.reserve_pacing_slot().await;
-                continue;
-            }
-            return;
         }
     }
 
@@ -1221,6 +1225,35 @@ mod tests {
             "the two callers queued behind the cooldown must remain ~200ms interval-spaced \
              relative to each other, not collapse onto the same wake time; gap was {:?}",
             queued_gap
+        );
+    }
+
+    // Codex review on PR #43: pace() only consulted rate_limit_until after
+    // actually sleeping, so a caller whose FIFO reservation happened to
+    // already be due-now returned immediately without ever checking the
+    // floor — reproducible whenever record_retry_after's two separate lock
+    // acquisitions (rate_limit_until, then next_request_at) interleave with
+    // another caller's reservation between them. Rather than relying on
+    // exact async scheduling to hit that narrow window, this test sets up
+    // the resulting state directly (a future rate_limit_until with
+    // next_request_at still due-now) and asserts pace() still waits.
+    #[tokio::test]
+    async fn pace_checks_the_cooldown_even_on_an_immediate_slot() {
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            min_request_interval_ms: 0,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let cooldown = Duration::from_millis(500);
+        *client.inner.rate_limit_until.lock().await = Instant::now() + cooldown;
+
+        let started = Instant::now();
+        client.pace().await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(450),
+            "pace() must wait out an active rate-limit floor even when its own FIFO \
+             reservation is already due-now, waited only {:?}",
+            started.elapsed()
         );
     }
 
