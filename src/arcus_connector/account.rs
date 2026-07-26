@@ -121,7 +121,12 @@ impl ArcusConnector {
 pub(super) fn balance_response(account: &AccountWire) -> Result<BalanceResponse, DexError> {
     Ok(BalanceResponse {
         equity: parse_account_decimal(&account.equity, "equity")?,
-        balance: parse_account_decimal(&account.net_quote_balance, "netQuoteBalance")?,
+        // `netQuoteBalance` is the cash-ledger value, not funds available
+        // for new orders; with open positions or reserved margin it can
+        // materially overstate usable balance. `freeCollateral` matches the
+        // available-balance convention `lighter_connector::fetch_balance`
+        // uses (bot-strategy#749 review).
+        balance: parse_account_decimal(&account.free_collateral, "freeCollateral")?,
         position_entry_price: None,
         position_sign: None,
     })
@@ -206,7 +211,7 @@ mod tests {
         .expect("account fixture");
         let balance = balance_response(&account).expect("balance");
         assert_eq!(balance.equity, Decimal::from_str("1001.25").unwrap());
-        assert_eq!(balance.balance, Decimal::from_str("975.5").unwrap());
+        assert_eq!(balance.balance, Decimal::from_str("800").unwrap());
         let position = position_snapshot(PositionWire {
             market_display_name: "BTC-USD".to_string(),
             side: "LONG".to_string(),

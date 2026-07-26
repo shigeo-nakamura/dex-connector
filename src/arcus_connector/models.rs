@@ -184,8 +184,8 @@ pub(super) struct TradeWire {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AccountWire {
-    pub(super) net_quote_balance: String,
     pub(super) equity: String,
+    pub(super) free_collateral: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

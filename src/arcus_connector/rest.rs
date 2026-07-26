@@ -181,7 +181,7 @@ impl ArcusConnector {
             return if status == StatusCode::TOO_MANY_REQUESTS {
                 let retry_after_secs = retry_after
                     .as_deref()
-                    .and_then(|value| value.parse::<i64>().ok())
+                    .and_then(parse_retry_after_secs)
                     .unwrap_or(1)
                     .max(1);
                 Err(DexError::RateLimited {
@@ -199,5 +199,45 @@ impl ArcusConnector {
                 "Arcus {operation} response decode failed: {err}; body={body}"
             ))
         })
+    }
+}
+
+/// Parses a `Retry-After` header value per RFC 9110 §10.2.3, which allows
+/// either a non-negative integer delay-seconds or an HTTP-date. Only
+/// handling delay-seconds meant a standards-valid HTTP-date response fell
+/// through to the 1s default, letting callers retry well before the
+/// server's requested time and prolong throttling (bot-strategy#749
+/// review).
+fn parse_retry_after_secs(value: &str) -> Option<i64> {
+    if let Ok(delay_secs) = value.trim().parse::<i64>() {
+        return Some(delay_secs);
+    }
+    let target = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
+    Some(target.timestamp() - chrono::Utc::now().timestamp())
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::parse_retry_after_secs;
+
+    #[test]
+    fn parses_delay_seconds() {
+        assert_eq!(parse_retry_after_secs("30"), Some(30));
+    }
+
+    #[test]
+    fn parses_http_date_relative_to_now() {
+        let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let header = future.to_rfc2822();
+        let secs = parse_retry_after_secs(&header).expect("HTTP-date Retry-After parses");
+        assert!(
+            (115..=120).contains(&secs),
+            "expected ~120s until {header}, got {secs}"
+        );
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_retry_after_secs("not-a-value"), None);
     }
 }
