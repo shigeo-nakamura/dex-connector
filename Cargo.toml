@@ -17,6 +17,7 @@ default = ["lighter-sdk"]
 lighter-sdk = ["dep:libc", "dep:lighter-ratelimit"]
 extended-sdk = ["dep:rust-crypto-lib-base", "dep:starknet"]
 hyperliquid-sdk = []
+arcus-spot-sdk = []
 arcus-sdk = []
 
 [dependencies]

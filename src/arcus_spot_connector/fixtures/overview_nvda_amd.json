@@ -1,0 +1,36 @@
+[
+  {
+    "ticker": "NVDA",
+    "contractAddress": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+    "name": "NVIDIA",
+    "logoUrl": "https://branding.arcus.xyz/markets/branding/NVDA.png",
+    "category": "EQUITIES",
+    "quote": {
+      "price": 206.75,
+      "change24h": -2.009999999999991,
+      "changePercent24h": -0.9628281279938642,
+      "volume24h": 110844026
+    },
+    "financials": {
+      "marketCap": 5009871640000,
+      "currency": "usd"
+    }
+  },
+  {
+    "ticker": "AMD",
+    "contractAddress": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+    "name": "AMD",
+    "logoUrl": "https://branding.arcus.xyz/markets/branding/AMD.png",
+    "category": "EQUITIES",
+    "quote": {
+      "price": 521.6099999999999,
+      "change24h": -18.080030000000193,
+      "changePercent24h": -3.350076709773606,
+      "volume24h": 27087296
+    },
+    "financials": {
+      "marketCap": 851091670000,
+      "currency": "usd"
+    }
+  }
+]

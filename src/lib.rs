@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "arcus-sdk")]
 mod arcus_connector;
+#[cfg(feature = "arcus-spot-sdk")]
+mod arcus_spot_connector;
 mod dex_connector;
 mod dex_request;
 #[cfg(feature = "extended-sdk")]
@@ -28,6 +30,8 @@ pub mod ws_reconnect;
 
 #[cfg(feature = "arcus-sdk")]
 pub use arcus_connector::*;
+#[cfg(feature = "arcus-spot-sdk")]
+pub use arcus_spot_connector::*;
 pub use dex_connector::DexConnector;
 pub use dex_request::DexError;
 #[cfg(feature = "extended-sdk")]
