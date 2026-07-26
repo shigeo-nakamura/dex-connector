@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
 const DEFAULT_ROUTER_BASE_URL: &str = "https://router.spot.arcus.xyz";
 const DEFAULT_META_BASE_URL: &str = "https://api.arcus.xyz";
@@ -324,6 +324,12 @@ struct ArcusSpotClientInner {
     http: Client,
     next_request_at: Mutex<Instant>,
     token_cache: RwLock<TokenCache>,
+    /// Coalesces the first `refresh_tokens` call triggered from
+    /// `verified_token` so concurrent lookups on an uninitialized cache
+    /// share one in-flight metadata GET instead of each firing their own.
+    /// `OnceCell` (not a `Mutex`) so no guard is held across the refresh
+    /// `.await` — see bot-strategy#391 in clippy.toml.
+    token_refresh_once: OnceCell<()>,
 }
 
 /// Cloneable, process-local Arcus Spot read-only client.
@@ -352,6 +358,7 @@ impl ArcusSpotClient {
                 http,
                 next_request_at: Mutex::new(Instant::now()),
                 token_cache: RwLock::new(TokenCache::default()),
+                token_refresh_once: OnceCell::new(),
             }),
         })
     }
@@ -414,7 +421,19 @@ impl ArcusSpotClient {
             return Ok(token);
         }
         if !initialized {
-            self.refresh_tokens().await?;
+            // Coalesce the initial refresh: `OnceCell::get_or_try_init` runs
+            // the closure at most once and lets every concurrent caller
+            // await that same in-flight future, without us holding a
+            // MutexGuard/RwLockGuard across an await point ourselves
+            // (bot-strategy#391 forbids that pattern — see clippy.toml).
+            // Without this, N concurrent callers on a cold cache each fire
+            // their own metadata GET, and a redundant request can fail even
+            // after another one already succeeded. A failed attempt leaves
+            // the cell empty so the next call retries.
+            self.inner
+                .token_refresh_once
+                .get_or_try_init(|| async { self.refresh_tokens().await.map(|_| ()) })
+                .await?;
             if let Some(token) = self
                 .inner
                 .token_cache
@@ -587,14 +606,15 @@ impl ArcusSpotClient {
                     } else {
                         ArcusSpotFailureClass::Transport
                     };
-                    if attempt < self.inner.config.max_attempts {
+                    let retryable = is_retryable_transport_error(&source);
+                    if retryable && attempt < self.inner.config.max_attempts {
                         self.sleep_before_retry(attempt, None).await;
                         continue;
                     }
                     return Err(ArcusSpotError::Transport {
                         endpoint: endpoint.to_string(),
                         classification,
-                        retryable: true,
+                        retryable,
                         attempts: attempt,
                         source,
                     });
@@ -772,6 +792,16 @@ fn is_retryable_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
+/// Distinguish a transient transport failure (worth retrying) from a
+/// permanent one. A redirect-policy failure (e.g. a looping custom or
+/// proxied endpoint) or a malformed request will fail identically on every
+/// attempt, so retrying just burns the configured attempt budget and, on
+/// the final attempt, would otherwise mislabel the terminal error as
+/// `retryable: true` for callers that honor `ArcusSpotError::retryable()`.
+fn is_retryable_transport_error(source: &reqwest::Error) -> bool {
+    source.is_timeout() || source.is_connect()
+}
+
 fn retry_after_duration(value: Option<&HeaderValue>, now: SystemTime) -> Option<Duration> {
     let raw = value?.to_str().ok()?.trim();
     if let Ok(seconds) = raw.parse::<u64>() {
@@ -936,6 +966,104 @@ mod tests {
         assert_eq!(observation.payload.len(), 2);
         assert_eq!(client.verified_token("nvda").await.unwrap().symbol, "NVDA");
         server.await.unwrap();
+    }
+
+    // Codex review on PR #43: concurrent lookups on a cold cache each used to
+    // fire their own `refresh_tokens` call. The mock server below serves
+    // exactly one `/v1/tokens` response; if more than one request reached it
+    // concurrently, only the first caller would get a response and the
+    // others would time out waiting on a connection nobody answers.
+    #[tokio::test]
+    async fn concurrent_verified_token_lookups_share_one_refresh() {
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            TOKEN_FIXTURE.len(),
+            TOKEN_FIXTURE
+        );
+        let (base_url, server) = spawn_http_sequence(vec![success]).await;
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 1,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 0,
+            request_timeout_ms: 2_000,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+
+        let (nvda, amd, nvda_again) = tokio::join!(
+            client.verified_token("nvda"),
+            client.verified_token("amd"),
+            client.verified_token("nvda"),
+        );
+        assert_eq!(nvda.unwrap().symbol, "NVDA");
+        assert_eq!(amd.unwrap().symbol, "AMD");
+        assert_eq!(nvda_again.unwrap().symbol, "NVDA");
+        server.await.unwrap();
+    }
+
+    // Codex review on PR #43: a redirect-policy failure (e.g. a looping
+    // custom or proxied endpoint) previously retried unconditionally and
+    // reported `retryable: true` even on the terminal error, wasting the
+    // whole attempt budget on a failure that repeats identically every time.
+    // The server below always redirects back to itself, which reqwest's
+    // default policy eventually refuses to keep following (`is_redirect()`);
+    // that must fail the outer retry loop on the first attempt.
+    #[tokio::test]
+    async fn permanent_transport_error_is_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let redirect_target = base_url.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {redirect_target}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 5,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 0,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+
+        let error = client.refresh_tokens().await.unwrap_err();
+        server.abort();
+
+        assert!(
+            !error.retryable(),
+            "a redirect-policy failure must not be marked retryable: {error}"
+        );
+        match error {
+            ArcusSpotError::Transport {
+                classification,
+                attempts,
+                ..
+            } => {
+                assert_eq!(classification, ArcusSpotFailureClass::Transport);
+                assert_eq!(
+                    attempts, 1,
+                    "a permanent transport error must fail on the first attempt, not exhaust retries"
+                );
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
