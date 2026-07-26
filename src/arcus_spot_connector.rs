@@ -322,16 +322,13 @@ struct ArcusSpotClientInner {
     router_base_url: Url,
     meta_base_url: Url,
     http: Client,
-    /// FIFO pacing queue tail: each reservation (via `reserve_pacing_slot`)
-    /// claims the next slot `min_request_interval_ms` after the previous
-    /// one. `record_retry_after` also folds a 429 cooldown into this same
-    /// tail, so slots claimed afterward already start at/after the floor.
-    next_request_at: Mutex<Instant>,
+    /// Timestamp of the most recently dispatched request. `pace()` re-reads
+    /// this (and `rate_limit_until`) fresh on every iteration — including
+    /// right before actually sending — rather than sleeping against a
+    /// pre-computed target, so it can't burst even if the runtime stalls
+    /// long enough to wake several queued callers at once (Codex review).
+    last_sent_at: Mutex<Instant>,
     /// Quota-wide floor from the most recently observed 429 `Retry-After`.
-    /// Read-only signal for `pace()`: a caller already asleep on a stale
-    /// reservation compares against this (not `next_request_at`, which also
-    /// moves from ordinary concurrent reservations and would misread those
-    /// as a cooldown) to decide whether it needs to re-claim its slot.
     rate_limit_until: Mutex<Instant>,
     token_cache: RwLock<TokenCache>,
     /// Coalesces the first `refresh_tokens` call triggered from
@@ -360,14 +357,20 @@ impl ArcusSpotClient {
             .map_err(|error| {
                 ArcusSpotError::InvalidConfig(format!("could not build HTTP client: {error}"))
             })?;
+        let now = Instant::now();
+        // Backdated by the pacing interval so the very first request isn't
+        // delayed waiting out an interval against a same-instant baseline.
+        let last_sent_at = now
+            .checked_sub(Duration::from_millis(config.min_request_interval_ms))
+            .unwrap_or(now);
         Ok(Self {
             inner: Arc::new(ArcusSpotClientInner {
                 config,
                 router_base_url,
                 meta_base_url,
                 http,
-                next_request_at: Mutex::new(Instant::now()),
-                rate_limit_until: Mutex::new(Instant::now()),
+                last_sent_at: Mutex::new(last_sent_at),
+                rate_limit_until: Mutex::new(now),
                 token_cache: RwLock::new(TokenCache::default()),
                 token_refresh_once: OnceCell::new(),
             }),
@@ -575,47 +578,45 @@ impl ArcusSpotClient {
         Ok(observation.map(|_| entry))
     }
 
-    /// Claim the next FIFO pacing slot: `min_request_interval_ms` after the
-    /// previous reservation, or now if the queue is idle. `record_retry_after`
-    /// folds a 429 cooldown into this same tail, so a slot claimed after that
-    /// point already starts at/after the floor.
-    async fn reserve_pacing_slot(&self) -> Instant {
-        let interval = Duration::from_millis(self.inner.config.min_request_interval_ms);
-        let mut next_request_at = self.inner.next_request_at.lock().await;
-        let now = Instant::now();
-        let scheduled_at = std::cmp::max(*next_request_at, now);
-        *next_request_at = scheduled_at + interval;
-        scheduled_at
-    }
-
+    /// Wait until it's this caller's turn, then atomically claim the slot.
+    ///
+    /// Every iteration re-derives the earliest allowed send time from fresh
+    /// reads of `last_sent_at` and `rate_limit_until` — never from a
+    /// pre-computed target carried across a sleep. That's what makes this
+    /// immune to the whole class of races earlier versions of this fix
+    /// chased individually: a 429 cooldown recorded mid-sleep, a due-now
+    /// slot that skipped the cooldown check entirely, and (Codex review)
+    /// several queued callers all waking into a burst if the runtime stalls
+    /// long enough to blow past multiple callers' reserved times at once.
+    /// Whichever caller wins the lock first when its own `now >= earliest`
+    /// claims that slot by advancing `last_sent_at`; every other caller —
+    /// no matter how many woke up at once — recomputes `earliest` against
+    /// the now-later `last_sent_at` and waits again, so the interval is
+    /// enforced against reality at the moment of the send decision, not
+    /// against a stale plan made before sleeping.
     async fn pace(&self) {
-        let mut target = self.reserve_pacing_slot().await;
+        let interval = Duration::from_millis(self.inner.config.min_request_interval_ms);
         loop {
-            // Checked on every iteration — including the very first, before
-            // any sleep — so a due-now reservation still can't skip past a
-            // cooldown that another caller's record_retry_after recorded
-            // just before or after we reserved (Codex review: the previous
-            // version only checked this after actually sleeping, so an
-            // immediate slot returned without ever consulting the floor).
-            // `rate_limit_until` only moves when a 429 is observed, so this
-            // is false on every ordinary call — cheap, and never mistakes
-            // another caller's own FIFO reservation for a cooldown (that was
-            // the bug in an earlier version of this fix).
-            let floor = *self.inner.rate_limit_until.lock().await;
-            if floor > target {
-                // Re-claim through the normal queue rather than jumping
-                // straight to the floor: record_retry_after already folded
-                // it into the FIFO tail, so re-reserving keeps us
-                // interval-spaced relative to any other caller doing the
-                // same, instead of everyone landing on the same instant.
-                target = self.reserve_pacing_slot().await;
-                continue;
-            }
+            // Read rate_limit_until into a plain value *before* acquiring
+            // last_sent_at, so no guard is ever held across another lock's
+            // `.await` (bot-strategy#391 forbids nesting an await inside a
+            // held MutexGuard's scope — see clippy.toml).
+            let rate_limit_until = *self.inner.rate_limit_until.lock().await;
             let now = Instant::now();
-            if now >= target {
-                return;
+            let wait = {
+                let mut last_sent_at = self.inner.last_sent_at.lock().await;
+                let earliest = std::cmp::max(*last_sent_at + interval, rate_limit_until);
+                if now >= earliest {
+                    *last_sent_at = now;
+                    None
+                } else {
+                    Some(earliest - now)
+                }
+            };
+            match wait {
+                None => return,
+                Some(wait) => tokio::time::sleep(wait).await,
             }
-            tokio::time::sleep(target - now).await;
         }
     }
 
@@ -771,19 +772,9 @@ impl ArcusSpotClient {
             Duration::from_millis(self.inner.config.max_retry_delay_ms),
         );
         let resume_at = Instant::now() + bounded;
-        {
-            let mut rate_limit_until = self.inner.rate_limit_until.lock().await;
-            if resume_at > *rate_limit_until {
-                *rate_limit_until = resume_at;
-            }
-        }
-        // Fold the floor into the FIFO tail too, so any slot claimed (or
-        // re-claimed by a caller already queued — see pace()) after this
-        // point is queued starting at/after the cooldown instead of at
-        // whatever position the queue had already reached.
-        let mut next_request_at = self.inner.next_request_at.lock().await;
-        if resume_at > *next_request_at {
-            *next_request_at = resume_at;
+        let mut rate_limit_until = self.inner.rate_limit_until.lock().await;
+        if resume_at > *rate_limit_until {
+            *rate_limit_until = resume_at;
         }
     }
 
@@ -1376,15 +1367,13 @@ mod tests {
         );
     }
 
-    // Codex review on PR #43: pace() only consulted rate_limit_until after
-    // actually sleeping, so a caller whose FIFO reservation happened to
-    // already be due-now returned immediately without ever checking the
-    // floor — reproducible whenever record_retry_after's two separate lock
-    // acquisitions (rate_limit_until, then next_request_at) interleave with
-    // another caller's reservation between them. Rather than relying on
-    // exact async scheduling to hit that narrow window, this test sets up
-    // the resulting state directly (a future rate_limit_until with
-    // next_request_at still due-now) and asserts pace() still waits.
+    // Codex review on PR #43: an earlier version of pace() only consulted
+    // rate_limit_until after actually sleeping, so a caller whose slot
+    // happened to already be due-now returned immediately without ever
+    // checking the floor. pace() now reads rate_limit_until fresh on every
+    // iteration, including the very first, so this can't happen by
+    // construction — verified directly here by forcing the floor into the
+    // future and asserting pace() still waits it out.
     #[tokio::test]
     async fn pace_checks_the_cooldown_even_on_an_immediate_slot() {
         let client = ArcusSpotClient::new(ArcusSpotConfig {
@@ -1463,11 +1452,11 @@ mod tests {
 
     // Codex review on PR #43: a quota-wide 429 Retry-After previously only
     // delayed the caller that received it (via sleep_before_retry); other
-    // callers sharing the same client kept using the unmodified
-    // next_request_at pacing gate and could send during the advertised
-    // cooldown. max_attempts=1 means the first call surfaces the 429
-    // immediately without retrying itself, isolating the shared pacing
-    // state as the only thing that can delay the second, independent call.
+    // callers sharing the same client kept using the unmodified pacing gate
+    // and could send during the advertised cooldown. max_attempts=1 means
+    // the first call surfaces the 429 immediately without retrying itself,
+    // isolating the shared pacing state as the only thing that can delay
+    // the second, independent call.
     #[tokio::test]
     async fn rate_limit_cooldown_applies_to_next_caller_even_without_its_own_retry() {
         let success = format!(
