@@ -1,10 +1,14 @@
 //! Strictly read-only Arcus Spot router client.
 //!
 //! This module intentionally exposes only public metadata, indicative-price,
-//! and reference-price GETs. It has no wallet, approval, signing, firm-quote,
-//! submission, or status-mutation surface. Arcus Spot is inventory-funded and
-//! does not fit the leveraged-perpetual [crate::DexConnector] contract, so
-//! the P0 client remains a separate API.
+//! reference-price, and finalized-indexer GETs. It has no wallet, approval,
+//! signing, firm-quote, submission, or status-mutation surface. Arcus Spot is
+//! inventory-funded and does not fit the leveraged-perpetual
+//! [crate::DexConnector] contract, so the P0 client remains a separate API.
+
+mod indexer;
+
+pub use indexer::*;
 
 use chrono::{DateTime, Utc};
 use ethers::types::{Address, U256};
@@ -27,6 +31,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 const DEFAULT_ROUTER_BASE_URL: &str = "https://router.spot.arcus.xyz";
 const DEFAULT_META_BASE_URL: &str = "https://api.arcus.xyz";
+const DEFAULT_INDEXER_BASE_URL: &str = "https://indexer.spot.arcus.xyz";
 const DEFAULT_CHAIN_ID: u64 = 4663;
 
 /// Configuration for public Arcus Spot GET requests.
@@ -38,6 +43,7 @@ const DEFAULT_CHAIN_ID: u64 = 4663;
 pub struct ArcusSpotConfig {
     pub router_base_url: String,
     pub meta_base_url: String,
+    pub indexer_base_url: String,
     pub chain_id: u64,
     pub request_timeout_ms: u64,
     pub min_request_interval_ms: u64,
@@ -52,6 +58,7 @@ impl Default for ArcusSpotConfig {
         Self {
             router_base_url: DEFAULT_ROUTER_BASE_URL.to_string(),
             meta_base_url: DEFAULT_META_BASE_URL.to_string(),
+            indexer_base_url: DEFAULT_INDEXER_BASE_URL.to_string(),
             chain_id: DEFAULT_CHAIN_ID,
             request_timeout_ms: 30_000,
             min_request_interval_ms: 250,
@@ -328,6 +335,7 @@ struct ArcusSpotClientInner {
     config: ArcusSpotConfig,
     router_base_url: Url,
     meta_base_url: Url,
+    indexer_base_url: Url,
     http: Client,
     /// Both pacing timestamps behind a single lock, checked and updated as
     /// one atomic step. `pace()` re-reads them fresh on every iteration —
@@ -360,6 +368,7 @@ impl ArcusSpotClient {
         validate_config(&config)?;
         let router_base_url = parse_base_url("router_base_url", &config.router_base_url)?;
         let meta_base_url = parse_base_url("meta_base_url", &config.meta_base_url)?;
+        let indexer_base_url = parse_base_url("indexer_base_url", &config.indexer_base_url)?;
         let http = Client::builder()
             .timeout(Duration::from_millis(config.request_timeout_ms))
             .user_agent(config.user_agent.clone())
@@ -378,6 +387,7 @@ impl ArcusSpotClient {
                 config,
                 router_base_url,
                 meta_base_url,
+                indexer_base_url,
                 http,
                 pace_state: Mutex::new(PaceState {
                     last_sent_at,

@@ -1,0 +1,12 @@
+{
+  "chains": [
+    {
+      "chainId": 4663,
+      "name": "robinhood-mainnet",
+      "lastIndexedBlock": "19978873",
+      "finalizedHead": "19978873",
+      "lag": "0",
+      "trades": 207373
+    }
+  ]
+}
