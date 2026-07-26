@@ -153,7 +153,11 @@ impl ArcusConnector {
         Ok(LastTradesResponse { trades })
     }
 
-    async fn request_json<T>(&self, request: RequestBuilder, operation: &str) -> Result<T, DexError>
+    pub(super) async fn request_json<T>(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+    ) -> Result<T, DexError>
     where
         T: DeserializeOwned,
     {
@@ -174,7 +178,22 @@ impl ArcusConnector {
                     .map(|value| format!(" retry_after={value}"))
                     .unwrap_or_default()
             );
-            return if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            return if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after_secs = retry_after
+                    .as_deref()
+                    .and_then(parse_retry_after_secs)
+                    .unwrap_or(1)
+                    .max(1);
+                // DexError::RateLimited only carries `until_unix` (it's a
+                // shared, venue-agnostic variant), so the operation, body,
+                // and Retry-After detail above would otherwise be dropped
+                // entirely rather than just left out of the typed error
+                // (bot-strategy#749 review).
+                log::warn!("Arcus rate-limited: {detail}");
+                Err(DexError::RateLimited {
+                    until_unix: chrono::Utc::now().timestamp() + retry_after_secs,
+                })
+            } else if status.is_server_error() {
                 Err(DexError::Transient(detail))
             } else {
                 Err(DexError::Permanent(detail))
@@ -186,5 +205,45 @@ impl ArcusConnector {
                 "Arcus {operation} response decode failed: {err}; body={body}"
             ))
         })
+    }
+}
+
+/// Parses a `Retry-After` header value per RFC 9110 §10.2.3, which allows
+/// either a non-negative integer delay-seconds or an HTTP-date. Only
+/// handling delay-seconds meant a standards-valid HTTP-date response fell
+/// through to the 1s default, letting callers retry well before the
+/// server's requested time and prolong throttling (bot-strategy#749
+/// review).
+fn parse_retry_after_secs(value: &str) -> Option<i64> {
+    if let Ok(delay_secs) = value.trim().parse::<i64>() {
+        return Some(delay_secs);
+    }
+    let target = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
+    Some(target.timestamp() - chrono::Utc::now().timestamp())
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::parse_retry_after_secs;
+
+    #[test]
+    fn parses_delay_seconds() {
+        assert_eq!(parse_retry_after_secs("30"), Some(30));
+    }
+
+    #[test]
+    fn parses_http_date_relative_to_now() {
+        let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let header = future.to_rfc2822();
+        let secs = parse_retry_after_secs(&header).expect("HTTP-date Retry-After parses");
+        assert!(
+            (115..=120).contains(&secs),
+            "expected ~120s until {header}, got {secs}"
+        );
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_retry_after_secs("not-a-value"), None);
     }
 }

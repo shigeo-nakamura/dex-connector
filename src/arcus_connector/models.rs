@@ -1,6 +1,7 @@
 use crate::{DexError, OrderSide};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +179,54 @@ pub(super) struct TradeWire {
     pub(super) side: String,
     #[allow(dead_code)]
     pub(super) timestamp: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AccountWire {
+    pub(super) equity: String,
+    pub(super) free_collateral: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PositionsResponseWire {
+    #[serde(default)]
+    pub(super) positions: HashMap<String, PositionWire>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PositionWire {
+    pub(super) market_display_name: String,
+    pub(super) side: String,
+    pub(super) size: String,
+    pub(super) average_entry_price: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct OpenOrdersResponseWire {
+    #[serde(default)]
+    pub(super) orders: Vec<OpenOrderWire>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct OpenOrderWire {
+    pub(super) order_id: String,
+    pub(super) market_display_name: String,
+    pub(super) side: String,
+    pub(super) status: String,
+    pub(super) price: String,
+    pub(super) remaining_size: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SetLeverageResponseWire {
+    pub(super) status: String,
+    #[serde(default)]
+    pub(super) reject_reason: Option<String>,
 }
 
 impl TradeWire {
