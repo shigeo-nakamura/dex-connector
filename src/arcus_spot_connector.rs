@@ -566,15 +566,31 @@ impl ArcusSpotClient {
 
     async fn pace(&self) {
         let interval = Duration::from_millis(self.inner.config.min_request_interval_ms);
-        let wait = {
+        let mut target = {
             let mut next_request_at = self.inner.next_request_at.lock().await;
             let now = Instant::now();
             let scheduled_at = std::cmp::max(*next_request_at, now);
             *next_request_at = scheduled_at + interval;
-            scheduled_at.saturating_duration_since(now)
+            scheduled_at
         };
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+        loop {
+            let now = Instant::now();
+            if now >= target {
+                return;
+            }
+            tokio::time::sleep(target - now).await;
+            // A concurrent record_retry_after may have pushed the shared
+            // gate out past our reservation while we were asleep — a 429
+            // observed by another caller that entered pace() after us but
+            // whose response landed before we woke. Recheck against the
+            // current gate and keep waiting for the new floor instead of
+            // sending on a now-stale reservation (Codex review).
+            let gate = *self.inner.next_request_at.lock().await;
+            if gate > target {
+                target = gate;
+                continue;
+            }
+            return;
         }
     }
 
@@ -963,6 +979,32 @@ mod tests {
         (format!("http://{address}"), task)
     }
 
+    /// Same as `spawn_http_sequence`, but also records each accepted
+    /// connection's arrival `Instant` so a test can assert on the real
+    /// spacing between requests that actually reached the server.
+    async fn spawn_logged_http_sequence(
+        responses: Vec<String>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Instant>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_task = log.clone();
+        let task = tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                log_for_task.lock().unwrap().push(Instant::now());
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), log, task)
+    }
+
     #[tokio::test]
     async fn public_get_retries_429_and_records_attempt_count() {
         let success = format!(
@@ -1026,6 +1068,64 @@ mod tests {
         assert_eq!(amd.unwrap().symbol, "AMD");
         assert_eq!(nvda_again.unwrap().symbol, "NVDA");
         server.await.unwrap();
+    }
+
+    // Codex review on PR #43: a caller already queued in pace() (reserved a
+    // future send slot and is asleep waiting for it) must recheck the
+    // shared gate after waking, not send on its original reservation. Two
+    // clones race here with min_request_interval_ms=300: tokio::join! polls
+    // client_a first, whose pace() resolves immediately (nothing queued
+    // yet) so it sends before client_b's pace() call, which reserves a
+    // ~300ms-out slot and sleeps. client_a's request gets a 429 with a
+    // 1s Retry-After well within that 300ms, pushing the shared gate out
+    // via record_retry_after; client_b must wake, see the extended gate,
+    // and keep waiting instead of sending at its stale ~300ms mark.
+    #[tokio::test]
+    async fn queued_caller_rechecks_cooldown_after_waking() {
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            TOKEN_FIXTURE.len(),
+            TOKEN_FIXTURE
+        );
+        let (base_url, log, server) = spawn_logged_http_sequence(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            success,
+        ])
+        .await;
+
+        let client_a = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 300,
+            max_attempts: 1,
+            retry_base_delay_ms: 0,
+            max_retry_delay_ms: 5_000,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let client_b = client_a.clone();
+
+        let (first, second) = tokio::join!(client_a.refresh_tokens(), client_b.refresh_tokens());
+        assert!(
+            first.is_err(),
+            "tokio::join!'s poll order sends client_a's request first, which must hit the 429"
+        );
+        assert_eq!(second.unwrap().payload.len(), 2);
+
+        server.await.unwrap();
+        let timestamps = log.lock().unwrap().clone();
+        assert_eq!(
+            timestamps.len(),
+            2,
+            "expected exactly two requests at the server"
+        );
+        let gap = timestamps[1].duration_since(timestamps[0]);
+        assert!(
+            gap >= Duration::from_millis(900),
+            "the queued second caller must wait out the 429 cooldown observed by the first \
+             instead of sending at its original ~300ms reservation, waited only {:?}",
+            gap
+        );
     }
 
     // Codex review on PR #43: a quota-wide 429 Retry-After previously only
