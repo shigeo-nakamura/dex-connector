@@ -3,7 +3,7 @@ use super::{
     ArcusSpotToken,
 };
 use chrono::{DateTime, Utc};
-use ethers::types::{Address, H256};
+use ethers::types::{Address, H256, U256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -158,6 +158,23 @@ impl Default for ArcusSpotTradeQuery {
     }
 }
 
+/// Filters an indexer trade page is expected to satisfy. Bundled into a
+/// struct (rather than passed positionally) so `ArcusSpotTradePage::validate`
+/// stays under clippy's argument-count lint as filters are added.
+#[derive(Debug, Clone, Copy, Default)]
+struct TradeExpectations<'a> {
+    token_in: Option<&'a str>,
+    token_out: Option<&'a str>,
+    taker: Option<&'a str>,
+    tx_hash: Option<&'a str>,
+    router: Option<&'a str>,
+    route_tag: Option<&'a str>,
+    success: Option<bool>,
+    priced: Option<bool>,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+}
+
 impl ArcusSpotClient {
     /// Fetch public finalized-indexer lag and chain status.
     pub async fn indexer_stats(
@@ -183,10 +200,18 @@ impl ArcusSpotClient {
             .await?;
         observation.payload.validate(
             self.inner.config.chain_id,
-            query.token_in.as_deref(),
-            query.token_out.as_deref(),
-            query.taker.as_deref(),
-            None,
+            &TradeExpectations {
+                token_in: query.token_in.as_deref(),
+                token_out: query.token_out.as_deref(),
+                taker: query.taker.as_deref(),
+                router: query.router.as_deref(),
+                route_tag: query.route_tag.as_deref(),
+                success: query.success,
+                priced: query.priced,
+                from_block: query.from_block,
+                to_block: query.to_block,
+                ..TradeExpectations::default()
+            },
         )?;
         Ok(observation)
     }
@@ -238,9 +263,13 @@ impl ArcusSpotClient {
         let observation: ArcusSpotObservation<ArcusSpotTradePage> = self
             .get_json(&self.inner.indexer_base_url, &path, &query)
             .await?;
-        observation
-            .payload
-            .validate(self.inner.config.chain_id, None, None, Some(taker), None)?;
+        observation.payload.validate(
+            self.inner.config.chain_id,
+            &TradeExpectations {
+                taker: Some(taker),
+                ..TradeExpectations::default()
+            },
+        )?;
         Ok(observation)
     }
 
@@ -256,10 +285,10 @@ impl ArcusSpotClient {
             .await?;
         observation.payload.validate(
             self.inner.config.chain_id,
-            None,
-            None,
-            None,
-            Some(tx_hash),
+            &TradeExpectations {
+                tx_hash: Some(tx_hash),
+                ..TradeExpectations::default()
+            },
         )?;
         if observation.payload.next_cursor.is_some() {
             return Err(ArcusSpotError::InvalidResponse(
@@ -371,10 +400,7 @@ impl ArcusSpotTradePage {
     fn validate(
         &self,
         expected_chain_id: u64,
-        expected_token_in: Option<&str>,
-        expected_token_out: Option<&str>,
-        expected_taker: Option<&str>,
-        expected_tx_hash: Option<&str>,
+        expected: &TradeExpectations<'_>,
     ) -> Result<(), ArcusSpotError> {
         validate_cursor(self.next_cursor.as_deref())?;
 
@@ -390,10 +416,63 @@ impl ArcusSpotTradePage {
 
         for trade in &self.trades {
             trade.validate(expected_chain_id)?;
-            validate_filter("tokenIn", &trade.token_in, expected_token_in)?;
-            validate_filter("tokenOut", &trade.token_out, expected_token_out)?;
-            validate_filter("taker", &trade.taker, expected_taker)?;
-            validate_filter("txHash", &trade.tx_hash, expected_tx_hash)?;
+            validate_filter("tokenIn", &trade.token_in, expected.token_in)?;
+            validate_filter("tokenOut", &trade.token_out, expected.token_out)?;
+            validate_filter("taker", &trade.taker, expected.taker)?;
+            validate_filter("txHash", &trade.tx_hash, expected.tx_hash)?;
+            validate_filter("router", &trade.router, expected.router)?;
+            validate_filter(
+                "routeTag",
+                trade.route_tag.as_deref().unwrap_or_default(),
+                expected.route_tag,
+            )?;
+            if expected
+                .success
+                .is_some_and(|success| trade.success != success)
+            {
+                return Err(ArcusSpotError::InvalidResponse(format!(
+                    "indexer trade {} has success={} for filter success={}",
+                    trade.id,
+                    trade.success,
+                    expected.success.unwrap()
+                )));
+            }
+            if expected
+                .priced
+                .is_some_and(|priced| trade.pnl.priced != priced)
+            {
+                return Err(ArcusSpotError::InvalidResponse(format!(
+                    "indexer trade {} has priced={} for filter priced={}",
+                    trade.id,
+                    trade.pnl.priced,
+                    expected.priced.unwrap()
+                )));
+            }
+            if expected.from_block.is_some() || expected.to_block.is_some() {
+                let block_number = parse_raw_amount("blockNumber", &trade.block_number)?;
+                if expected
+                    .from_block
+                    .is_some_and(|from_block| block_number < U256::from(from_block))
+                {
+                    return Err(ArcusSpotError::InvalidResponse(format!(
+                        "indexer trade {} has blockNumber {} below fromBlock {}",
+                        trade.id,
+                        trade.block_number,
+                        expected.from_block.unwrap()
+                    )));
+                }
+                if expected
+                    .to_block
+                    .is_some_and(|to_block| block_number > U256::from(to_block))
+                {
+                    return Err(ArcusSpotError::InvalidResponse(format!(
+                        "indexer trade {} has blockNumber {} above toBlock {}",
+                        trade.id,
+                        trade.block_number,
+                        expected.to_block.unwrap()
+                    )));
+                }
+            }
             self.require_trade_token(&trade.token_in)?;
             self.require_trade_token(&trade.token_out)?;
         }
@@ -726,10 +805,41 @@ mod tests {
         stats.validate_for_chain(4663).unwrap();
 
         let page: ArcusSpotTradePage = serde_json::from_str(TRADES_FIXTURE).unwrap();
-        page.validate(4663, None, None, None, None).unwrap();
+        page.validate(4663, &TradeExpectations::default()).unwrap();
         assert_eq!(page.trades[0].route_tag.as_deref(), Some("RIALTO"));
         assert!(!page.trades[0].pnl.priced);
         assert_eq!(page.trades[0].amount_in, "62757776408482226");
+    }
+
+    #[test]
+    fn rejects_trade_page_that_ignores_router_filter() {
+        let page: ArcusSpotTradePage = serde_json::from_str(TRADES_FIXTURE).unwrap();
+        let error = page
+            .validate(
+                4663,
+                &TradeExpectations {
+                    router: Some("0x0000000000000000000000000000000000000001"),
+                    ..TradeExpectations::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, ArcusSpotError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn rejects_trade_page_that_ignores_block_range_filter() {
+        let page: ArcusSpotTradePage = serde_json::from_str(TRADES_FIXTURE).unwrap();
+        let trade_block: u64 = page.trades[0].block_number.parse().unwrap();
+        let error = page
+            .validate(
+                4663,
+                &TradeExpectations {
+                    to_block: Some(trade_block - 1),
+                    ..TradeExpectations::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, ArcusSpotError::InvalidResponse(_)));
     }
 
     #[test]
