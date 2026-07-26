@@ -4,9 +4,19 @@ use crate::ws_reconnect::WsReconnectPolicy;
 use crate::{DexError, PriceUpdate};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
+
+/// Maximum interval between any inbound WS frame before the stream is
+/// treated as silently stalled and force-reconnected via the spawn-loop.
+/// Without this, a server or network that goes half-open without a
+/// close/error frame leaves `ws.next().await` pending forever, so
+/// `subscribe_price_updates` silently stops producing prices even though
+/// `websocket_loop`'s reconnect policy never gets a chance to run
+/// (bot-strategy#749 review). Mirrors the Extended connector's stall
+/// watchdog (`extended_connector::ws::WS_STALL_TIMEOUT`).
+const WS_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) async fn websocket_loop(
     websocket_url: String,
@@ -69,7 +79,17 @@ pub(super) async fn run_ws_once(
             })?;
     }
 
-    while let Some(message) = ws.next().await {
+    loop {
+        let message = match tokio::time::timeout(WS_STALL_TIMEOUT, ws.next()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(DexError::WebSocketError(format!(
+                    "Arcus WebSocket stalled: no frame within {}s",
+                    WS_STALL_TIMEOUT.as_secs()
+                )));
+            }
+        };
         match message.map_err(|err| DexError::WebSocketError(err.to_string()))? {
             Message::Text(text) => {
                 handle_text(&text, tracked_markets, books, price_update_tx).await?;
@@ -289,5 +309,21 @@ mod tests {
         assert_eq!(last.symbol, "BTC");
         assert_eq!(last.best_bid.to_string(), "101");
         assert_eq!(last.best_ask.to_string(), "102");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_timeout_fires_on_silent_stream() {
+        // Reproduces the half-open-connection pattern flagged in the
+        // bot-strategy#749 review: a stream that never yields anything
+        // (server stops sending without a close/error frame). Without a
+        // stall watchdog, `ws.next().await` would hang forever and
+        // `websocket_loop`'s reconnect path would never run.
+        let mut silent = futures::stream::pending::<Result<Message, ()>>();
+        let result = tokio::time::timeout(WS_STALL_TIMEOUT, silent.next()).await;
+        assert!(
+            result.is_err(),
+            "expected stall timeout to fire on a silent stream, got {:?}",
+            result.is_ok()
+        );
     }
 }

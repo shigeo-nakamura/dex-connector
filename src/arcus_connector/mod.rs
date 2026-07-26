@@ -216,14 +216,19 @@ impl DexConnector for ArcusConnector {
         test_price: Option<Decimal>,
     ) -> Result<TickerResponse, DexError> {
         let market = normalize_market(symbol);
-        let top = self.cached_top(&market).await;
-        let info = if top.is_some() {
+        let had_top = self.cached_top(&market).await.is_some();
+        let info = if had_top {
             self.market_info_for(&market).await?
         } else {
             // With no healthy streaming book, refresh the single-market REST
             // row so mark/oracle/funding values are not the startup snapshot.
             self.fetch_market_info(&market).await?
         };
+        // Re-read the cached top after the metadata await (which can take up
+        // to the REST client's 15s timeout) instead of reusing the value
+        // captured above, so a book that went stale mid-refresh is correctly
+        // dropped by the `ob_stale_ms` guard (bot-strategy#749 review).
+        let top = self.cached_top(&market).await;
         if info.status != "ONLINE" {
             return Err(DexError::Permanent(format!(
                 "Arcus market is not ONLINE: {} status={}",
@@ -250,7 +255,14 @@ impl DexConnector for ArcusConnector {
             open_interest: info.open_interest,
             funding_rate: info.funding_rate,
             oracle_price: info.oracle_price,
-            exchange_ts: top.map(|book| book.timestamp_ms),
+            // A caller-supplied test price is synthetic, not an
+            // exchange-reported observation; don't attribute it to the
+            // unrelated book update's timestamp (bot-strategy#749 review).
+            exchange_ts: if test_price.is_some() {
+                None
+            } else {
+                top.map(|book| book.timestamp_ms)
+            },
         })
     }
 
@@ -400,12 +412,27 @@ impl DexConnector for ArcusConnector {
         if self.tracked_markets.is_empty() {
             return false;
         }
-        let markets = self.market_info.read().await;
-        self.tracked_markets.iter().any(|tracked| {
-            markets
-                .get(&tracked.market)
-                .is_some_and(|market| market.status != "ONLINE")
-        })
+        // Maintenance checks are commonly called right before other venue
+        // operations, so they can't rely on a `get_ticker` call having
+        // refreshed the cache first. Route through the same TTL-refreshing
+        // path as get_ticker, falling back to the last-known status only if
+        // the refresh itself fails (bot-strategy#749 review).
+        for tracked in &self.tracked_markets {
+            match self.market_info_for(&tracked.market).await {
+                Ok(info) => {
+                    if info.status != "ONLINE" {
+                        return true;
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[arcus] maintenance check failed to refresh {}: {err}",
+                        tracked.market
+                    );
+                }
+            }
+        }
+        false
     }
 
     async fn sign_evm_65b(&self, _message: &str) -> Result<String, DexError> {
@@ -658,16 +685,26 @@ mod tests {
                 "SOL-USD".to_string(),
                 market_info_fixture("SOL-USD", "MAINTENANCE"),
             );
+            // Mark both entries fresh so `is_upcoming_maintenance` (which now
+            // routes through the TTL-refreshing `market_info_for`) reads the
+            // cache directly instead of attempting a real REST refresh.
+            let now = now_ms();
+            let mut fetched = connector.market_info_fetched_ms.write().await;
+            fetched.insert("BTC-USD".to_string(), now);
+            fetched.insert("SOL-USD".to_string(), now);
         }
         assert!(!connector.is_upcoming_maintenance(24).await);
 
-        connector
-            .market_info
-            .write()
-            .await
-            .get_mut("BTC-USD")
-            .expect("BTC-USD entry")
-            .status = "MAINTENANCE".to_string();
+        {
+            let mut markets = connector.market_info.write().await;
+            markets.get_mut("BTC-USD").expect("BTC-USD entry").status = "MAINTENANCE".to_string();
+            let now = now_ms();
+            connector
+                .market_info_fetched_ms
+                .write()
+                .await
+                .insert("BTC-USD".to_string(), now);
+        }
         assert!(connector.is_upcoming_maintenance(24).await);
     }
 
