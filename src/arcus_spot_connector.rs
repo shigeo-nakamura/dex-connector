@@ -317,19 +317,29 @@ struct TokenCache {
     by_symbol: HashMap<String, ArcusSpotToken>,
 }
 
+/// `pace()`'s two timestamps, guarded by one lock so they're always read
+/// and updated as a single atomic step — see `ArcusSpotClientInner::pace_state`.
+struct PaceState {
+    last_sent_at: Instant,
+    rate_limit_until: Instant,
+}
+
 struct ArcusSpotClientInner {
     config: ArcusSpotConfig,
     router_base_url: Url,
     meta_base_url: Url,
     http: Client,
-    /// Timestamp of the most recently dispatched request. `pace()` re-reads
-    /// this (and `rate_limit_until`) fresh on every iteration — including
-    /// right before actually sending — rather than sleeping against a
-    /// pre-computed target, so it can't burst even if the runtime stalls
-    /// long enough to wake several queued callers at once (Codex review).
-    last_sent_at: Mutex<Instant>,
-    /// Quota-wide floor from the most recently observed 429 `Retry-After`.
-    rate_limit_until: Mutex<Instant>,
+    /// Both pacing timestamps behind a single lock, checked and updated as
+    /// one atomic step. `pace()` re-reads them fresh on every iteration —
+    /// including right before actually sending — rather than sleeping
+    /// against a pre-computed target, so it can't burst even if the runtime
+    /// stalls long enough to wake several queued callers at once. A single
+    /// `Mutex` (not two) closes a check-then-claim race: reading
+    /// `rate_limit_until` and claiming `last_sent_at` under separate locks
+    /// left a window where another caller's `record_retry_after` could land
+    /// in between, so a caller could dispatch on a floor value that was
+    /// already stale by the time it claimed its slot (Codex review).
+    pace_state: Mutex<PaceState>,
     token_cache: RwLock<TokenCache>,
     /// Coalesces the first `refresh_tokens` call triggered from
     /// `verified_token` so concurrent lookups on an uninitialized cache
@@ -369,8 +379,10 @@ impl ArcusSpotClient {
                 router_base_url,
                 meta_base_url,
                 http,
-                last_sent_at: Mutex::new(last_sent_at),
-                rate_limit_until: Mutex::new(now),
+                pace_state: Mutex::new(PaceState {
+                    last_sent_at,
+                    rate_limit_until: now,
+                }),
                 token_cache: RwLock::new(TokenCache::default()),
                 token_refresh_once: OnceCell::new(),
             }),
@@ -597,17 +609,12 @@ impl ArcusSpotClient {
     async fn pace(&self) {
         let interval = Duration::from_millis(self.inner.config.min_request_interval_ms);
         loop {
-            // Read rate_limit_until into a plain value *before* acquiring
-            // last_sent_at, so no guard is ever held across another lock's
-            // `.await` (bot-strategy#391 forbids nesting an await inside a
-            // held MutexGuard's scope — see clippy.toml).
-            let rate_limit_until = *self.inner.rate_limit_until.lock().await;
             let now = Instant::now();
             let wait = {
-                let mut last_sent_at = self.inner.last_sent_at.lock().await;
-                let earliest = std::cmp::max(*last_sent_at + interval, rate_limit_until);
+                let mut state = self.inner.pace_state.lock().await;
+                let earliest = std::cmp::max(state.last_sent_at + interval, state.rate_limit_until);
                 if now >= earliest {
-                    *last_sent_at = now;
+                    state.last_sent_at = now;
                     None
                 } else {
                     Some(earliest - now)
@@ -772,9 +779,9 @@ impl ArcusSpotClient {
             Duration::from_millis(self.inner.config.max_retry_delay_ms),
         );
         let resume_at = Instant::now() + bounded;
-        let mut rate_limit_until = self.inner.rate_limit_until.lock().await;
-        if resume_at > *rate_limit_until {
-            *rate_limit_until = resume_at;
+        let mut state = self.inner.pace_state.lock().await;
+        if resume_at > state.rate_limit_until {
+            state.rate_limit_until = resume_at;
         }
     }
 
@@ -1382,7 +1389,7 @@ mod tests {
         })
         .unwrap();
         let cooldown = Duration::from_millis(500);
-        *client.inner.rate_limit_until.lock().await = Instant::now() + cooldown;
+        client.inner.pace_state.lock().await.rate_limit_until = Instant::now() + cooldown;
 
         let started = Instant::now();
         client.pace().await;
