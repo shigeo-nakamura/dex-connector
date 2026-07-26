@@ -106,6 +106,19 @@ pub struct ArcusConnector {
     auth: Option<auth::ArcusAuth>,
 }
 
+impl Drop for ArcusConnector {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches rather than cancels the task, so
+        // without this the reconnect loop spawned by `start()` keeps running
+        // (holding book-cache/broadcast-sender clones) past the connector's
+        // own lifetime if `stop()` was never called, e.g. during config
+        // reload or connector replacement (bot-strategy#749 review).
+        if let Some(task) = self.ws_task.get_mut().take() {
+            task.abort();
+        }
+    }
+}
+
 pub fn create_arcus_connector(
     config: ArcusConnectorConfig,
 ) -> Result<Box<dyn DexConnector>, DexError> {
