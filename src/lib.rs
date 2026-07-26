@@ -3,6 +3,8 @@ use std::fmt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "arcus-sdk")]
+mod arcus_connector;
 #[cfg(feature = "arcus-spot-sdk")]
 mod arcus_spot_connector;
 mod dex_connector;
@@ -26,6 +28,8 @@ pub mod lighter_ratelimit {
 pub mod lighter_waf_cooldown;
 pub mod ws_reconnect;
 
+#[cfg(feature = "arcus-sdk")]
+pub use arcus_connector::*;
 #[cfg(feature = "arcus-spot-sdk")]
 pub use arcus_spot_connector::*;
 pub use dex_connector::DexConnector;

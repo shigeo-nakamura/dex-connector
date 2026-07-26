@@ -73,12 +73,16 @@ pub enum DexError {
     #[error("API key registration is required")]
     ApiKeyRegistrationRequired,
 
-    /// Lighter WAF / per-IP rate-limit cooldown is currently active.
-    /// `until_unix` is the unix-epoch second at which the cooldown expires.
-    /// Callers must NOT retry while this error is being returned — every
-    /// additional Lighter REST call refreshes the WAF rolling window and
-    /// extends the block. See bot-strategy#35.
-    #[error("Lighter WAF cooldown active until unix={until_unix} (rate-limited)")]
+    /// Venue-side rate-limit cooldown is currently active (e.g. Lighter's
+    /// WAF / per-IP block, or an Arcus 429). `until_unix` is the unix-epoch
+    /// second at which the cooldown expires. Callers must NOT retry while
+    /// this error is being returned — every additional request while the
+    /// cooldown is active can extend the block. See bot-strategy#35.
+    ///
+    /// The trailing `(rate-limited)` marker is matched verbatim by
+    /// pairtrade's startup-retry fallback (`chain.contains("rate-limited")`
+    /// in `main.rs`) — keep it if this message changes again.
+    #[error("Cooldown active until unix={until_unix} (rate-limited)")]
     RateLimited { until_unix: i64 },
 
     /// Transient I/O / parse / dependency failure. Caller may retry with

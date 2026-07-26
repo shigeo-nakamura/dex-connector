@@ -1,6 +1,6 @@
 [package]
 name = "dex-connector"
-version = "4.7.5"
+version = "4.7.6"
 authors = ["Shigeo NAKAMURA <nakamura_shigeo@yahoo.com>"]
 edition = "2021"
 description = "connections to dexes"
@@ -18,6 +18,7 @@ lighter-sdk = ["dep:libc", "dep:lighter-ratelimit"]
 extended-sdk = ["dep:rust-crypto-lib-base", "dep:starknet"]
 hyperliquid-sdk = []
 arcus-spot-sdk = []
+arcus-sdk = []
 
 [dependencies]
 chrono = { version = "0.4.26", default-features = false, features = ["clock", "serde"] }
