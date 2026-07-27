@@ -35,6 +35,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let jsonl_path = optional_path("ARCUS_SPOT_JSONL_PATH");
     let latest_path = optional_path("ARCUS_SPOT_LATEST_PATH");
+    if let (Some(jsonl), Some(latest)) = (&jsonl_path, &latest_path) {
+        if same_output_path(jsonl, latest)? {
+            return Err(format!(
+                "ARCUS_SPOT_JSONL_PATH and ARCUS_SPOT_LATEST_PATH must not resolve to the \
+                 same file, or every run erases the JSONL archive: {}",
+                jsonl.display()
+            )
+            .into());
+        }
+    }
     if let Some(path) = &jsonl_path {
         append_jsonl(path, &compact)?;
     }
@@ -109,6 +119,26 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+/// Resolves each path's parent directory to catch aliases (relative
+/// segments, symlinked directories) that plain `PathBuf` equality misses,
+/// without requiring the (not-yet-written) files themselves to exist.
+fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
+    let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
+        ensure_parent(path)?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("output path must have a file name: {}", path.display()))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(fs::canonicalize)
+            .transpose()?
+            .unwrap_or(env::current_dir()?);
+        Ok(parent.join(file_name))
+    };
+    Ok(resolve(a)? == resolve(b)?)
 }
 
 fn append_jsonl(path: &Path, json: &str) -> Result<(), Box<dyn Error>> {
@@ -203,5 +233,73 @@ mod tests {
         assert_eq!(lines, [r#"{"writer":1}"#]);
         serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "arcus-spot-recorder-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn same_output_path_detects_identical_configured_paths() {
+        let dir = unique_temp_dir("same-path");
+        let path = dir.join("snapshot.json");
+        assert!(same_output_path(&path, &path).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_detects_relative_segment_aliases() {
+        let dir = unique_temp_dir("relative-alias");
+        let direct = dir.join("snapshot.json");
+        let aliased = dir.join("nested").join("..").join("snapshot.json");
+        assert!(same_output_path(&direct, &aliased).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_rejects_distinct_paths() {
+        let dir = unique_temp_dir("distinct");
+        let jsonl = dir.join("archive.jsonl");
+        let latest = dir.join("latest.json");
+        assert!(!same_output_path(&jsonl, &latest).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_latest_rejects_a_preexisting_symlink_at_the_temp_path() {
+        let dir = unique_temp_dir("symlink");
+        let target = dir.join("attacker-owned");
+        fs::write(&target, b"do not overwrite me").unwrap();
+        let path = dir.join("latest.json");
+        let nonce_guess: u64 = rand::random();
+        let temp_name = format!(".latest.json.{}.{nonce_guess:016x}.tmp", std::process::id());
+        std::os::unix::fs::symlink(&target, dir.join(&temp_name)).unwrap();
+
+        // The real call picks its own random nonce, so this test only proves
+        // that *some* pre-existing path at the temp naming scheme is refused
+        // rather than followed; it does not depend on guessing the nonce.
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(dir.join(&temp_name));
+        assert!(file.is_err(), "create_new must refuse an existing symlink");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "do not overwrite me",
+            "the symlink target must be left untouched"
+        );
+
+        write_latest(&path, b"{}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

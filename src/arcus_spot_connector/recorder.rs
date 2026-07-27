@@ -267,7 +267,7 @@ impl ArcusSpotRecorder {
                 observation
                     .payload
                     .iter()
-                    .map(|token| (token.symbol.to_ascii_uppercase(), token))
+                    .map(|token| (token.symbol.trim().to_ascii_uppercase(), token))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
@@ -278,7 +278,7 @@ impl ArcusSpotRecorder {
                 observation
                     .payload
                     .iter()
-                    .map(|entry| (entry.ticker.to_ascii_uppercase(), entry))
+                    .map(|entry| (entry.ticker.trim().to_ascii_uppercase(), entry))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
@@ -308,7 +308,9 @@ impl ArcusSpotRecorder {
             observation.map(|tokens| {
                 tokens
                     .into_iter()
-                    .filter(|token| selected_symbols.contains(&token.symbol.to_ascii_uppercase()))
+                    .filter(|token| {
+                        selected_symbols.contains(&token.symbol.trim().to_ascii_uppercase())
+                    })
                     .collect()
             })
         });
@@ -316,7 +318,9 @@ impl ArcusSpotRecorder {
             observation.map(|entries| {
                 entries
                     .into_iter()
-                    .filter(|entry| selected_symbols.contains(&entry.ticker.to_ascii_uppercase()))
+                    .filter(|entry| {
+                        selected_symbols.contains(&entry.ticker.trim().to_ascii_uppercase())
+                    })
                     .collect()
             })
         });
@@ -504,7 +508,7 @@ fn validated_reference<'a>(
     overview: &'a HashMap<String, &ArcusSpotOverviewEntry>,
 ) -> Result<&'a ArcusSpotOverviewEntry, ArcusSpotRecordedError> {
     let entry = overview
-        .get(&token.symbol.to_ascii_uppercase())
+        .get(&token.symbol.trim().to_ascii_uppercase())
         .copied()
         .ok_or_else(|| {
             ArcusSpotRecordedError::validation(
@@ -757,6 +761,58 @@ mod tests {
             row.errors[0].classification,
             ArcusSpotFailureClass::ResponseValidation
         );
+    }
+
+    #[tokio::test]
+    async fn padded_verified_token_symbol_still_resolves_the_pair() {
+        const PADDED_TOKEN_FIXTURE: &str =
+            include_str!("fixtures/tokens_nvda_amd_padded_symbol.json");
+        let reverse_fixture = serde_json::json!({
+            "recommended": "arcus",
+            "all": [{
+                "venue": "arcus",
+                "buyAmount": "23900000000000000",
+                "sellAmount": "9393852601996744",
+                "fees": [{"type": "protocol", "amount": "7"}],
+                "routeId": "reverse-kept"
+            }],
+            "errors": []
+        })
+        .to_string();
+        let (base_url, server) = spawn_http_sequence(vec![
+            INDEXER_FIXTURE.to_string(),
+            PADDED_TOKEN_FIXTURE.to_string(),
+            OVERVIEW_FIXTURE.to_string(),
+            PRICE_FIXTURE.to_string(),
+            reverse_fixture,
+        ])
+        .await;
+        let client = ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url.clone(),
+            indexer_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 1,
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let recorder = ArcusSpotRecorder::new(
+            client,
+            ArcusSpotRecorderConfig::from_csv("NVDA/AMD", "5").unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = recorder.collect_once().await;
+        server.await.unwrap();
+
+        let row = &snapshot.round_trips[0];
+        assert!(
+            row.errors.is_empty(),
+            "a verified token symbol with surrounding whitespace must still resolve \
+             the configured pair, got: {:?}",
+            row.errors
+        );
+        assert!(row.forward.is_some());
     }
 
     async fn spawn_http_sequence(responses: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
