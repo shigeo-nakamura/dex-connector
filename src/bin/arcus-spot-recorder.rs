@@ -131,16 +131,17 @@ fn write_latest(path: &Path, json: &[u8]) -> Result<(), Box<dyn Error>> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("latest output path must have a UTF-8 file name")?;
-    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let nonce: u64 = rand::random();
+    let temporary =
+        path.with_file_name(format!(".{file_name}.{}.{nonce:016x}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .open(&temporary)?;
     file.write_all(json)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    fs::rename(temporary, path)?;
+    fs::rename(&temporary, path)?;
     Ok(())
 }
 
