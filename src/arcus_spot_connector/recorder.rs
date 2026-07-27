@@ -544,7 +544,9 @@ fn notional_to_raw_amount(
     let raw_scale = 10_i128
         .checked_pow(decimals)
         .ok_or_else(|| format!("token decimals {decimals} exceed the recorder Decimal range"))?;
-    let scale = Decimal::from_i128_with_scale(raw_scale, 0);
+    let scale = Decimal::try_from_i128_with_scale(raw_scale, 0).map_err(|error| {
+        format!("token decimals {decimals} exceed the recorder Decimal range: {error}")
+    })?;
     let raw = notional_usd
         .checked_div(reference_price_usd)
         .and_then(|quantity| quantity.checked_mul(scale))
@@ -612,6 +614,17 @@ mod tests {
             notional_to_raw_amount(Decimal::from(5), Decimal::new(20675, 2), 18).unwrap(),
             "24183796856106408"
         );
+    }
+
+    #[test]
+    fn unsupported_token_decimals_return_errors_instead_of_panicking() {
+        for decimals in [29, 38, 39, 255] {
+            let error = notional_to_raw_amount(Decimal::ONE, Decimal::ONE, decimals).unwrap_err();
+            assert!(
+                error.contains("exceed the recorder Decimal range"),
+                "unexpected error for {decimals} decimals: {error}"
+            );
+        }
     }
 
     #[test]
