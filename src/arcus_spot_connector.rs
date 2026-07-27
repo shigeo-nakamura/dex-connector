@@ -1,16 +1,19 @@
-//! Strictly read-only Arcus Spot router client.
+//! Read-only Arcus Spot router client.
 //!
 //! This module intentionally exposes only public metadata, indicative-price,
-//! reference-price, and finalized-indexer GETs. It has no wallet, approval,
-//! signing, firm-quote, submission, or status-mutation surface. Arcus Spot is
-//! inventory-funded and does not fit the leveraged-perpetual
-//! [crate::DexConnector] contract, so the P0 client remains a separate API.
+//! pre-sign quote, reference-price, and finalized-indexer GETs. It can decode
+//! and validate EIP-712 payloads returned by `GET /v1/quote`, but has no
+//! wallet, approval, signing, submission, or status-mutation surface. Arcus
+//! Spot is inventory-funded and does not fit the leveraged-perpetual
+//! [crate::DexConnector] contract, so the client remains a separate API.
 
 mod indexer;
 mod recorder;
+mod signable_quote;
 
 pub use indexer::*;
 pub use recorder::*;
+pub use signable_quote::*;
 
 use chrono::{DateTime, Utc};
 use ethers::types::{Address, U256};
