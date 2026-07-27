@@ -121,12 +121,18 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Resolves each path's parent directory to catch aliases (relative
-/// segments, symlinked directories) that plain `PathBuf` equality misses,
-/// without requiring the (not-yet-written) files themselves to exist.
+/// Resolves each path to catch aliases (symlinks, relative segments,
+/// symlinked directories) that plain `PathBuf` equality misses. If the path
+/// itself already exists, it is canonicalized through its final component
+/// so a symlink pointing at the other output file is detected. Otherwise
+/// (the file has not been written yet) only its parent directory is
+/// resolved and the unresolved file name is reattached.
 fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
         ensure_parent(path)?;
+        if let Ok(canonical) = fs::canonicalize(path) {
+            return Ok(canonical);
+        }
         let file_name = path
             .file_name()
             .ok_or_else(|| format!("output path must have a file name: {}", path.display()))?;
@@ -271,6 +277,17 @@ mod tests {
         let jsonl = dir.join("archive.jsonl");
         let latest = dir.join("latest.json");
         assert!(!same_output_path(&jsonl, &latest).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_detects_a_symlink_pointing_at_the_other_output_file() {
+        let dir = unique_temp_dir("symlink-alias");
+        let latest = dir.join("latest.json");
+        fs::write(&latest, b"{}").unwrap();
+        let jsonl = dir.join("archive.jsonl");
+        std::os::unix::fs::symlink(&latest, &jsonl).unwrap();
+        assert!(same_output_path(&jsonl, &latest).unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 
