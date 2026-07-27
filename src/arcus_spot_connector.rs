@@ -7,8 +7,10 @@
 //! [crate::DexConnector] contract, so the P0 client remains a separate API.
 
 mod indexer;
+mod recorder;
 
 pub use indexer::*;
+pub use recorder::*;
 
 use chrono::{DateTime, Utc};
 use ethers::types::{Address, U256};
