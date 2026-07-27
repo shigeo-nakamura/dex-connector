@@ -124,19 +124,36 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
 /// Resolves each path to catch aliases (symlinks, relative segments,
 /// symlinked directories) that plain `PathBuf` equality misses. If the path
 /// itself already exists, it is canonicalized through its final component
-/// so a symlink pointing at the other output file is detected. Otherwise
-/// (the file has not been written yet) only its parent directory is
-/// resolved and the unresolved file name is reattached.
+/// so a symlink pointing at the other output file is detected. A dangling
+/// symlink (its target does not exist yet either) is followed manually,
+/// since `canonicalize` refuses to resolve those; only once the chain ends
+/// on a plain, still-missing path do we fall back to resolving just the
+/// parent directory and reattaching the unresolved file name.
 fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
         ensure_parent(path)?;
-        if let Ok(canonical) = fs::canonicalize(path) {
-            return Ok(canonical);
+        let mut current = path.to_path_buf();
+        for _ in 0..32 {
+            if let Ok(canonical) = fs::canonicalize(&current) {
+                return Ok(canonical);
+            }
+            let Ok(target) = fs::read_link(&current) else {
+                break;
+            };
+            current = if target.is_absolute() {
+                target
+            } else {
+                current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(|parent| parent.join(&target))
+                    .unwrap_or(target)
+            };
         }
-        let file_name = path
+        let file_name = current
             .file_name()
             .ok_or_else(|| format!("output path must have a file name: {}", path.display()))?;
-        let parent = path
+        let parent = current
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(fs::canonicalize)
@@ -285,6 +302,16 @@ mod tests {
         let dir = unique_temp_dir("symlink-alias");
         let latest = dir.join("latest.json");
         fs::write(&latest, b"{}").unwrap();
+        let jsonl = dir.join("archive.jsonl");
+        std::os::unix::fs::symlink(&latest, &jsonl).unwrap();
+        assert!(same_output_path(&jsonl, &latest).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_detects_a_dangling_symlink_pointing_at_the_other_output_file() {
+        let dir = unique_temp_dir("dangling-symlink-alias");
+        let latest = dir.join("latest.json");
         let jsonl = dir.join("archive.jsonl");
         std::os::unix::fs::symlink(&latest, &jsonl).unwrap();
         assert!(same_output_path(&jsonl, &latest).unwrap());
