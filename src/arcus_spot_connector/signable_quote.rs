@@ -1688,7 +1688,23 @@ mod tests {
     async fn public_arcus_pre_sign_quote_smoke() {
         let taker = std::env::var("ARCUS_SPOT_TEST_TAKER")
             .expect("set ARCUS_SPOT_TEST_TAKER to a dedicated address with no key in this process");
-        let client = ArcusSpotClient::new(super::super::ArcusSpotConfig::default()).unwrap();
+        // ArcusSpotConfig::default() leaves trusted_permit2_spenders empty,
+        // which now rejects every quote fail-closed; this smoke test needs
+        // the real deployment spender addresses to reach its assertions.
+        let trusted_permit2_spenders = std::env::var("ARCUS_SPOT_TEST_TRUSTED_PERMIT2_SPENDERS")
+            .expect(
+                "set ARCUS_SPOT_TEST_TRUSTED_PERMIT2_SPENDERS to a comma-separated list of the \
+                 real per-chain Permit2 spender addresses for the venues under test",
+            )
+            .split(',')
+            .map(|address| address.trim().to_string())
+            .filter(|address| !address.is_empty())
+            .collect();
+        let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
+            trusted_permit2_spenders,
+            ..super::super::ArcusSpotConfig::default()
+        })
+        .unwrap();
         let request = ArcusSpotSignableQuoteRequest::new(
             "NVDA",
             "AMD",
