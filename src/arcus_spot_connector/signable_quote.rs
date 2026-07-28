@@ -742,6 +742,17 @@ pub fn analyze_signable_round_trip(
             "signable round-trip token directions do not reverse".to_string(),
         ));
     }
+    // The forward intent delivers its purchased tokens to forward's taker; a
+    // reverse intent requesting a different taker assumes ownership of funds
+    // it never actually received, so the two legs cannot chain into one real
+    // round trip even though their token directions and amounts line up.
+    let forward_taker = parse_address("forward taker", &forward.request.taker)?;
+    let reverse_taker = parse_address("reverse taker", &reverse.request.taker)?;
+    if forward_taker != reverse_taker {
+        return Err(ArcusSpotError::InvalidResponse(format!(
+            "signable round-trip taker mismatch: forward {forward_taker:#x} != reverse {reverse_taker:#x}"
+        )));
+    }
     let forward_quote = forward.response.payload.recommended_quote()?;
     if forward_quote.buy_amount != reverse.request.sell_amount {
         return Err(ArcusSpotError::InvalidResponse(format!(
@@ -1681,6 +1692,24 @@ mod tests {
 
         reverse.request.sell_amount = "989".to_string();
         assert!(analyze_signable_round_trip(&forward, &reverse).is_err());
+    }
+
+    #[test]
+    fn optimistic_round_trip_requires_the_same_taker_for_both_legs() {
+        let forward = fixture_observation();
+        let mut reverse = fixture_observation();
+        std::mem::swap(&mut reverse.sell_token, &mut reverse.buy_token);
+        reverse.request.sell_symbol = "AMD".to_string();
+        reverse.request.buy_symbol = "NVDA".to_string();
+        reverse.request.sell_amount = "990".to_string();
+        reverse.request.taker = "0x7600000000000000000000000000000000000002".to_string();
+        reverse.response.payload.recommended = "arcus".to_string();
+        reverse.response.payload.quotes[0].buy_amount = "980".to_string();
+        let error = analyze_signable_round_trip(&forward, &reverse).unwrap_err();
+        assert!(
+            error.to_string().contains("taker mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
