@@ -729,6 +729,12 @@ pub fn analyze_signable_round_trip(
     forward: &ArcusSpotSignableQuoteObservation,
     reverse: &ArcusSpotSignableQuoteObservation,
 ) -> Result<ArcusSpotSignableRoundTripAnalysis, ArcusSpotError> {
+    if forward.chain_id != reverse.chain_id {
+        return Err(ArcusSpotError::InvalidResponse(format!(
+            "signable round-trip chain mismatch: forward {} != reverse {}",
+            forward.chain_id, reverse.chain_id
+        )));
+    }
     if !forward
         .buy_token
         .address
@@ -1708,6 +1714,24 @@ mod tests {
         let error = analyze_signable_round_trip(&forward, &reverse).unwrap_err();
         assert!(
             error.to_string().contains("taker mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn optimistic_round_trip_requires_the_same_chain_for_both_legs() {
+        let forward = fixture_observation();
+        let mut reverse = fixture_observation();
+        std::mem::swap(&mut reverse.sell_token, &mut reverse.buy_token);
+        reverse.request.sell_symbol = "AMD".to_string();
+        reverse.request.buy_symbol = "NVDA".to_string();
+        reverse.request.sell_amount = "990".to_string();
+        reverse.chain_id = forward.chain_id + 1;
+        reverse.response.payload.recommended = "arcus".to_string();
+        reverse.response.payload.quotes[0].buy_amount = "980".to_string();
+        let error = analyze_signable_round_trip(&forward, &reverse).unwrap_err();
+        assert!(
+            error.to_string().contains("chain mismatch"),
             "unexpected error: {error}"
         );
     }
