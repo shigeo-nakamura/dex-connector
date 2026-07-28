@@ -15,6 +15,7 @@ use std::{
     error::Error,
     fs::{self, OpenOptions},
     io::Write,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -140,19 +141,26 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
 /// Windows), or something else, so it conservatively treats a case-only
 /// difference as a possible alias rather than assuming ext4 semantics.
 ///
-/// Every intermediate hop is lexically normalized (`.` dropped, `..`
-/// collapsed against a preceding normal component) before it is checked
-/// against `visited` or read as a symlink again. Without this, a
-/// self-referential relative symlink such as `a -> ./a` can produce a new,
-/// textually distinct path on some hops (`a`, `./a`, `././a`, ...) even
-/// though it names the same cyclic target; whether `visited` still
-/// converges on a repeat depends on the exact input path shape, so
-/// normalizing first makes cycle detection immediate and independent of
-/// how the configured path happens to be spelled.
+/// Every intermediate hop *produced by following a symlink target* is
+/// lexically normalized (`.` dropped, `..` collapsed against a preceding
+/// normal component) before it is checked against `visited` or read as a
+/// symlink again. Without this, a self-referential relative symlink such as
+/// `a -> ./a` can produce a new, textually distinct path on some hops (`a`,
+/// `./a`, `././a`, ...) even though it names the same cyclic target.
+///
+/// The starting path itself is deliberately left unnormalized. Lexically
+/// collapsing a `..` that follows an existing symlink component (e.g.
+/// `link/../file` where `link` really exists) changes its meaning: the
+/// filesystem resolves `..` against the symlink's *target* directory, not
+/// its own, so collapsing it away first and only then resolving can name the
+/// wrong parent. Leaving the starting path as given lets the OS resolve any
+/// real leading symlink through the final-component canonicalization above,
+/// or through the parent-canonicalization fallback below, either of which
+/// applies `..` after symlinks the same way the kernel does.
 fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
         ensure_parent(path)?;
-        let mut current = normalize_lexically(path);
+        let mut current = path.to_path_buf();
         let mut visited = HashSet::new();
         loop {
             if let Ok(canonical) = fs::canonicalize(&current) {
@@ -190,7 +198,39 @@ fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
         Ok(parent.join(file_name))
     };
     let (resolved_a, resolved_b) = (resolve(a)?, resolve(b)?);
-    Ok(resolved_a == resolved_b || paths_equal_case_insensitive(&resolved_a, &resolved_b))
+    if resolved_a == resolved_b || paths_equal_case_insensitive(&resolved_a, &resolved_b) {
+        return Ok(true);
+    }
+    // Canonical path strings are not a filesystem identity: the same file or
+    // directory reachable through two different bind mounts canonicalizes to
+    // two different (but equally valid) strings. Fall back to comparing
+    // device/inode, which bind mounts of the same underlying filesystem
+    // share. When the final component does not exist yet on either side
+    // (the common case for a fresh recorder run), compare the parent
+    // directory's device/inode plus file name instead, since there is no
+    // inode for the missing file itself to compare.
+    if let (Ok(meta_a), Ok(meta_b)) = (fs::metadata(&resolved_a), fs::metadata(&resolved_b)) {
+        if meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino() {
+            return Ok(true);
+        }
+    }
+    if let (Some(parent_a), Some(parent_b), Some(name_a), Some(name_b)) = (
+        resolved_a.parent(),
+        resolved_b.parent(),
+        resolved_a.file_name(),
+        resolved_b.file_name(),
+    ) {
+        if let (Ok(meta_a), Ok(meta_b)) = (fs::metadata(parent_a), fs::metadata(parent_b)) {
+            if meta_a.dev() == meta_b.dev()
+                && meta_a.ino() == meta_b.ino()
+                && name_a.to_string_lossy().to_lowercase()
+                    == name_b.to_string_lossy().to_lowercase()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Lexically collapses `.` and `..` components without touching the
@@ -244,8 +284,10 @@ fn write_latest(path: &Path, json: &[u8]) -> Result<(), Box<dyn Error>> {
         .and_then(|name| name.to_str())
         .ok_or("latest output path must have a UTF-8 file name")?;
     let nonce: u64 = rand::random();
-    let temporary =
-        path.with_file_name(format!(".{file_name}.{}.{nonce:016x}.tmp", std::process::id()));
+    let temporary = path.with_file_name(format!(
+        ".{file_name}.{}.{nonce:016x}.tmp",
+        std::process::id()
+    ));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -407,6 +449,40 @@ mod tests {
         let lower = dir.join("archive.jsonl");
         let upper = dir.join("ARCHIVE.JSONL");
         assert!(same_output_path(&lower, &upper).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_detects_a_hard_linked_alias_with_distinct_names() {
+        // Two hard links to the same inode canonicalize to two textually
+        // distinct paths (no symlink is involved for canonicalize to
+        // resolve away), the same shape of alias a bind-mounted duplicate
+        // path would produce. The device/inode fallback must still catch it.
+        let dir = unique_temp_dir("hard-link-alias");
+        let archive = dir.join("archive.jsonl");
+        fs::write(&archive, b"{}\n").unwrap();
+        let linked = dir.join("also-archive.jsonl");
+        fs::hard_link(&archive, &linked).unwrap();
+        assert!(same_output_path(&archive, &linked).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_resolves_a_dot_dot_that_follows_a_real_symlink() {
+        // `dir/link -> dir/other/sub`, and the configured path is
+        // `dir/link/../file.json`. Resolving `link` first lands in
+        // `dir/other/sub`, so `..` must climb from there to `dir/other`, not
+        // lexically cancel `link` against `..` and land back in `dir`.
+        let dir = unique_temp_dir("dotdot-through-symlink");
+        let other_dir = dir.join("other");
+        let sub_dir = other_dir.join("sub");
+        fs::create_dir_all(&sub_dir).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&sub_dir, &link).unwrap();
+
+        let direct = other_dir.join("file.json");
+        let aliased = dir.join("link").join("..").join("file.json");
+        assert!(same_output_path(&direct, &aliased).unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 
