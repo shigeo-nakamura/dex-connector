@@ -133,6 +133,12 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
 /// traversal tracks visited paths instead of capping the hop count, so a
 /// long-but-acyclic dangling chain still resolves fully and only a genuine
 /// symlink cycle is rejected.
+///
+/// The resolved paths are additionally compared case-insensitively. This
+/// process cannot portably learn whether the target filesystem is
+/// case-sensitive (ext4), case-insensitive-but-preserving (default macOS,
+/// Windows), or something else, so it conservatively treats a case-only
+/// difference as a possible alias rather than assuming ext4 semantics.
 fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
         ensure_parent(path)?;
@@ -173,7 +179,12 @@ fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
             .unwrap_or(env::current_dir()?);
         Ok(parent.join(file_name))
     };
-    Ok(resolve(a)? == resolve(b)?)
+    let (resolved_a, resolved_b) = (resolve(a)?, resolve(b)?);
+    Ok(resolved_a == resolved_b || paths_equal_case_insensitive(&resolved_a, &resolved_b))
+}
+
+fn paths_equal_case_insensitive(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
 fn append_jsonl(path: &Path, json: &str) -> Result<(), Box<dyn Error>> {
@@ -346,6 +357,20 @@ mod tests {
         }
         let jsonl = current;
         assert!(same_output_path(&jsonl, &latest).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_detects_case_only_aliases_conservatively() {
+        // Neither file exists, so this exercises the parent-based fallback.
+        // On ext4 these are genuinely distinct inodes; on a case-insensitive
+        // filesystem they would collide. We cannot portably tell which
+        // filesystem is in play, so the guard must treat this as an alias
+        // either way rather than assume ext4 semantics.
+        let dir = unique_temp_dir("case-alias");
+        let lower = dir.join("archive.jsonl");
+        let upper = dir.join("ARCHIVE.JSONL");
+        assert!(same_output_path(&lower, &upper).unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 
