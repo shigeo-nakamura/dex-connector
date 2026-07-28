@@ -139,10 +139,20 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
 /// case-sensitive (ext4), case-insensitive-but-preserving (default macOS,
 /// Windows), or something else, so it conservatively treats a case-only
 /// difference as a possible alias rather than assuming ext4 semantics.
+///
+/// Every intermediate hop is lexically normalized (`.` dropped, `..`
+/// collapsed against a preceding normal component) before it is checked
+/// against `visited` or read as a symlink again. Without this, a
+/// self-referential relative symlink such as `a -> ./a` can produce a new,
+/// textually distinct path on some hops (`a`, `./a`, `././a`, ...) even
+/// though it names the same cyclic target; whether `visited` still
+/// converges on a repeat depends on the exact input path shape, so
+/// normalizing first makes cycle detection immediate and independent of
+/// how the configured path happens to be spelled.
 fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
         ensure_parent(path)?;
-        let mut current = path.to_path_buf();
+        let mut current = normalize_lexically(path);
         let mut visited = HashSet::new();
         loop {
             if let Ok(canonical) = fs::canonicalize(&current) {
@@ -158,7 +168,7 @@ fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
             let Ok(target) = fs::read_link(&current) else {
                 break;
             };
-            current = if target.is_absolute() {
+            current = normalize_lexically(&if target.is_absolute() {
                 target
             } else {
                 current
@@ -166,7 +176,7 @@ fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
                     .filter(|parent| !parent.as_os_str().is_empty())
                     .map(|parent| parent.join(&target))
                     .unwrap_or(target)
-            };
+            });
         }
         let file_name = current
             .file_name()
@@ -181,6 +191,32 @@ fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     };
     let (resolved_a, resolved_b) = (resolve(a)?, resolve(b)?);
     Ok(resolved_a == resolved_b || paths_equal_case_insensitive(&resolved_a, &resolved_b))
+}
+
+/// Lexically collapses `.` and `..` components without touching the
+/// filesystem, so repeated symlink-chain hops converge on one textual
+/// representation instead of growing a new `./`/`../` prefix per hop. A
+/// leading `..` with no preceding normal component to cancel is kept as-is
+/// (this only needs to make cyclic hops converge, not fully resolve paths
+/// that escape their starting root).
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) =>
+            {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 fn paths_equal_case_insensitive(a: &Path, b: &Path) -> bool {
@@ -387,6 +423,53 @@ mod tests {
              through to the missing-path fallback"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_rejects_a_self_referential_relative_symlink() {
+        // `a -> ./a` is a one-hop cycle. Without lexical normalization,
+        // whether the `visited` guard converges on a repeat quickly depends
+        // on the input path shape (a bare relative starting path can grow a
+        // new, textually distinct `./`-prefixed hop forever instead of
+        // repeating), so this runs with a timeout as a safety net rather
+        // than assuming a particular non-normalized traversal length.
+        let dir = unique_temp_dir("self-referential-symlink");
+        let a = dir.join("a");
+        std::os::unix::fs::symlink("./a", &a).unwrap();
+        let latest = dir.join("latest.json");
+
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = same_output_path(&a, &latest).map_err(|error| error.to_string());
+            let _ = result_tx.send(result);
+        });
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("same_output_path did not terminate on a self-referential symlink");
+        assert!(
+            result.is_err(),
+            "a self-referential relative symlink must be rejected as a cycle"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn normalize_lexically_collapses_dot_and_dot_dot_segments() {
+        assert_eq!(normalize_lexically(Path::new("./a")), Path::new("a"));
+        assert_eq!(normalize_lexically(Path::new("././a")), Path::new("a"));
+        assert_eq!(
+            normalize_lexically(Path::new("dir/./sub/../file")),
+            Path::new("dir/file")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("/dir/./sub/../file")),
+            Path::new("/dir/file")
+        );
+        // A leading `..` with nothing to cancel is preserved rather than
+        // dropped, since this normalization only needs to make repeated
+        // symlink hops converge, not fully resolve paths that escape their
+        // starting root.
+        assert_eq!(normalize_lexically(Path::new("../a")), Path::new("../a"));
     }
 
     #[test]
