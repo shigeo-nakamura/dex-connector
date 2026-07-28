@@ -10,6 +10,7 @@
 use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig};
 use fs2::FileExt;
 use std::{
+    collections::HashSet,
     env,
     error::Error,
     fs::{self, OpenOptions},
@@ -128,14 +129,25 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
 /// symlink (its target does not exist yet either) is followed manually,
 /// since `canonicalize` refuses to resolve those; only once the chain ends
 /// on a plain, still-missing path do we fall back to resolving just the
-/// parent directory and reattaching the unresolved file name.
+/// parent directory and reattaching the unresolved file name. Chain
+/// traversal tracks visited paths instead of capping the hop count, so a
+/// long-but-acyclic dangling chain still resolves fully and only a genuine
+/// symlink cycle is rejected.
 fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
         ensure_parent(path)?;
         let mut current = path.to_path_buf();
-        for _ in 0..32 {
+        let mut visited = HashSet::new();
+        loop {
             if let Ok(canonical) = fs::canonicalize(&current) {
                 return Ok(canonical);
+            }
+            if !visited.insert(current.clone()) {
+                return Err(format!(
+                    "output path resolves through a symlink cycle: {}",
+                    path.display()
+                )
+                .into());
             }
             let Ok(target) = fs::read_link(&current) else {
                 break;
@@ -315,6 +327,40 @@ mod tests {
         let jsonl = dir.join("archive.jsonl");
         std::os::unix::fs::symlink(&latest, &jsonl).unwrap();
         assert!(same_output_path(&jsonl, &latest).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_detects_a_dangling_alias_beyond_the_old_traversal_cap() {
+        let dir = unique_temp_dir("long-dangling-chain");
+        let latest = dir.join("latest.json");
+        let mut current = latest.clone();
+        // One more hop than the traversal cap this same_output_path used to
+        // apply (32), still well within Linux's own symlink resolution
+        // limit, so the chain must resolve fully rather than falling
+        // through to a mismatched intermediate hop.
+        for i in 0..33 {
+            let next = dir.join(format!("hop-{i}"));
+            std::os::unix::fs::symlink(&current, &next).unwrap();
+            current = next;
+        }
+        let jsonl = current;
+        assert!(same_output_path(&jsonl, &latest).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_output_path_rejects_a_symlink_cycle() {
+        let dir = unique_temp_dir("symlink-cycle");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(
+            same_output_path(&a, &dir.join("latest.json")).is_err(),
+            "a symlink cycle must be rejected instead of silently falling \
+             through to the missing-path fallback"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
