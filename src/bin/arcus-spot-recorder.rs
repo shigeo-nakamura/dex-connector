@@ -141,22 +141,23 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn Error>> {
 /// Windows), or something else, so it conservatively treats a case-only
 /// difference as a possible alias rather than assuming ext4 semantics.
 ///
-/// Every intermediate hop *produced by following a symlink target* is
-/// lexically normalized (`.` dropped, `..` collapsed against a preceding
-/// normal component) before it is checked against `visited` or read as a
-/// symlink again. Without this, a self-referential relative symlink such as
-/// `a -> ./a` can produce a new, textually distinct path on some hops (`a`,
-/// `./a`, `././a`, ...) even though it names the same cyclic target.
+/// Every intermediate hop *produced by following a symlink target* has its
+/// redundant `.` components dropped (see `normalize_lexically`) before it is
+/// checked against `visited` or read as a symlink again. Without this, a
+/// self-referential relative symlink such as `a -> ./a` can produce a new,
+/// textually distinct path on some hops (`a`, `./a`, `././a`, ...) even
+/// though it names the same cyclic target. `..` is never lexically collapsed,
+/// here or for the starting path below: a hop target such as
+/// `link/../latest.json` can have `link` be a real symlink, and the
+/// filesystem resolves `..` against that symlink's *target* directory, not
+/// its own, so collapsing it away first — before the filesystem gets a
+/// chance to see `link` — can name the wrong path entirely.
 ///
-/// The starting path itself is deliberately left unnormalized. Lexically
-/// collapsing a `..` that follows an existing symlink component (e.g.
-/// `link/../file` where `link` really exists) changes its meaning: the
-/// filesystem resolves `..` against the symlink's *target* directory, not
-/// its own, so collapsing it away first and only then resolving can name the
-/// wrong parent. Leaving the starting path as given lets the OS resolve any
-/// real leading symlink through the final-component canonicalization above,
-/// or through the parent-canonicalization fallback below, either of which
-/// applies `..` after symlinks the same way the kernel does.
+/// The starting path itself is, likewise, left entirely unnormalized.
+/// Leaving it as given lets the OS resolve any real leading symlink through
+/// the final-component canonicalization above, or through the
+/// parent-canonicalization fallback below, either of which applies `..`
+/// after symlinks the same way the kernel does.
 fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     let resolve = |path: &Path| -> Result<PathBuf, Box<dyn Error>> {
         ensure_parent(path)?;
@@ -233,26 +234,27 @@ fn same_output_path(a: &Path, b: &Path) -> Result<bool, Box<dyn Error>> {
     Ok(false)
 }
 
-/// Lexically collapses `.` and `..` components without touching the
-/// filesystem, so repeated symlink-chain hops converge on one textual
-/// representation instead of growing a new `./`/`../` prefix per hop. A
-/// leading `..` with no preceding normal component to cancel is kept as-is
-/// (this only needs to make cyclic hops converge, not fully resolve paths
-/// that escape their starting root).
+/// Lexically drops `.` components without touching the filesystem or
+/// collapsing `..`, so repeated symlink-chain hops converge on one textual
+/// representation instead of growing a new `./` prefix per hop.
+///
+/// `..` is deliberately left untouched. It used to be collapsed against a
+/// preceding `Normal` component here, but a hop target such as
+/// `link/../latest.json` can have `link` be a real symlink; the kernel then
+/// resolves `..` against `link`'s *target* directory, not its own, so
+/// collapsing it away lexically before the filesystem gets a chance to see
+/// `link` can name the wrong path entirely (`same_output_path` would then
+/// compare that wrong path against the real one and report false aliases as
+/// distinct). `.` alone is always the identity component regardless of
+/// what's around it, so dropping just that is enough to make a
+/// self-referential relative symlink (`a -> ./a`) converge to a repeated,
+/// `visited`-detectable path across hops instead of growing forever.
 fn normalize_lexically(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir
-                if matches!(
-                    normalized.components().next_back(),
-                    Some(Component::Normal(_))
-                ) =>
-            {
-                normalized.pop();
-            }
             other => normalized.push(other),
         }
     }
@@ -487,6 +489,30 @@ mod tests {
     }
 
     #[test]
+    fn same_output_path_resolves_a_dot_dot_reached_through_a_dangling_hop() {
+        // `dir/archive.jsonl -> link/../latest.json` (a dangling, relative
+        // symlink target), and `dir/link -> dir/other/sub` (a real symlink).
+        // This exercises the hop-target join inside the traversal loop, not
+        // the starting-path handling covered above: the kernel resolves the
+        // target to `dir/other/latest.json`, so lexically collapsing
+        // `link/..` away before canonicalize/read_link ever see the real
+        // `link` symlink must not make this compare as a distinct path.
+        let dir = unique_temp_dir("dotdot-through-hop");
+        let other_dir = dir.join("other");
+        let sub_dir = other_dir.join("sub");
+        fs::create_dir_all(&sub_dir).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&sub_dir, &link).unwrap();
+
+        let archive = dir.join("archive.jsonl");
+        std::os::unix::fs::symlink("link/../latest.json", &archive).unwrap();
+
+        let direct = other_dir.join("latest.json");
+        assert!(same_output_path(&archive, &direct).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn same_output_path_rejects_a_symlink_cycle() {
         let dir = unique_temp_dir("symlink-cycle");
         let a = dir.join("a");
@@ -530,21 +556,21 @@ mod tests {
     }
 
     #[test]
-    fn normalize_lexically_collapses_dot_and_dot_dot_segments() {
+    fn normalize_lexically_drops_dot_but_never_collapses_dot_dot() {
         assert_eq!(normalize_lexically(Path::new("./a")), Path::new("a"));
         assert_eq!(normalize_lexically(Path::new("././a")), Path::new("a"));
+        // `..` must survive uncollapsed even when a normal component
+        // precedes it lexically: that component could be a real symlink, and
+        // only the filesystem (not this function) knows what `..` resolves
+        // against in that case.
         assert_eq!(
             normalize_lexically(Path::new("dir/./sub/../file")),
-            Path::new("dir/file")
+            Path::new("dir/sub/../file")
         );
         assert_eq!(
             normalize_lexically(Path::new("/dir/./sub/../file")),
-            Path::new("/dir/file")
+            Path::new("/dir/sub/../file")
         );
-        // A leading `..` with nothing to cancel is preserved rather than
-        // dropped, since this normalization only needs to make repeated
-        // symlink hops converge, not fully resolve paths that escape their
-        // starting root.
         assert_eq!(normalize_lexically(Path::new("../a")), Path::new("../a"));
     }
 
