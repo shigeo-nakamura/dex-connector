@@ -342,76 +342,35 @@ impl ArcusSpotSignableVenueQuote {
                 self.venue
             )));
         }
-        if !typed_data.types.contains_key(PERMIT2_PRIMARY_TYPE)
-            || !typed_data.types.contains_key("TokenPermissions")
-        {
-            return Err(ArcusSpotError::InvalidResponse(format!(
-                "venue {} EIP-712 types omit PermitWitnessTransferFrom or TokenPermissions",
-                self.venue
-            )));
-        }
         // A type name being present in `types` only means the schema declares
-        // *a* struct with that name; it says nothing about which fields that
-        // struct actually commits to the signature. If the declared field list
-        // omits e.g. `spender` or `witness`, EIP-712 encoding hashes only the
-        // remaining fields, so the pointer-based checks below must not treat
-        // any value as signed unless its field is present in the declaration.
-        require_eip712_field(
+        // *a* struct with that name; it says nothing about which fields, in
+        // which order, that struct actually commits to the signature. EIP-712
+        // hashes the full `encodeType` string (name + every field name/type in
+        // declared order), so a schema that renames, reorders, adds, or omits
+        // a field still lets the pointer-based checks below find every value
+        // they look for while producing a type hash the venue contract never
+        // agreed to. The declared schema must therefore match the venue's
+        // canonical struct exactly, not just contain the fields we happen to
+        // read.
+        let witness_schema = canonical_witness_schema(&self.venue)?;
+        require_exact_eip712_fields(
             &typed_data.types,
             PERMIT2_PRIMARY_TYPE,
-            "permitted",
-            "TokenPermissions",
+            &permit2_type_fields(witness_schema.type_name),
             &self.venue,
         )?;
-        require_eip712_field(
-            &typed_data.types,
-            PERMIT2_PRIMARY_TYPE,
-            "spender",
-            "address",
-            &self.venue,
-        )?;
-        require_eip712_field(
-            &typed_data.types,
-            PERMIT2_PRIMARY_TYPE,
-            "nonce",
-            "uint256",
-            &self.venue,
-        )?;
-        require_eip712_field(
-            &typed_data.types,
-            PERMIT2_PRIMARY_TYPE,
-            "deadline",
-            "uint256",
-            &self.venue,
-        )?;
-        require_eip712_field(
+        require_exact_eip712_fields(
             &typed_data.types,
             "TokenPermissions",
-            "token",
-            "address",
+            TOKEN_PERMISSIONS_FIELDS,
             &self.venue,
         )?;
-        require_eip712_field(
+        require_exact_eip712_fields(
             &typed_data.types,
-            "TokenPermissions",
-            "amount",
-            "uint256",
+            witness_schema.type_name,
+            witness_schema.fields,
             &self.venue,
         )?;
-        let witness_type = eip712_field_type(&typed_data.types, PERMIT2_PRIMARY_TYPE, "witness")
-            .ok_or_else(|| {
-                ArcusSpotError::InvalidResponse(format!(
-                    "venue {} EIP-712 {PERMIT2_PRIMARY_TYPE} does not declare field witness",
-                    self.venue
-                ))
-            })?
-            .to_string();
-        if !typed_data.types.contains_key(&witness_type) {
-            return Err(ArcusSpotError::InvalidResponse(format!(
-                "venue {} EIP-712 witness type {witness_type} is not declared",
-                self.venue
-            )));
-        }
         self.eip712_digest()?;
 
         expect_pointer_address(
@@ -453,17 +412,9 @@ impl ArcusSpotSignableVenueQuote {
         }
 
         match self.venue.to_ascii_lowercase().as_str() {
-            "arcus" => self.validate_arcus(
-                expected,
-                deadline,
-                minimum_received,
-                &typed_data.types,
-                &witness_type,
-            ),
-            "rialto" => {
-                self.validate_rialto(expected, minimum_received, &typed_data.types, &witness_type)
-            }
-            "lifi" => self.validate_lifi(expected, &typed_data.types, &witness_type),
+            "arcus" => self.validate_arcus(expected, deadline, minimum_received),
+            "rialto" => self.validate_rialto(expected, minimum_received),
+            "lifi" => self.validate_lifi(expected),
             other => Err(ArcusSpotError::InvalidResponse(format!(
                 "venue {other} has no signable-quote validator and cannot be trusted"
             ))),
@@ -475,27 +426,12 @@ impl ArcusSpotSignableVenueQuote {
         expected: &QuoteExpectations,
         deadline: u64,
         minimum_received: U256,
-        types: &Eip712Types,
-        witness_type: &str,
     ) -> Result<(), ArcusSpotError> {
         if self.expiry != Some(deadline) {
             return Err(ArcusSpotError::InvalidResponse(
                 "Arcus venue must expose expiry matching its signed deadline".to_string(),
             ));
         }
-        require_eip712_field(types, witness_type, "taker", "address", &self.venue)?;
-        require_eip712_field(
-            types,
-            witness_type,
-            "takerSellToken",
-            "address",
-            &self.venue,
-        )?;
-        require_eip712_field(types, witness_type, "takerBuyToken", "address", &self.venue)?;
-        require_eip712_field(types, witness_type, "sellAmount", "uint256", &self.venue)?;
-        require_eip712_field(types, witness_type, "minBuyAmount", "uint256", &self.venue)?;
-        require_eip712_field(types, witness_type, "allowWrapped", "bool", &self.venue)?;
-        require_eip712_field(types, witness_type, "nonce", "uint256", &self.venue)?;
         expect_pointer_address(
             &self.to_sign,
             "/message/witness/taker",
@@ -550,12 +486,7 @@ impl ArcusSpotSignableVenueQuote {
         &self,
         expected: &QuoteExpectations,
         minimum_received: U256,
-        types: &Eip712Types,
-        witness_type: &str,
     ) -> Result<(), ArcusSpotError> {
-        require_eip712_field(types, witness_type, "recipient", "address", &self.venue)?;
-        require_eip712_field(types, witness_type, "buyToken", "address", &self.venue)?;
-        require_eip712_field(types, witness_type, "minBuyAmount", "uint256", &self.venue)?;
         expect_pointer_address(&self.to_sign, "/owner", "toSign.owner", expected.taker)?;
         expect_pointer_address(
             &self.to_sign,
@@ -596,26 +527,7 @@ impl ArcusSpotSignableVenueQuote {
         Ok(())
     }
 
-    fn validate_lifi(
-        &self,
-        expected: &QuoteExpectations,
-        types: &Eip712Types,
-        witness_type: &str,
-    ) -> Result<(), ArcusSpotError> {
-        require_eip712_field(
-            types,
-            witness_type,
-            "diamondAddress",
-            "address",
-            &self.venue,
-        )?;
-        require_eip712_field(
-            types,
-            witness_type,
-            "diamondCalldataHash",
-            "bytes32",
-            &self.venue,
-        )?;
+    fn validate_lifi(&self, expected: &QuoteExpectations) -> Result<(), ArcusSpotError> {
         let tx = self.tx.as_ref().ok_or_else(|| {
             ArcusSpotError::InvalidResponse("LiFi venue omitted transaction metadata".to_string())
         })?;
@@ -653,42 +565,64 @@ impl ArcusSpotSignableVenueQuote {
         })?;
         let actual_hash = format!(
             "0x{}",
-            hex::encode(ethers::utils::keccak256(calldata_bytes))
+            hex::encode(ethers::utils::keccak256(&calldata_bytes))
         );
         if !actual_hash.eq_ignore_ascii_case(expected_hash) {
             return Err(ArcusSpotError::InvalidResponse(format!(
                 "LiFi diamondCalldata hash {actual_hash} does not match witness {expected_hash}"
             )));
         }
-        if let Some(raw) = &self.raw {
-            if raw.pointer("/transactionRequest").is_some() {
-                let diamond_address = pointer_address(
-                    &self.to_sign,
-                    "/message/witness/diamondAddress",
-                    "toSign.message.witness.diamondAddress",
-                )?;
-                expect_pointer_address(
-                    raw,
-                    "/transactionRequest/to",
-                    "raw.transactionRequest.to",
-                    diamond_address,
-                )?;
-            }
-            if raw.pointer("/action").is_some() {
-                expect_pointer_address(
-                    raw,
-                    "/action/fromAddress",
-                    "raw.action.fromAddress",
-                    expected.taker,
-                )?;
-                expect_pointer_address(
-                    raw,
-                    "/action/toAddress",
-                    "raw.action.toAddress",
-                    expected.taker,
-                )?;
-            }
+        // The signature only commits to a hash of the opaque diamond calldata,
+        // not to its decoded meaning; LiFi's facets vary by route so this
+        // cannot be fully ABI-decoded generically. Instead require that the
+        // expected recipient and buy-token addresses actually appear as
+        // 32-byte-aligned parameters inside the signed bytes: every real
+        // transfer/swap/bridge call ABI-encodes its addresses this way, so a
+        // calldata blob that redirects funds elsewhere or swaps into another
+        // asset cannot satisfy both this check and the hash check above.
+        if !calldata_references_address(&calldata_bytes, expected.taker) {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "LiFi diamondCalldata does not reference the expected recipient {:#x}",
+                expected.taker
+            )));
         }
+        if !calldata_references_address(&calldata_bytes, expected.buy_token) {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "LiFi diamondCalldata does not reference the expected buy token {:#x}",
+                expected.buy_token
+            )));
+        }
+        // raw.action/raw.transactionRequest are the router's own unsigned
+        // account of who receives funds and which contract the transaction
+        // targets. Treating them as optional let a response skip these
+        // cross-checks entirely; require them so every LiFi quote is bound by
+        // both the signed-calldata scan above and this independent metadata.
+        let raw = self.raw.as_ref().ok_or_else(|| {
+            ArcusSpotError::InvalidResponse("LiFi venue omitted raw route metadata".to_string())
+        })?;
+        let diamond_address = pointer_address(
+            &self.to_sign,
+            "/message/witness/diamondAddress",
+            "toSign.message.witness.diamondAddress",
+        )?;
+        expect_pointer_address(
+            raw,
+            "/transactionRequest/to",
+            "raw.transactionRequest.to",
+            diamond_address,
+        )?;
+        expect_pointer_address(
+            raw,
+            "/action/fromAddress",
+            "raw.action.fromAddress",
+            expected.taker,
+        )?;
+        expect_pointer_address(
+            raw,
+            "/action/toAddress",
+            "raw.action.toAddress",
+            expected.taker,
+        )?;
         Ok(())
     }
 }
@@ -1120,41 +1054,116 @@ fn pointer_value<'a>(
         .ok_or_else(|| ArcusSpotError::InvalidResponse(format!("signable quote omitted {field}")))
 }
 
-/// The EIP-712 type name a field is declared with, or `None` if the type or
-/// the field within it is absent from the schema.
-fn eip712_field_type<'a>(
-    types: &'a Eip712Types,
-    type_name: &str,
-    field_name: &str,
-) -> Option<&'a str> {
-    types
-        .get(type_name)?
-        .iter()
-        .find(|field| field.name == field_name)
-        .map(|field| field.r#type.as_str())
+const TOKEN_PERMISSIONS_FIELDS: &[(&str, &str)] = &[("token", "address"), ("amount", "uint256")];
+
+const ARCUS_WITNESS_FIELDS: &[(&str, &str)] = &[
+    ("taker", "address"),
+    ("takerSellToken", "address"),
+    ("takerBuyToken", "address"),
+    ("sellAmount", "uint256"),
+    ("minBuyAmount", "uint256"),
+    ("allowWrapped", "bool"),
+    ("nonce", "uint256"),
+    ("deadline", "uint256"),
+];
+
+const RIALTO_WITNESS_FIELDS: &[(&str, &str)] = &[
+    ("recipient", "address"),
+    ("buyToken", "address"),
+    ("minBuyAmount", "uint256"),
+    ("deadline", "uint64"),
+    ("feeRecipient", "address"),
+    ("srcBps", "uint16"),
+    ("dstBps", "uint16"),
+    ("referralCode", "bytes32"),
+    ("quoteId", "bytes32"),
+    ("actionsHash", "bytes32"),
+];
+
+const LIFI_WITNESS_FIELDS: &[(&str, &str)] = &[
+    ("diamondAddress", "address"),
+    ("diamondCalldataHash", "bytes32"),
+];
+
+/// The canonical witness struct name and complete, ordered field list a venue
+/// must declare for its signature to bind the values this module reads.
+struct WitnessSchema {
+    type_name: &'static str,
+    fields: &'static [(&'static str, &'static str)],
 }
 
-/// Fails unless `type_name.field_name` is declared with exactly
-/// `expected_type` in the venue's EIP-712 schema. A pointer-extracted value
-/// is only part of the signed digest if its field is declared this way;
-/// otherwise EIP-712 encoding silently drops it and the value carries no
-/// signature guarantee at all.
-fn require_eip712_field(
-    types: &Eip712Types,
-    type_name: &str,
-    field_name: &str,
-    expected_type: &str,
-    venue: &str,
-) -> Result<(), ArcusSpotError> {
-    match eip712_field_type(types, type_name, field_name) {
-        Some(actual) if actual == expected_type => Ok(()),
-        Some(actual) => Err(ArcusSpotError::InvalidResponse(format!(
-            "venue {venue} EIP-712 {type_name}.{field_name} is declared as {actual}, expected {expected_type}"
-        ))),
-        None => Err(ArcusSpotError::InvalidResponse(format!(
-            "venue {venue} EIP-712 {type_name} does not declare field {field_name}"
+/// Fails closed for any venue without a known canonical schema, and returns
+/// the schema this module trusts instead of whatever struct name the router
+/// response happens to declare.
+fn canonical_witness_schema(venue: &str) -> Result<WitnessSchema, ArcusSpotError> {
+    match venue.to_ascii_lowercase().as_str() {
+        "arcus" => Ok(WitnessSchema {
+            type_name: "TakerIntent",
+            fields: ARCUS_WITNESS_FIELDS,
+        }),
+        "rialto" => Ok(WitnessSchema {
+            type_name: "RialtoSwap",
+            fields: RIALTO_WITNESS_FIELDS,
+        }),
+        "lifi" => Ok(WitnessSchema {
+            type_name: "LiFiCall",
+            fields: LIFI_WITNESS_FIELDS,
+        }),
+        other => Err(ArcusSpotError::InvalidResponse(format!(
+            "venue {other} has no signable-quote validator and cannot be trusted"
         ))),
     }
+}
+
+fn permit2_type_fields(witness_type: &'static str) -> [(&'static str, &'static str); 5] {
+    [
+        ("permitted", "TokenPermissions"),
+        ("spender", "address"),
+        ("nonce", "uint256"),
+        ("deadline", "uint256"),
+        ("witness", witness_type),
+    ]
+}
+
+/// Fails unless `type_name` is declared in the venue's EIP-712 schema with
+/// exactly `expected`'s field names, types, and order — nothing renamed,
+/// reordered, added, or omitted. EIP-712's type hash is computed from that
+/// full `encodeType` string, so any deviation produces a signature that does
+/// not commit to what this module's pointer-based checks read, even though
+/// each individual field it looks for is still present.
+fn require_exact_eip712_fields(
+    types: &Eip712Types,
+    type_name: &str,
+    expected: &[(&str, &str)],
+    venue: &str,
+) -> Result<(), ArcusSpotError> {
+    let declared = types.get(type_name).ok_or_else(|| {
+        ArcusSpotError::InvalidResponse(format!("venue {venue} EIP-712 types omit {type_name}"))
+    })?;
+    let actual: Vec<(&str, &str)> = declared
+        .iter()
+        .map(|field| (field.name.as_str(), field.r#type.as_str()))
+        .collect();
+    if actual.as_slice() != expected {
+        return Err(ArcusSpotError::InvalidResponse(format!(
+            "venue {venue} EIP-712 {type_name} fields {actual:?} do not exactly match the canonical schema {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `address` appears as a 32-byte-aligned ABI parameter anywhere in
+/// `calldata` after its 4-byte selector. Real transfer/swap/bridge calldata
+/// always encodes address arguments this way, so this is a lightweight bound
+/// on what a signed-but-undecoded calldata blob can be doing without needing
+/// venue-specific ABI knowledge.
+fn calldata_references_address(calldata: &[u8], address: Address) -> bool {
+    if calldata.len() <= 4 {
+        return false;
+    }
+    let mut padded = [0_u8; 32];
+    padded[12..].copy_from_slice(address.as_bytes());
+    calldata[4..].chunks_exact(32).any(|word| word == padded)
 }
 
 fn pointer_address(value: &Value, pointer: &str, field: &str) -> Result<Address, ArcusSpotError> {
@@ -1491,7 +1500,72 @@ mod tests {
             .retain(|field| field["name"] != "spender");
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
-            error.to_string().contains("does not declare field spender"),
+            error
+                .to_string()
+                .contains("do not exactly match the canonical schema"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn renamed_or_reordered_witness_type_is_rejected() {
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        // Swap the order of two witness fields; every individual field is
+        // still declared, but the EIP-712 type hash depends on their order.
+        let witness_fields = response.quotes[0].to_sign["types"]["TakerIntent"]
+            .as_array_mut()
+            .unwrap();
+        witness_fields.swap(0, 1);
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("do not exactly match the canonical schema"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn lifi_calldata_not_referencing_expected_recipient_is_rejected() {
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let lifi = response
+            .quotes
+            .iter_mut()
+            .find(|quote| quote.venue == "lifi")
+            .unwrap();
+        // Hash-consistent calldata that does not encode the expected taker or
+        // buy token anywhere; only an unrelated decoy address is present.
+        lifi.tx.as_mut().unwrap()["diamondCalldata"] = Value::String(
+            "0xaabbccdd0000000000000000000000000000000000000000000000000000000000000099"
+                .to_string(),
+        );
+        lifi.to_sign["message"]["witness"]["diamondCalldataHash"] = Value::String(
+            "0x5dafc5958a8a7eeafac1368cb1db09246b4e81d32959d8a279d0ee0148ec51a3".to_string(),
+        );
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not reference the expected recipient"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn lifi_missing_raw_route_metadata_is_rejected() {
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let lifi = response
+            .quotes
+            .iter_mut()
+            .find(|quote| quote.venue == "lifi")
+            .unwrap();
+        lifi.raw = None;
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error.to_string().contains("omitted raw route metadata"),
             "unexpected error: {error}"
         );
     }

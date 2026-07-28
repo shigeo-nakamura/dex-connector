@@ -204,13 +204,13 @@
           "deadline": "4102444800",
           "witness": {
             "diamondAddress": "0xB477751B76CF82d00a686A1232f5fCD772414Af3",
-            "diamondCalldataHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+            "diamondCalldataHash": "0x8edfd8262f73f325f7fabc86f6e22e4b795914680252afdce5035bf92d76d205"
           }
         }
       },
       "tx": {
         "permit2Proxy": "0x8eABB4E117fB70b346592e013855f6d825F50af1",
-        "diamondCalldata": "0x",
+        "diamondCalldata": "0xaabbccdd000000000000000000000000760000000000000000000000000000000000000100000000000000000000000086923f96303d656e4aa86d9d42d1e57ad2023fdc",
         "buyToken": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
         "estimatedGas": "0xd5c1e"
       },
