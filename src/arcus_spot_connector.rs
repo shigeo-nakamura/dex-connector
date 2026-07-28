@@ -56,6 +56,21 @@ pub struct ArcusSpotConfig {
     pub retry_base_delay_ms: u64,
     pub max_retry_delay_ms: u64,
     pub user_agent: String,
+    /// Permit2 `spender` addresses this deployment recognizes as genuine
+    /// venue settlement contracts on `chain_id`, hex-encoded (case-insensitive).
+    ///
+    /// A signable quote's Permit2 signature authorizes this address to pull
+    /// the sell token; the spender is also responsible for enforcing the
+    /// signed witness's semantics once it executes. Comparing it only against
+    /// other fields in the same (attacker-influenceable) response, as the
+    /// venue-specific checks already do, cannot detect a compromised or
+    /// misconfigured router substituting an unrelated contract, so this list
+    /// is checked as an independent, deployer-controlled source of truth.
+    /// Left empty (the default), every quote is refused rather than treated
+    /// as validated on an unverified spender: operators MUST populate this
+    /// with the real per-chain venue deployment addresses before consuming
+    /// this module's output as signing evidence.
+    pub trusted_permit2_spenders: Vec<String>,
 }
 
 impl Default for ArcusSpotConfig {
@@ -74,6 +89,7 @@ impl Default for ArcusSpotConfig {
                 "dex-connector/{}/arcus-spot-readonly",
                 env!("CARGO_PKG_VERSION")
             ),
+            trusted_permit2_spenders: Vec::new(),
         }
     }
 }

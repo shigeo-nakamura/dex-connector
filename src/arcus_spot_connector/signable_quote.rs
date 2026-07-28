@@ -22,6 +22,11 @@ const BPS_SCALE: u32 = 10_000;
 const MAX_DRY_RUN_SLIPPAGE_BPS: u32 = 1_000;
 const PERMIT2_PRIMARY_TYPE: &str = "PermitWitnessTransferFrom";
 const PERMIT2_ADDRESS: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+/// An RFQ intent is meant to be exercised near-immediately; Permit2 nonces
+/// only prevent *reuse* after execution, they do nothing to stop an unused
+/// signature from sitting idle and being exercised much later at a stale
+/// minimum price. Cap how far past receipt a signed deadline may sit.
+const MAX_SIGNING_DEADLINE_TTL_SECS: u64 = 300;
 
 /// Whether the pre-sign quote may fall back to Arcus wrapped-token delivery.
 ///
@@ -291,6 +296,13 @@ impl ArcusSpotSignableVenueQuote {
                 self.venue, deadline, expected.now_unix
             )));
         }
+        let ttl_secs = deadline.saturating_sub(expected.now_unix);
+        if ttl_secs > MAX_SIGNING_DEADLINE_TTL_SECS {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "venue {} quote deadline {} is {ttl_secs}s after receipt time {}, exceeding the {MAX_SIGNING_DEADLINE_TTL_SECS}s maximum signing TTL",
+                self.venue, deadline, expected.now_unix
+            )));
+        }
 
         let typed_data = self.typed_data()?;
         if typed_data.primary_type != PERMIT2_PRIMARY_TYPE {
@@ -392,6 +404,20 @@ impl ArcusSpotSignableVenueQuote {
                 self.venue
             )));
         }
+        // The venue-specific checks below only compare `spender` against
+        // other fields in this same (attacker-influenceable) response; none
+        // of them independently confirm it names a real venue settlement
+        // contract. Since the Permit2 signature authorizes this address to
+        // pull the sell token, a compromised or misconfigured router could
+        // otherwise substitute an unrelated contract and still pass. Refuse
+        // to treat any quote as validated unless the deployer has configured
+        // at least one trusted spender for this chain.
+        if !expected.trusted_spenders.contains(&spender) {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "venue {} EIP-712 spender {spender:#x} is not in the configured trusted_permit2_spenders allowlist",
+                self.venue
+            )));
+        }
 
         if let Some(raw) = &self.raw {
             if raw.pointer("/issues/balance").is_some() {
@@ -414,7 +440,12 @@ impl ArcusSpotSignableVenueQuote {
         match self.venue.to_ascii_lowercase().as_str() {
             "arcus" => self.validate_arcus(expected, deadline, minimum_received),
             "rialto" => self.validate_rialto(expected, minimum_received),
-            "lifi" => self.validate_lifi(expected),
+            // LiFi's signed witness commits only to a hash of opaque diamond
+            // calldata (see `canonical_witness_schema`'s doc comment); without
+            // a maintained LiFi facet ABI to decode that calldata, this
+            // module cannot verify its actual recipient, output token, or
+            // minimum output, so it is refused like any other untrusted
+            // venue rather than accepted on unsigned metadata alone.
             other => Err(ArcusSpotError::InvalidResponse(format!(
                 "venue {other} has no signable-quote validator and cannot be trusted"
             ))),
@@ -524,105 +555,6 @@ impl ArcusSpotSignableVenueQuote {
                 u64::from(expected.slippage_bps),
             )?;
         }
-        Ok(())
-    }
-
-    fn validate_lifi(&self, expected: &QuoteExpectations) -> Result<(), ArcusSpotError> {
-        let tx = self.tx.as_ref().ok_or_else(|| {
-            ArcusSpotError::InvalidResponse("LiFi venue omitted transaction metadata".to_string())
-        })?;
-        expect_pointer_address(tx, "/buyToken", "tx.buyToken", expected.buy_token)?;
-        let permit2_proxy = pointer_address(tx, "/permit2Proxy", "tx.permit2Proxy")?;
-        let spender = pointer_address(&self.to_sign, "/message/spender", "toSign.message.spender")?;
-        if permit2_proxy != spender {
-            return Err(ArcusSpotError::InvalidResponse(
-                "LiFi permit2Proxy does not match the EIP-712 spender".to_string(),
-            ));
-        }
-        let calldata = pointer_value(tx, "/diamondCalldata", "tx.diamondCalldata")?
-            .as_str()
-            .ok_or_else(|| {
-                ArcusSpotError::InvalidResponse(
-                    "tx.diamondCalldata is not a hex string".to_string(),
-                )
-            })?;
-        let calldata_bytes =
-            hex::decode(calldata.strip_prefix("0x").unwrap_or(calldata)).map_err(|error| {
-                ArcusSpotError::InvalidResponse(format!(
-                    "tx.diamondCalldata is not valid hex: {error}"
-                ))
-            })?;
-        let expected_hash = pointer_value(
-            &self.to_sign,
-            "/message/witness/diamondCalldataHash",
-            "toSign.message.witness.diamondCalldataHash",
-        )?
-        .as_str()
-        .ok_or_else(|| {
-            ArcusSpotError::InvalidResponse(
-                "toSign.message.witness.diamondCalldataHash is not a hex string".to_string(),
-            )
-        })?;
-        let actual_hash = format!(
-            "0x{}",
-            hex::encode(ethers::utils::keccak256(&calldata_bytes))
-        );
-        if !actual_hash.eq_ignore_ascii_case(expected_hash) {
-            return Err(ArcusSpotError::InvalidResponse(format!(
-                "LiFi diamondCalldata hash {actual_hash} does not match witness {expected_hash}"
-            )));
-        }
-        // The signature only commits to a hash of the opaque diamond calldata,
-        // not to its decoded meaning; LiFi's facets vary by route so this
-        // cannot be fully ABI-decoded generically. Instead require that the
-        // expected recipient and buy-token addresses actually appear as
-        // 32-byte-aligned parameters inside the signed bytes: every real
-        // transfer/swap/bridge call ABI-encodes its addresses this way, so a
-        // calldata blob that redirects funds elsewhere or swaps into another
-        // asset cannot satisfy both this check and the hash check above.
-        if !calldata_references_address(&calldata_bytes, expected.taker) {
-            return Err(ArcusSpotError::InvalidResponse(format!(
-                "LiFi diamondCalldata does not reference the expected recipient {:#x}",
-                expected.taker
-            )));
-        }
-        if !calldata_references_address(&calldata_bytes, expected.buy_token) {
-            return Err(ArcusSpotError::InvalidResponse(format!(
-                "LiFi diamondCalldata does not reference the expected buy token {:#x}",
-                expected.buy_token
-            )));
-        }
-        // raw.action/raw.transactionRequest are the router's own unsigned
-        // account of who receives funds and which contract the transaction
-        // targets. Treating them as optional let a response skip these
-        // cross-checks entirely; require them so every LiFi quote is bound by
-        // both the signed-calldata scan above and this independent metadata.
-        let raw = self.raw.as_ref().ok_or_else(|| {
-            ArcusSpotError::InvalidResponse("LiFi venue omitted raw route metadata".to_string())
-        })?;
-        let diamond_address = pointer_address(
-            &self.to_sign,
-            "/message/witness/diamondAddress",
-            "toSign.message.witness.diamondAddress",
-        )?;
-        expect_pointer_address(
-            raw,
-            "/transactionRequest/to",
-            "raw.transactionRequest.to",
-            diamond_address,
-        )?;
-        expect_pointer_address(
-            raw,
-            "/action/fromAddress",
-            "raw.action.fromAddress",
-            expected.taker,
-        )?;
-        expect_pointer_address(
-            raw,
-            "/action/toAddress",
-            "raw.action.toAddress",
-            expected.taker,
-        )?;
         Ok(())
     }
 }
@@ -875,6 +807,18 @@ impl ArcusSpotClient {
             .get_json(&self.inner.router_base_url, "v1/quote", &query)
             .await?;
         let now_unix = timestamp_u64(response.received_at.timestamp())?;
+        let trusted_spenders = self
+            .inner
+            .config
+            .trusted_permit2_spenders
+            .iter()
+            .map(|address| parse_address("trusted_permit2_spenders entry", address))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                ArcusSpotError::InvalidConfig(format!(
+                    "trusted_permit2_spenders is misconfigured: {error}"
+                ))
+            })?;
         response.payload.validate(&QuoteExpectations {
             chain_id: self.inner.config.chain_id,
             sell_token: sell_address,
@@ -884,6 +828,7 @@ impl ArcusSpotClient {
             slippage_bps: request.slippage_bps,
             route_policy: request.route_policy,
             now_unix,
+            trusted_spenders,
         })?;
         Ok(ArcusSpotSignableQuoteObservation {
             chain_id: self.inner.config.chain_id,
@@ -904,6 +849,7 @@ struct QuoteExpectations {
     slippage_bps: u32,
     route_policy: ArcusSpotQuoteRoutePolicy,
     now_unix: u64,
+    trusted_spenders: Vec<Address>,
 }
 
 fn validate_slippage_floor(
@@ -1080,11 +1026,6 @@ const RIALTO_WITNESS_FIELDS: &[(&str, &str)] = &[
     ("actionsHash", "bytes32"),
 ];
 
-const LIFI_WITNESS_FIELDS: &[(&str, &str)] = &[
-    ("diamondAddress", "address"),
-    ("diamondCalldataHash", "bytes32"),
-];
-
 /// The canonical witness struct name and complete, ordered field list a venue
 /// must declare for its signature to bind the values this module reads.
 struct WitnessSchema {
@@ -1105,10 +1046,12 @@ fn canonical_witness_schema(venue: &str) -> Result<WitnessSchema, ArcusSpotError
             type_name: "RialtoSwap",
             fields: RIALTO_WITNESS_FIELDS,
         }),
-        "lifi" => Ok(WitnessSchema {
-            type_name: "LiFiCall",
-            fields: LIFI_WITNESS_FIELDS,
-        }),
+        // LiFi is deliberately excluded: its witness commits only to a hash
+        // of opaque diamond calldata, and without a maintained LiFi facet ABI
+        // to decode that calldata, this module cannot verify the recipient,
+        // output token, or minimum output it actually encodes. It is refused
+        // like any other unrecognized venue rather than accepted on unsigned
+        // metadata alone.
         other => Err(ArcusSpotError::InvalidResponse(format!(
             "venue {other} has no signable-quote validator and cannot be trusted"
         ))),
@@ -1150,20 +1093,6 @@ fn require_exact_eip712_fields(
         )));
     }
     Ok(())
-}
-
-/// Whether `address` appears as a 32-byte-aligned ABI parameter anywhere in
-/// `calldata` after its 4-byte selector. Real transfer/swap/bridge calldata
-/// always encodes address arguments this way, so this is a lightweight bound
-/// on what a signed-but-undecoded calldata blob can be doing without needing
-/// venue-specific ABI knowledge.
-fn calldata_references_address(calldata: &[u8], address: Address) -> bool {
-    if calldata.len() <= 4 {
-        return false;
-    }
-    let mut padded = [0_u8; 32];
-    padded[12..].copy_from_slice(address.as_bytes());
-    calldata[4..].chunks_exact(32).any(|word| word == padded)
 }
 
 fn pointer_address(value: &Value, pointer: &str, field: &str) -> Result<Address, ArcusSpotError> {
@@ -1345,6 +1274,9 @@ mod tests {
     const SELL_TOKEN: &str = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC";
     const BUY_TOKEN: &str = "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC";
 
+    const ARCUS_SPENDER: &str = "0x006102b16A04c20306A28b652745D3973D7D24fa";
+    const RIALTO_SPENDER: &str = "0xc94135b63772b91d79d0a2daab2a8801f32359bd";
+
     fn fixture_expectations() -> QuoteExpectations {
         QuoteExpectations {
             chain_id: 4663,
@@ -1355,6 +1287,10 @@ mod tests {
             slippage_bps: 37,
             route_policy: ArcusSpotQuoteRoutePolicy::DirectTokenOnly,
             now_unix: 1_700_000_000,
+            trusted_spenders: vec![
+                parse_address("arcus spender", ARCUS_SPENDER).unwrap(),
+                parse_address("rialto spender", RIALTO_SPENDER).unwrap(),
+            ],
         }
     }
 
@@ -1394,7 +1330,7 @@ mod tests {
     fn fixture_validates_every_venue_typed_data_and_cost_field() {
         let response: ArcusSpotSignableQuoteResponse = serde_json::from_str(QUOTE_FIXTURE).unwrap();
         response.validate(&fixture_expectations()).unwrap();
-        assert_eq!(response.quotes.len(), 3);
+        assert_eq!(response.quotes.len(), 2);
         assert_eq!(response.recommended_quote().unwrap().venue, "arcus");
         for quote in &response.quotes {
             assert_eq!(quote.eip712_digest().unwrap().len(), 66);
@@ -1425,7 +1361,7 @@ mod tests {
         assert_eq!(analysis.mode, "public_pre_sign_quote_read_only");
         assert!(analysis.arcus_route_policy_validated);
         assert!(analysis.non_funded_sell_balance_confirmed);
-        assert_eq!(analysis.venues.len(), 3);
+        assert_eq!(analysis.venues.len(), 2);
         let arcus = analysis
             .venues
             .iter()
@@ -1465,7 +1401,36 @@ mod tests {
     }
 
     #[test]
-    fn wrong_permit2_or_lifi_calldata_binding_is_rejected() {
+    fn untrusted_spender_is_rejected_even_when_internally_consistent() {
+        // The router substitutes an unrelated (but otherwise consistently
+        // echoed) spender address for the arcus venue. Nothing else in the
+        // response contradicts it, so only an independent allowlist can
+        // catch this.
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let rogue = "0x0000000000000000000000000000000000000bad";
+        response.quotes[0].to_sign["message"]["spender"] = Value::String(rogue.to_string());
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error.to_string().contains("trusted_permit2_spenders"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_trusted_spender_allowlist_rejects_every_quote() {
+        let response: ArcusSpotSignableQuoteResponse = serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let mut expected = fixture_expectations();
+        expected.trusted_spenders.clear();
+        let error = response.validate(&expected).unwrap_err();
+        assert!(
+            error.to_string().contains("trusted_permit2_spenders"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn wrong_permit2_binding_is_rejected() {
         let mut response: ArcusSpotSignableQuoteResponse =
             serde_json::from_str(QUOTE_FIXTURE).unwrap();
         response.quotes[0].to_sign["domain"]["verifyingContract"] =
@@ -1475,16 +1440,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("is not Permit2"));
-
-        let mut response: ArcusSpotSignableQuoteResponse =
-            serde_json::from_str(QUOTE_FIXTURE).unwrap();
-        response.quotes[2].tx.as_mut().unwrap()["diamondCalldata"] =
-            Value::String("0x01".to_string());
-        assert!(response
-            .validate(&fixture_expectations())
-            .unwrap_err()
-            .to_string()
-            .contains("diamondCalldata hash"));
     }
 
     #[test]
@@ -1527,45 +1482,21 @@ mod tests {
     }
 
     #[test]
-    fn lifi_calldata_not_referencing_expected_recipient_is_rejected() {
+    fn lifi_venue_is_rejected_outright() {
+        // LiFi's signed witness only commits to a hash of opaque diamond
+        // calldata; without a maintained LiFi facet ABI to decode it, this
+        // module cannot verify the actual recipient, output token, or
+        // minimum output it encodes, so the venue is refused outright even
+        // when every other check (Permit2 domain, EIP-712 schema, calldata
+        // hash) would otherwise pass.
         let mut response: ArcusSpotSignableQuoteResponse =
             serde_json::from_str(QUOTE_FIXTURE).unwrap();
-        let lifi = response
-            .quotes
-            .iter_mut()
-            .find(|quote| quote.venue == "lifi")
-            .unwrap();
-        // Hash-consistent calldata that does not encode the expected taker or
-        // buy token anywhere; only an unrelated decoy address is present.
-        lifi.tx.as_mut().unwrap()["diamondCalldata"] = Value::String(
-            "0xaabbccdd0000000000000000000000000000000000000000000000000000000000000099"
-                .to_string(),
-        );
-        lifi.to_sign["message"]["witness"]["diamondCalldataHash"] = Value::String(
-            "0x5dafc5958a8a7eeafac1368cb1db09246b4e81d32959d8a279d0ee0148ec51a3".to_string(),
-        );
+        let mut lifi = response.quotes[0].clone();
+        lifi.venue = "lifi".to_string();
+        response.quotes.push(lifi);
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not reference the expected recipient"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn lifi_missing_raw_route_metadata_is_rejected() {
-        let mut response: ArcusSpotSignableQuoteResponse =
-            serde_json::from_str(QUOTE_FIXTURE).unwrap();
-        let lifi = response
-            .quotes
-            .iter_mut()
-            .find(|quote| quote.venue == "lifi")
-            .unwrap();
-        lifi.raw = None;
-        let error = response.validate(&fixture_expectations()).unwrap_err();
-        assert!(
-            error.to_string().contains("omitted raw route metadata"),
+            error.to_string().contains("no signable-quote validator"),
             "unexpected error: {error}"
         );
     }
@@ -1596,6 +1527,24 @@ mod tests {
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
             error.to_string().contains("tx.to"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn excessively_long_lived_deadline_is_rejected() {
+        // The deadline is not yet expired (receipt time is unchanged), but a
+        // year-2100 deadline lets a signed-but-unexercised intent sit idle
+        // and be exercised much later at a stale minimum price.
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        response.quotes[0].expiry = Some(4_102_444_800);
+        response.quotes[0].to_sign["message"]["deadline"] = Value::String("4102444800".to_string());
+        response.quotes[0].to_sign["message"]["witness"]["deadline"] =
+            Value::String("4102444800".to_string());
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error.to_string().contains("maximum signing TTL"),
             "unexpected error: {error}"
         );
     }
@@ -1653,15 +1602,37 @@ mod tests {
         (format!("http://{address}"), requests, server)
     }
 
+    /// QUOTE_FIXTURE's deadlines are fixed so tests can validate against the
+    /// fixed `fixture_expectations().now_unix`. This client-path test instead
+    /// runs against the real clock (its `now_unix` comes from the mock
+    /// server response's actual receipt time), so its deadlines must be live
+    /// (`now + a TTL within MAX_SIGNING_DEADLINE_TTL_SECS`) rather than fixed.
+    fn quote_fixture_with_live_deadlines() -> String {
+        let mut fixture: Value = serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let deadline = Utc::now().timestamp() + 60;
+        for quote in fixture["all"].as_array_mut().unwrap() {
+            if let Some(expiry) = quote.get_mut("expiry") {
+                *expiry = Value::from(deadline);
+            }
+            quote["toSign"]["message"]["deadline"] = Value::String(deadline.to_string());
+            quote["toSign"]["message"]["witness"]["deadline"] = Value::String(deadline.to_string());
+        }
+        fixture.to_string()
+    }
+
     #[tokio::test]
     async fn client_uses_get_with_every_pre_sign_safety_parameter() {
-        let (base_url, requests, server) =
-            spawn_quote_server(vec![TOKEN_FIXTURE.to_string(), QUOTE_FIXTURE.to_string()]).await;
+        let (base_url, requests, server) = spawn_quote_server(vec![
+            TOKEN_FIXTURE.to_string(),
+            quote_fixture_with_live_deadlines(),
+        ])
+        .await;
         let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
             router_base_url: base_url.clone(),
             meta_base_url: base_url,
             min_request_interval_ms: 0,
             max_attempts: 1,
+            trusted_permit2_spenders: vec![ARCUS_SPENDER.to_string(), RIALTO_SPENDER.to_string()],
             ..super::super::ArcusSpotConfig::default()
         })
         .unwrap();
