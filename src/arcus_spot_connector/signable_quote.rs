@@ -606,6 +606,21 @@ impl ArcusSpotSignableQuoteResponse {
                 "signable quote response has no venue quotes".to_string(),
             ));
         }
+        // recommended_quote() below returns the *first* match by venue name,
+        // so two validated quotes sharing a venue would silently make that
+        // selection (and this response's "recommended" flag) ambiguous —
+        // round-trip and cost analysis could then use whichever one happens
+        // to be first in the array, which is not a property the response
+        // schema guarantees.
+        let mut seen_venues: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for quote in &self.quotes {
+            if !seen_venues.insert(quote.venue.to_ascii_lowercase()) {
+                return Err(ArcusSpotError::InvalidResponse(format!(
+                    "signable quote response has duplicate venue {:?}",
+                    quote.venue
+                )));
+            }
+        }
         for quote in &self.quotes {
             quote.validate(expected)?;
         }
@@ -1473,6 +1488,22 @@ mod tests {
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
             error.to_string().contains("trusted_permit2_spenders"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_venue_quotes_are_rejected() {
+        // recommended_quote() returns the *first* array match by venue
+        // name, so two validated quotes sharing a venue would make that
+        // selection ambiguous depending on array order.
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let duplicate = response.quotes[0].clone();
+        response.quotes.push(duplicate);
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate venue"),
             "unexpected error: {error}"
         );
     }
