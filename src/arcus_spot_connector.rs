@@ -78,6 +78,23 @@ pub struct ArcusSpotConfig {
     /// with the real per-chain venue deployment addresses before consuming
     /// this module's output as signing evidence.
     pub trusted_permit2_spenders: BTreeMap<String, Vec<String>>,
+    /// Deployer-controlled per-chain token symbol → address pin, hex-encoded
+    /// (case-insensitive), keyed by uppercase symbol (see `normalize_symbol`).
+    ///
+    /// `signable_quote_by_symbol` resolves `sellToken`/`buyToken` addresses
+    /// from the router's own `v1/tokens` list (via `verified_token`), and a
+    /// signable quote's Permit2 signature authorizes pulling exactly the
+    /// returned sell-token address. A compromised or misconfigured router
+    /// could map a requested symbol to a different, valuable token while
+    /// still marking it `verified`, so this independent, deployer-controlled
+    /// pin is required before that router-supplied address is trusted as
+    /// signing evidence. Left empty (the default), every signable quote is
+    /// refused rather than treated as validated on an unpinned address:
+    /// operators MUST populate this with the real per-chain token addresses
+    /// before consuming `signable_quote_by_symbol`'s output as signing
+    /// evidence. Read-only lookups (`verified_token`, `indicative_price*`,
+    /// `refresh_tokens`) do not consult this map.
+    pub trusted_token_addresses: BTreeMap<String, String>,
 }
 
 impl Default for ArcusSpotConfig {
@@ -97,6 +114,7 @@ impl Default for ArcusSpotConfig {
                 env!("CARGO_PKG_VERSION")
             ),
             trusted_permit2_spenders: BTreeMap::new(),
+            trusted_token_addresses: BTreeMap::new(),
         }
     }
 }

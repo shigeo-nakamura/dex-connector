@@ -6,8 +6,8 @@
 //! deliberately cannot sign or submit them.
 
 use super::{
-    parse_raw_amount, validate_token, ArcusSpotClient, ArcusSpotError, ArcusSpotObservation,
-    ArcusSpotToken,
+    normalize_symbol, parse_raw_amount, validate_token, ArcusSpotClient, ArcusSpotError,
+    ArcusSpotObservation, ArcusSpotToken,
 };
 use ethers::types::{
     transaction::eip712::{Eip712, TypedData, Types as Eip712Types},
@@ -353,6 +353,26 @@ impl ArcusSpotSignableVenueQuote {
                 "venue {} Permit2 domain unexpectedly includes version or salt",
                 self.venue
             )));
+        }
+        // `ethers`'s `encode_eip712()` derives the domain separator from the
+        // *parsed* `domain` struct above, independent of whatever `types`
+        // declares for `EIP712Domain` (if that entry is even present — it is
+        // optional per EIP-712). A signer consuming the raw typed-data JSON
+        // this module validates may instead honor a declared `EIP712Domain`
+        // schema, so a response that reorders its fields or changes a field
+        // type there (while the parsed values above still pass) can hash a
+        // payload the digest computed here does not represent. Validate the
+        // declaration against the canonical domain fields whenever supplied,
+        // matching exactly the fields this module already requires present
+        // (name, chainId, verifyingContract; version/salt are rejected
+        // above).
+        if typed_data.types.contains_key(EIP712_DOMAIN_TYPE_NAME) {
+            require_exact_eip712_fields(
+                &typed_data.types,
+                EIP712_DOMAIN_TYPE_NAME,
+                EIP712_DOMAIN_FIELDS,
+                &self.venue,
+            )?;
         }
         // A type name being present in `types` only means the schema declares
         // *a* struct with that name; it says nothing about which fields, in
@@ -820,6 +840,8 @@ impl ArcusSpotClient {
         let buy = self.verified_token(&request.buy_symbol).await?;
         validate_token(&sell)?;
         validate_token(&buy)?;
+        self.require_trusted_token_address(&sell)?;
+        self.require_trusted_token_address(&buy)?;
         if sell.chain_id != self.inner.config.chain_id || buy.chain_id != self.inner.config.chain_id
         {
             return Err(ArcusSpotError::InvalidResponse(format!(
@@ -887,6 +909,38 @@ impl ArcusSpotClient {
             buy_token: buy,
             response,
         })
+    }
+
+    /// Refuse a router-supplied token address that is not independently
+    /// pinned in `ArcusSpotConfig::trusted_token_addresses`.
+    ///
+    /// `verified_token` trusts the router's own `v1/tokens` list; if that
+    /// router is compromised or misconfigured it could map a requested
+    /// symbol to a different, valuable token address while still marking it
+    /// `verified`. Since a signable quote's Permit2 signature authorizes
+    /// pulling exactly the returned sell-token address, this independent
+    /// source of truth must confirm both legs before that address is treated
+    /// as signing evidence.
+    fn require_trusted_token_address(&self, token: &ArcusSpotToken) -> Result<(), ArcusSpotError> {
+        let key = normalize_symbol(&token.symbol);
+        let trusted_raw = self
+            .inner
+            .config
+            .trusted_token_addresses
+            .get(&key)
+            .ok_or_else(|| {
+                ArcusSpotError::InvalidConfig(format!(
+                    "trusted_token_addresses is not configured for symbol {key}; signable quotes cannot be trusted without a deployer-pinned address"
+                ))
+            })?;
+        let trusted_address = parse_address("trusted_token_addresses entry", trusted_raw)?;
+        let router_address = parse_address("token address", &token.address)?;
+        if trusted_address != router_address {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "token {key} address {router_address:#x} from the router does not match the trusted_token_addresses pin {trusted_address:#x}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1053,6 +1107,13 @@ fn pointer_value<'a>(
 }
 
 const TOKEN_PERMISSIONS_FIELDS: &[(&str, &str)] = &[("token", "address"), ("amount", "uint256")];
+
+const EIP712_DOMAIN_TYPE_NAME: &str = "EIP712Domain";
+const EIP712_DOMAIN_FIELDS: &[(&str, &str)] = &[
+    ("name", "string"),
+    ("chainId", "uint256"),
+    ("verifyingContract", "address"),
+];
 
 const ARCUS_WITNESS_FIELDS: &[(&str, &str)] = &[
     ("taker", "address"),
@@ -1484,7 +1545,8 @@ mod tests {
         let mut response: ArcusSpotSignableQuoteResponse =
             serde_json::from_str(QUOTE_FIXTURE).unwrap();
         assert_eq!(response.quotes[0].venue, "arcus");
-        response.quotes[0].to_sign["message"]["spender"] = Value::String(RIALTO_SPENDER.to_string());
+        response.quotes[0].to_sign["message"]["spender"] =
+            Value::String(RIALTO_SPENDER.to_string());
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
             error.to_string().contains("trusted_permit2_spenders"),
@@ -1563,6 +1625,32 @@ mod tests {
             .as_array_mut()
             .unwrap();
         witness_fields.swap(0, 1);
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("do not exactly match the canonical schema"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn declared_eip712_domain_schema_mismatch_is_rejected() {
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let rialto = response
+            .quotes
+            .iter_mut()
+            .find(|quote| quote.venue == "rialto")
+            .unwrap();
+        // The parsed `domain` struct (name/chainId/verifyingContract) is
+        // unchanged, but the declared EIP712Domain type reorders two fields;
+        // `encode_eip712()` would still hash the parsed struct, hiding a
+        // digest mismatch a schema-honoring signer would produce.
+        let domain_fields = rialto.to_sign["types"]["EIP712Domain"]
+            .as_array_mut()
+            .unwrap();
+        domain_fields.swap(0, 1);
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
             error
@@ -1712,6 +1800,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpinned_token_symbol_is_rejected() {
+        let (base_url, _requests, server) =
+            spawn_quote_server(vec![TOKEN_FIXTURE.to_string()]).await;
+        let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 1,
+            trusted_permit2_spenders: BTreeMap::from([
+                ("arcus".to_string(), vec![ARCUS_SPENDER.to_string()]),
+                ("rialto".to_string(), vec![RIALTO_SPENDER.to_string()]),
+            ]),
+            // trusted_token_addresses left empty: the router's own token
+            // list must not be trusted as signing evidence on its own.
+            ..super::super::ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let request = ArcusSpotSignableQuoteRequest::new(
+            "NVDA",
+            "AMD",
+            "1000",
+            TEST_TAKER,
+            37,
+            ArcusSpotQuoteRoutePolicy::DirectTokenOnly,
+        );
+        let error = client.signable_quote_by_symbol(&request).await.unwrap_err();
+        assert!(
+            error.to_string().contains("trusted_token_addresses"),
+            "unexpected error: {error}"
+        );
+        // The server only ever received the /v1/tokens request; the pin
+        // check must fail before a /v1/quote request is made.
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn router_token_address_mismatched_with_pin_is_rejected() {
+        let (base_url, _requests, server) =
+            spawn_quote_server(vec![TOKEN_FIXTURE.to_string()]).await;
+        let wrong_address = "0x0000000000000000000000000000000000000bad";
+        let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 1,
+            trusted_permit2_spenders: BTreeMap::from([
+                ("arcus".to_string(), vec![ARCUS_SPENDER.to_string()]),
+                ("rialto".to_string(), vec![RIALTO_SPENDER.to_string()]),
+            ]),
+            trusted_token_addresses: BTreeMap::from([
+                ("NVDA".to_string(), wrong_address.to_string()),
+                ("AMD".to_string(), BUY_TOKEN.to_string()),
+            ]),
+            ..super::super::ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let request = ArcusSpotSignableQuoteRequest::new(
+            "NVDA",
+            "AMD",
+            "1000",
+            TEST_TAKER,
+            37,
+            ArcusSpotQuoteRoutePolicy::DirectTokenOnly,
+        );
+        let error = client.signable_quote_by_symbol(&request).await.unwrap_err();
+        assert!(
+            error.to_string().contains("trusted_token_addresses pin"),
+            "unexpected error: {error}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn client_uses_get_with_every_pre_sign_safety_parameter() {
         let (base_url, requests, server) = spawn_quote_server(vec![
             TOKEN_FIXTURE.to_string(),
@@ -1726,6 +1887,10 @@ mod tests {
             trusted_permit2_spenders: BTreeMap::from([
                 ("arcus".to_string(), vec![ARCUS_SPENDER.to_string()]),
                 ("rialto".to_string(), vec![RIALTO_SPENDER.to_string()]),
+            ]),
+            trusted_token_addresses: BTreeMap::from([
+                ("NVDA".to_string(), SELL_TOKEN.to_string()),
+                ("AMD".to_string(), BUY_TOKEN.to_string()),
             ]),
             ..super::super::ArcusSpotConfig::default()
         })
@@ -1842,8 +2007,34 @@ mod tests {
                     .push(address.trim().to_string());
                 map
             });
+        // trusted_token_addresses is left empty by ArcusSpotConfig::default(),
+        // which now rejects every symbol fail-closed; this smoke test needs
+        // the real deployment token addresses to reach its assertions.
+        let trusted_token_addresses = std::env::var("ARCUS_SPOT_TEST_TRUSTED_TOKEN_ADDRESSES")
+            .expect(
+                "set ARCUS_SPOT_TEST_TRUSTED_TOKEN_ADDRESSES to a comma-separated list of \
+                 symbol:address pairs (e.g. NVDA:0x...,AMD:0x...) naming the real per-chain \
+                 token addresses for the symbols under test",
+            )
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let (symbol, address) = entry.split_once(':').unwrap_or_else(|| {
+                    panic!(
+                        "ARCUS_SPOT_TEST_TRUSTED_TOKEN_ADDRESSES entry {entry:?} must be \
+                         symbol:address"
+                    )
+                });
+                (
+                    symbol.trim().to_ascii_uppercase(),
+                    address.trim().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
             trusted_permit2_spenders,
+            trusted_token_addresses,
             ..super::super::ArcusSpotConfig::default()
         })
         .unwrap();
