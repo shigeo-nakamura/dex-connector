@@ -411,10 +411,22 @@ impl ArcusSpotSignableVenueQuote {
         // pull the sell token, a compromised or misconfigured router could
         // otherwise substitute an unrelated contract and still pass. Refuse
         // to treat any quote as validated unless the deployer has configured
-        // at least one trusted spender for this chain.
-        if !expected.trusted_spenders.contains(&spender) {
+        // at least one trusted spender for this chain. Checked per venue,
+        // not against one shared set: a response labeled e.g. "arcus" must
+        // use the Arcus deployment's own spender, not an address only
+        // trusted for a different venue such as Rialto, otherwise a
+        // compromised or misconfigured router could mislabel a quote to
+        // reuse another venue's trusted spender while still going through
+        // this venue's (mismatched) settlement semantics.
+        let venue_key = self.venue.to_ascii_lowercase();
+        let trusted_for_venue = expected
+            .trusted_spenders
+            .get(&venue_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if !trusted_for_venue.contains(&spender) {
             return Err(ArcusSpotError::InvalidResponse(format!(
-                "venue {} EIP-712 spender {spender:#x} is not in the configured trusted_permit2_spenders allowlist",
+                "venue {} EIP-712 spender {spender:#x} is not in the configured trusted_permit2_spenders allowlist for that venue",
                 self.venue
             )));
         }
@@ -829,13 +841,19 @@ impl ArcusSpotClient {
             .config
             .trusted_permit2_spenders
             .iter()
-            .map(|address| parse_address("trusted_permit2_spenders entry", address))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                ArcusSpotError::InvalidConfig(format!(
-                    "trusted_permit2_spenders is misconfigured: {error}"
-                ))
-            })?;
+            .map(|(venue, addresses)| {
+                let parsed = addresses
+                    .iter()
+                    .map(|address| parse_address("trusted_permit2_spenders entry", address))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        ArcusSpotError::InvalidConfig(format!(
+                            "trusted_permit2_spenders is misconfigured for venue {venue}: {error}"
+                        ))
+                    })?;
+                Ok((venue.to_ascii_lowercase(), parsed))
+            })
+            .collect::<Result<BTreeMap<_, _>, ArcusSpotError>>()?;
         response.payload.validate(&QuoteExpectations {
             chain_id: self.inner.config.chain_id,
             sell_token: sell_address,
@@ -866,7 +884,9 @@ struct QuoteExpectations {
     slippage_bps: u32,
     route_policy: ArcusSpotQuoteRoutePolicy,
     now_unix: u64,
-    trusted_spenders: Vec<Address>,
+    /// Trusted Permit2 spenders keyed by lowercase venue name; see
+    /// `ArcusSpotConfig::trusted_permit2_spenders`.
+    trusted_spenders: BTreeMap<String, Vec<Address>>,
 }
 
 fn validate_slippage_floor(
@@ -1304,10 +1324,16 @@ mod tests {
             slippage_bps: 37,
             route_policy: ArcusSpotQuoteRoutePolicy::DirectTokenOnly,
             now_unix: 1_700_000_000,
-            trusted_spenders: vec![
-                parse_address("arcus spender", ARCUS_SPENDER).unwrap(),
-                parse_address("rialto spender", RIALTO_SPENDER).unwrap(),
-            ],
+            trusted_spenders: BTreeMap::from([
+                (
+                    "arcus".to_string(),
+                    vec![parse_address("arcus spender", ARCUS_SPENDER).unwrap()],
+                ),
+                (
+                    "rialto".to_string(),
+                    vec![parse_address("rialto spender", RIALTO_SPENDER).unwrap()],
+                ),
+            ]),
         }
     }
 
@@ -1427,6 +1453,23 @@ mod tests {
             serde_json::from_str(QUOTE_FIXTURE).unwrap();
         let rogue = "0x0000000000000000000000000000000000000bad";
         response.quotes[0].to_sign["message"]["spender"] = Value::String(rogue.to_string());
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error.to_string().contains("trusted_permit2_spenders"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn spender_trusted_for_a_different_venue_is_rejected() {
+        // The router labels the quote "arcus" but supplies Rialto's own
+        // trusted spender address. A shared, venue-blind allowlist would
+        // accept this since the address is trusted for *some* venue; it
+        // must only be accepted for the venue it actually belongs to.
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        assert_eq!(response.quotes[0].venue, "arcus");
+        response.quotes[0].to_sign["message"]["spender"] = Value::String(RIALTO_SPENDER.to_string());
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
             error.to_string().contains("trusted_permit2_spenders"),
@@ -1649,7 +1692,10 @@ mod tests {
             meta_base_url: base_url,
             min_request_interval_ms: 0,
             max_attempts: 1,
-            trusted_permit2_spenders: vec![ARCUS_SPENDER.to_string(), RIALTO_SPENDER.to_string()],
+            trusted_permit2_spenders: BTreeMap::from([
+                ("arcus".to_string(), vec![ARCUS_SPENDER.to_string()]),
+                ("rialto".to_string(), vec![RIALTO_SPENDER.to_string()]),
+            ]),
             ..super::super::ArcusSpotConfig::default()
         })
         .unwrap();
@@ -1746,13 +1792,25 @@ mod tests {
         // the real deployment spender addresses to reach its assertions.
         let trusted_permit2_spenders = std::env::var("ARCUS_SPOT_TEST_TRUSTED_PERMIT2_SPENDERS")
             .expect(
-                "set ARCUS_SPOT_TEST_TRUSTED_PERMIT2_SPENDERS to a comma-separated list of the \
-                 real per-chain Permit2 spender addresses for the venues under test",
+                "set ARCUS_SPOT_TEST_TRUSTED_PERMIT2_SPENDERS to a comma-separated list of \
+                 venue:address pairs (e.g. arcus:0x...,rialto:0x...) naming the real per-chain \
+                 Permit2 spender addresses for the venues under test",
             )
             .split(',')
-            .map(|address| address.trim().to_string())
-            .filter(|address| !address.is_empty())
-            .collect();
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .fold(std::collections::BTreeMap::new(), |mut map, entry| {
+                let (venue, address) = entry.split_once(':').unwrap_or_else(|| {
+                    panic!(
+                        "ARCUS_SPOT_TEST_TRUSTED_PERMIT2_SPENDERS entry {entry:?} must be \
+                         venue:address"
+                    )
+                });
+                map.entry(venue.trim().to_ascii_lowercase())
+                    .or_insert_with(Vec::new)
+                    .push(address.trim().to_string());
+                map
+            });
         let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
             trusted_permit2_spenders,
             ..super::super::ArcusSpotConfig::default()

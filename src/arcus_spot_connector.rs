@@ -57,20 +57,27 @@ pub struct ArcusSpotConfig {
     pub max_retry_delay_ms: u64,
     pub user_agent: String,
     /// Permit2 `spender` addresses this deployment recognizes as genuine
-    /// venue settlement contracts on `chain_id`, hex-encoded (case-insensitive).
+    /// venue settlement contracts on `chain_id`, hex-encoded
+    /// (case-insensitive), keyed by lowercase venue name (e.g. `"arcus"`,
+    /// `"rialto"`).
     ///
     /// A signable quote's Permit2 signature authorizes this address to pull
     /// the sell token; the spender is also responsible for enforcing the
     /// signed witness's semantics once it executes. Comparing it only against
     /// other fields in the same (attacker-influenceable) response, as the
     /// venue-specific checks already do, cannot detect a compromised or
-    /// misconfigured router substituting an unrelated contract, so this list
+    /// misconfigured router substituting an unrelated contract, so this map
     /// is checked as an independent, deployer-controlled source of truth.
+    /// It is keyed per venue rather than one shared set: a response labeled
+    /// `"arcus"` must use the Arcus deployment's own spender, not any
+    /// address trusted for a different venue, since a compromised or
+    /// misconfigured router could otherwise mislabel a quote naming one
+    /// venue's spender while claiming another venue's settlement semantics.
     /// Left empty (the default), every quote is refused rather than treated
     /// as validated on an unverified spender: operators MUST populate this
     /// with the real per-chain venue deployment addresses before consuming
     /// this module's output as signing evidence.
-    pub trusted_permit2_spenders: Vec<String>,
+    pub trusted_permit2_spenders: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for ArcusSpotConfig {
@@ -89,7 +96,7 @@ impl Default for ArcusSpotConfig {
                 "dex-connector/{}/arcus-spot-readonly",
                 env!("CARGO_PKG_VERSION")
             ),
-            trusted_permit2_spenders: Vec::new(),
+            trusted_permit2_spenders: BTreeMap::new(),
         }
     }
 }
