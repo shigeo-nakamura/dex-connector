@@ -176,17 +176,23 @@ jobs:
 
           # `aws ssm wait command-executed` polls every 5s for a fixed 20
           # attempts (100s max) and exits 255 on timeout even if the remote
-          # command is still genuinely running. The recorder's oneshot can
-          # legitimately exceed that under configured retries (Codex P2
-          # follow-up, dex-connector#48), which would let the workflow report
-          # failure and release its concurrency lock while the SSM command
-          # keeps running server-side. Poll manually with a generous cap.
+          # command is still genuinely running. The recorder issues up to 27
+          # sequential GETs (3 metadata + 12 round trips x 2 legs), each
+          # allowing 3 attempts at a 30s client timeout, so a legitimate
+          # slow/retrying invocation can take ~40 minutes worst case (Codex
+          # P2 follow-up, dex-connector#48); poll manually with a cap well
+          # above that instead. `get-command-invocation` can also transiently
+          # return InvocationDoesNotExist immediately after send-command (AWS
+          # docs: results "might not be immediately visible to all
+          # subsequent commands"), which surfaces here as an empty STATUS --
+          # treat that as pending and retry rather than treating it as a
+          # terminal failure.
           set +e
           STATUS="Pending"
-          for _ in $(seq 1 60); do
+          for _ in $(seq 1 200); do
             STATUS=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
             case "$STATUS" in
-              Pending|InProgress|Delayed) sleep 10 ;;
+              Pending|InProgress|Delayed|"") sleep 15 ;;
               *) break ;;
             esac
           done
