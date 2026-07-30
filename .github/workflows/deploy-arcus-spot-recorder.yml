@@ -145,7 +145,8 @@ jobs:
             "commands": [
               "set -e",
               "id -u arcus >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /sbin/nologin arcus",
-              "sudo systemctl stop arcus-spot-rust-recorder.timer arcus-spot-rust-recorder.service 2>/dev/null || true",
+              "sudo systemctl disable --now arcus-spot-rust-recorder.timer 2>/dev/null || true",
+              "sudo systemctl stop arcus-spot-rust-recorder.service 2>/dev/null || true",
               "aws s3 cp s3://__S3_BUCKET__/__ARCUS_S3_PREFIX__/arcus-spot-recorder /usr/local/bin/arcus-spot-recorder && sudo chmod 755 /usr/local/bin/arcus-spot-recorder && sudo chown root:root /usr/local/bin/arcus-spot-recorder",
               "aws s3 cp s3://__S3_BUCKET__/__ARCUS_S3_PREFIX__/verify-arcus-recorder.sh /tmp/verify-arcus-recorder.sh && sudo chmod +x /tmp/verify-arcus-recorder.sh",
               "aws s3 cp s3://__S3_BUCKET__/__UNIT_S3_KEY__ /tmp/arcus-spot-rust-recorder.service",
