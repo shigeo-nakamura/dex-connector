@@ -28,6 +28,14 @@ const PERMIT2_ADDRESS: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 /// minimum price. Cap how far past receipt a signed deadline may sit.
 const MAX_SIGNING_DEADLINE_TTL_SECS: u64 = 300;
 
+/// `expected.now_unix` is truncated to whole seconds from the response's
+/// receipt time, so a `deadline` just one second past it can still leave a
+/// genuine remaining lifetime anywhere from a few milliseconds up to just
+/// under two seconds — not enough to survive EIP-712 validation and the
+/// caller signing it. Require this many whole seconds of slack past the
+/// truncated receipt time before treating a quote as signable.
+const MIN_SIGNING_DEADLINE_TTL_SECS: u64 = 5;
+
 /// Whether the pre-sign quote may fall back to Arcus wrapped-token delivery.
 ///
 /// DirectTokenOnly is the safe default for dry-run evidence because wrapped
@@ -297,6 +305,12 @@ impl ArcusSpotSignableVenueQuote {
             )));
         }
         let ttl_secs = deadline.saturating_sub(expected.now_unix);
+        if ttl_secs < MIN_SIGNING_DEADLINE_TTL_SECS {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "venue {} quote deadline {} is only {ttl_secs}s after receipt time {}, below the {MIN_SIGNING_DEADLINE_TTL_SECS}s minimum usable signing TTL",
+                self.venue, deadline, expected.now_unix
+            )));
+        }
         if ttl_secs > MAX_SIGNING_DEADLINE_TTL_SECS {
             return Err(ArcusSpotError::InvalidResponse(format!(
                 "venue {} quote deadline {} is {ttl_secs}s after receipt time {}, exceeding the {MAX_SIGNING_DEADLINE_TTL_SECS}s maximum signing TTL",
@@ -1724,6 +1738,26 @@ mod tests {
         let error = response.validate(&fixture_expectations()).unwrap_err();
         assert!(
             error.to_string().contains("maximum signing TTL"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_deadline_only_seconds_after_receipt_is_rejected() {
+        // now_unix is truncated to whole seconds from the response's
+        // receipt time, so a deadline only 2s past it can leave anywhere
+        // from a few milliseconds to just under 2s of genuine remaining
+        // lifetime — not enough to survive EIP-712 validation and signing.
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let near_deadline = fixture_expectations().now_unix + 2;
+        response.quotes[0].expiry = Some(near_deadline);
+        response.quotes[0].to_sign["message"]["deadline"] = Value::String(near_deadline.to_string());
+        response.quotes[0].to_sign["message"]["witness"]["deadline"] =
+            Value::String(near_deadline.to_string());
+        let error = response.validate(&fixture_expectations()).unwrap_err();
+        assert!(
+            error.to_string().contains("minimum usable signing TTL"),
             "unexpected error: {error}"
         );
     }
