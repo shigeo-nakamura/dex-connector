@@ -82,7 +82,7 @@ jobs:
               fi; \
               export PATH=/workspace/.cache/cargo/bin:\$PATH; \
               rustc -V; cargo -V; \
-              cargo build --release --bin arcus-spot-recorder --features arcus-spot-sdk; \
+              cargo build --release --bin arcus-spot-recorder --no-default-features --features arcus-spot-sdk; \
               chown -R \${HOST_UID}:\${HOST_GID} /workspace/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cache permissions
