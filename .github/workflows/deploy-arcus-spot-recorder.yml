@@ -152,12 +152,11 @@ jobs:
               "if [ ! -f /etc/systemd/system/arcus-spot-rust-recorder.service ] || ! cmp -s /etc/systemd/system/arcus-spot-rust-recorder.service /tmp/arcus-spot-rust-recorder.service; then sudo mv /tmp/arcus-spot-rust-recorder.service /etc/systemd/system/arcus-spot-rust-recorder.service; sudo systemctl daemon-reload; else rm /tmp/arcus-spot-rust-recorder.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__TIMER_S3_KEY__ /tmp/arcus-spot-rust-recorder.timer",
               "if [ ! -f /etc/systemd/system/arcus-spot-rust-recorder.timer ] || ! cmp -s /etc/systemd/system/arcus-spot-rust-recorder.timer /tmp/arcus-spot-rust-recorder.timer; then sudo mv /tmp/arcus-spot-rust-recorder.timer /etc/systemd/system/arcus-spot-rust-recorder.timer; sudo systemctl daemon-reload; else rm /tmp/arcus-spot-rust-recorder.timer; fi",
-              "sudo systemctl enable arcus-spot-rust-recorder.timer",
               "f=/var/lib/debot-arcus/spot-rust/samples.jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/arcus_recorder_baseline; echo \"baseline=$(cat /tmp/arcus_recorder_baseline)\"",
               "sudo systemctl restart arcus-spot-rust-recorder.service",
               "sleep 3; systemctl is-active --quiet arcus-spot-rust-recorder.service || true",
               "sudo /tmp/verify-arcus-recorder.sh /var/lib/debot-arcus/spot-rust/samples.jsonl /tmp/arcus_recorder_baseline 12",
-              "sudo systemctl start arcus-spot-rust-recorder.timer && systemctl list-timers arcus-spot-rust-recorder.timer --no-pager | tail -3"
+              "sudo systemctl enable --now arcus-spot-rust-recorder.timer && systemctl list-timers arcus-spot-rust-recorder.timer --no-pager | tail -3"
             ]
           }
           JSON

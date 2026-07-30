@@ -44,6 +44,16 @@ python3 - "$f" "$expected_rows" <<'PY'
 import json
 import sys
 
+# Must match dex-connector's SUPPORTED_RECORDER_SCHEMA_VERSION /
+# PUBLIC_RECORDER_MODE (src/arcus_spot_connector/recorder.rs) and the
+# consuming pairtrade runtime's SUPPORTED_RECORDER_SCHEMA_VERSION /
+# PUBLIC_RECORDER_MODE (src/arcus_spot/runtime.rs). A row count match alone
+# does not prove the deployed binary's envelope is still consumable: a
+# schema/mode change without a matching row-count change would otherwise
+# deploy green while breaking every downstream reader.
+EXPECTED_SCHEMA_VERSION = 3
+EXPECTED_MODE = "public_indicative_read_only"
+
 path, expected = sys.argv[1], int(sys.argv[2])
 with open(path, "rb") as handle:
     last = None
@@ -56,6 +66,20 @@ if last is None:
     sys.exit(1)
 
 row = json.loads(last)
+schema_version = row.get("schema_version")
+if schema_version != EXPECTED_SCHEMA_VERSION:
+    print(
+        f"FAIL arcus-spot-rust-recorder: freshest line has schema_version="
+        f"{schema_version!r}, expected {EXPECTED_SCHEMA_VERSION!r}"
+    )
+    sys.exit(1)
+mode = row.get("mode")
+if mode != EXPECTED_MODE:
+    print(
+        f"FAIL arcus-spot-rust-recorder: freshest line has mode={mode!r}, "
+        f"expected {EXPECTED_MODE!r}"
+    )
+    sys.exit(1)
 round_trips = row.get("round_trips")
 if not isinstance(round_trips, list):
     print("FAIL arcus-spot-rust-recorder: freshest line has no round_trips array")
@@ -69,6 +93,6 @@ if len(round_trips) != expected:
 
 print(
     f"OK arcus-spot-rust-recorder: freshest line has {len(round_trips)} round trips "
-    f"(schema_version={row.get('schema_version')!r}, mode={row.get('mode')!r})"
+    f"(schema_version={schema_version!r}, mode={mode!r})"
 )
 PY
