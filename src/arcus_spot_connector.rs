@@ -95,6 +95,23 @@ pub struct ArcusSpotConfig {
     /// evidence. Read-only lookups (`verified_token`, `indicative_price*`,
     /// `refresh_tokens`) do not consult this map.
     pub trusted_token_addresses: BTreeMap<String, String>,
+    /// Deployer-controlled per-chain token symbol → decimals pin, keyed by
+    /// uppercase symbol (see `normalize_symbol`).
+    ///
+    /// The router's `v1/tokens` list also supplies `decimals`, used to scale
+    /// raw on-chain amounts into human units before comparing a quote
+    /// against `sell_reference_price_usd`/`buy_reference_price_usd` in
+    /// `analyze()`. `trusted_token_addresses` pinning the address alone does
+    /// not protect this: a compromised or misconfigured router could report
+    /// incorrect `decimals` for the same (correctly pinned) address, and an
+    /// order-of-magnitude decimals error shifts `quote_to_reference_deviation_bps`
+    /// by a corresponding order of magnitude. Left empty (the default),
+    /// `signable_quote_by_symbol` refuses every quote rather than compute
+    /// this analysis on an unpinned decimals value: operators MUST populate
+    /// this with the real per-chain token decimals before consuming that
+    /// output. Read-only lookups (`verified_token`, `indicative_price*`,
+    /// `refresh_tokens`) do not consult this map.
+    pub trusted_token_decimals: BTreeMap<String, u32>,
 }
 
 impl Default for ArcusSpotConfig {
@@ -115,6 +132,7 @@ impl Default for ArcusSpotConfig {
             ),
             trusted_permit2_spenders: BTreeMap::new(),
             trusted_token_addresses: BTreeMap::new(),
+            trusted_token_decimals: BTreeMap::new(),
         }
     }
 }

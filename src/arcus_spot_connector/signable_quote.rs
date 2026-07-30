@@ -925,8 +925,9 @@ impl ArcusSpotClient {
         })
     }
 
-    /// Refuse a router-supplied token address that is not independently
-    /// pinned in `ArcusSpotConfig::trusted_token_addresses`.
+    /// Refuse a router-supplied token address or decimals that are not
+    /// independently pinned in `ArcusSpotConfig::trusted_token_addresses` /
+    /// `trusted_token_decimals`.
     ///
     /// `verified_token` trusts the router's own `v1/tokens` list; if that
     /// router is compromised or misconfigured it could map a requested
@@ -934,7 +935,11 @@ impl ArcusSpotClient {
     /// `verified`. Since a signable quote's Permit2 signature authorizes
     /// pulling exactly the returned sell-token address, this independent
     /// source of truth must confirm both legs before that address is treated
-    /// as signing evidence.
+    /// as signing evidence. The address pin alone does not protect
+    /// `analyze()`'s quote_to_reference_deviation_bps: incorrect `decimals`
+    /// on an otherwise correctly-pinned address still scales that
+    /// comparison by a corresponding order of magnitude, so decimals are
+    /// pinned and checked here too.
     fn require_trusted_token_address(&self, token: &ArcusSpotToken) -> Result<(), ArcusSpotError> {
         let key = normalize_symbol(&token.symbol);
         let trusted_raw = self
@@ -952,6 +957,22 @@ impl ArcusSpotClient {
         if trusted_address != router_address {
             return Err(ArcusSpotError::InvalidResponse(format!(
                 "token {key} address {router_address:#x} from the router does not match the trusted_token_addresses pin {trusted_address:#x}"
+            )));
+        }
+        let trusted_decimals = self
+            .inner
+            .config
+            .trusted_token_decimals
+            .get(&key)
+            .ok_or_else(|| {
+                ArcusSpotError::InvalidConfig(format!(
+                    "trusted_token_decimals is not configured for symbol {key}; signable quotes cannot be trusted without a deployer-pinned decimals value"
+                ))
+            })?;
+        if *trusted_decimals != token.decimals {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "token {key} decimals {} from the router does not match the trusted_token_decimals pin {trusted_decimals}",
+                token.decimals
             )));
         }
         Ok(())
@@ -1907,6 +1928,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_token_decimals_mismatched_with_pin_is_rejected() {
+        // The address pin matches, but the router reports 18 decimals for
+        // NVDA while only 6 is pinned as trusted: an address pin alone does
+        // not protect quote_to_reference_deviation_bps from an incorrect
+        // decimals value on that same, correctly-pinned address.
+        let (base_url, _requests, server) =
+            spawn_quote_server(vec![TOKEN_FIXTURE.to_string()]).await;
+        let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
+            router_base_url: base_url.clone(),
+            meta_base_url: base_url,
+            min_request_interval_ms: 0,
+            max_attempts: 1,
+            trusted_permit2_spenders: BTreeMap::from([
+                ("arcus".to_string(), vec![ARCUS_SPENDER.to_string()]),
+                ("rialto".to_string(), vec![RIALTO_SPENDER.to_string()]),
+            ]),
+            trusted_token_addresses: BTreeMap::from([
+                ("NVDA".to_string(), SELL_TOKEN.to_string()),
+                ("AMD".to_string(), BUY_TOKEN.to_string()),
+            ]),
+            trusted_token_decimals: BTreeMap::from([
+                ("NVDA".to_string(), 6),
+                ("AMD".to_string(), 18),
+            ]),
+            ..super::super::ArcusSpotConfig::default()
+        })
+        .unwrap();
+        let request = ArcusSpotSignableQuoteRequest::new(
+            "NVDA",
+            "AMD",
+            "1000",
+            TEST_TAKER,
+            37,
+            ArcusSpotQuoteRoutePolicy::DirectTokenOnly,
+        );
+        let error = client.signable_quote_by_symbol(&request).await.unwrap_err();
+        assert!(
+            error.to_string().contains("trusted_token_decimals pin"),
+            "unexpected error: {error}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn client_uses_get_with_every_pre_sign_safety_parameter() {
         let (base_url, requests, server) = spawn_quote_server(vec![
             TOKEN_FIXTURE.to_string(),
@@ -1925,6 +1990,10 @@ mod tests {
             trusted_token_addresses: BTreeMap::from([
                 ("NVDA".to_string(), SELL_TOKEN.to_string()),
                 ("AMD".to_string(), BUY_TOKEN.to_string()),
+            ]),
+            trusted_token_decimals: BTreeMap::from([
+                ("NVDA".to_string(), 18),
+                ("AMD".to_string(), 18),
             ]),
             ..super::super::ArcusSpotConfig::default()
         })
@@ -2066,9 +2135,35 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        // trusted_token_decimals is left empty by ArcusSpotConfig::default(),
+        // which now rejects every symbol fail-closed; this smoke test needs
+        // the real deployment token decimals to reach its assertions.
+        let trusted_token_decimals = std::env::var("ARCUS_SPOT_TEST_TRUSTED_TOKEN_DECIMALS")
+            .expect(
+                "set ARCUS_SPOT_TEST_TRUSTED_TOKEN_DECIMALS to a comma-separated list of \
+                 symbol:decimals pairs (e.g. NVDA:18,AMD:18) naming the real per-chain \
+                 token decimals for the symbols under test",
+            )
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let (symbol, decimals) = entry.split_once(':').unwrap_or_else(|| {
+                    panic!(
+                        "ARCUS_SPOT_TEST_TRUSTED_TOKEN_DECIMALS entry {entry:?} must be \
+                         symbol:decimals"
+                    )
+                });
+                let decimals: u32 = decimals.trim().parse().unwrap_or_else(|error| {
+                    panic!("ARCUS_SPOT_TEST_TRUSTED_TOKEN_DECIMALS entry {entry:?}: {error}")
+                });
+                (symbol.trim().to_ascii_uppercase(), decimals)
+            })
+            .collect::<BTreeMap<_, _>>();
         let client = ArcusSpotClient::new(super::super::ArcusSpotConfig {
             trusted_permit2_spenders,
             trusted_token_addresses,
+            trusted_token_decimals,
             ..super::super::ArcusSpotConfig::default()
         })
         .unwrap();
