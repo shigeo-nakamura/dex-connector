@@ -210,10 +210,20 @@ jobs:
             esac
           done
           # If the loop exhausted its cap while the last-seen STATUS was
-          # still non-terminal (Codex P2 follow-up, dex-connector#48), the
-          # command may have completed during that final sleep; refresh
-          # STATUS once more so the exit check below reflects the true
-          # final state, matching what the printed report below shows.
-          STATUS=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
+          # still non-terminal, the command may have completed during that
+          # final sleep; refresh once more so the exit check reflects the
+          # true final state. Only do this when STATUS is still
+          # non-terminal: if the loop already observed a terminal status via
+          # `break`, a redundant lookup here can itself transiently fail
+          # (the polling loop above explicitly treats that as possible) and
+          # clobber a genuine Success with an empty string (Codex P2
+          # follow-up, dex-connector#48); and only overwrite STATUS if the
+          # refresh actually returned something.
+          case "$STATUS" in
+            Pending|InProgress|Delayed|"")
+              REFRESHED=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
+              [ -n "$REFRESHED" ] && STATUS="$REFRESHED"
+              ;;
+          esac
           aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --output text
           [ "$STATUS" = "Success" ]
