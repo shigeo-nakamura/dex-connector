@@ -155,7 +155,7 @@ jobs:
               "f=/var/lib/debot-arcus/spot-rust/samples.jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/arcus_recorder_baseline; echo \"baseline=$(cat /tmp/arcus_recorder_baseline)\"",
               "sudo systemctl restart arcus-spot-rust-recorder.service",
               "sleep 3; systemctl is-active --quiet arcus-spot-rust-recorder.service || true",
-              "sudo /tmp/verify-arcus-recorder.sh /var/lib/debot-arcus/spot-rust/samples.jsonl /tmp/arcus_recorder_baseline 12",
+              "sudo /tmp/verify-arcus-recorder.sh /var/lib/debot-arcus/spot-rust/samples.jsonl /tmp/arcus_recorder_baseline arcus-spot-rust-recorder",
               "sudo systemctl enable --now arcus-spot-rust-recorder.timer && systemctl list-timers arcus-spot-rust-recorder.timer --no-pager | tail -3"
             ]
           }
@@ -173,8 +173,21 @@ jobs:
             --query "Command.CommandId" \
             --output text)
 
+          # `aws ssm wait command-executed` polls every 5s for a fixed 20
+          # attempts (100s max) and exits 255 on timeout even if the remote
+          # command is still genuinely running. The recorder's oneshot can
+          # legitimately exceed that under configured retries (Codex P2
+          # follow-up, dex-connector#48), which would let the workflow report
+          # failure and release its concurrency lock while the SSM command
+          # keeps running server-side. Poll manually with a generous cap.
           set +e
-          aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}"
-          WAIT_STATUS=$?
+          STATUS="Pending"
+          for _ in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
+            case "$STATUS" in
+              Pending|InProgress|Delayed) sleep 10 ;;
+              *) break ;;
+            esac
+          done
           aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --output text
-          exit $WAIT_STATUS
+          [ "$STATUS" = "Success" ]
