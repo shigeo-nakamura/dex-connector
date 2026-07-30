@@ -133,7 +133,13 @@ jobs:
           # ExpiredToken, which the poll's stderr-discarding treats as an
           # empty (pending) status until the cap, failing a deployment that
           # may have actually succeeded (Codex P2 follow-up, dex-connector#48).
-          # Requires the debot-dashboard role's MaxSessionDuration >= this.
+          # AssumeRoleWithWebIdentity itself rejects a requested duration
+          # above the role's own MaxSessionDuration (IAM default: 3600s), so
+          # this alone would fail before SSM deployment even begins; the
+          # debot-dashboard role's MaxSessionDuration has already been
+          # raised to 10800s (applied 2026-07-30, out-of-band -- GitHub
+          # Actions has no permission to self-provision this) to
+          # accommodate it.
           role-duration-seconds: 8100
 
       # The timer is stopped before install (so an overlapping invocation
