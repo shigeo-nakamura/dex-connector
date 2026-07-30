@@ -1,16 +1,19 @@
-//! Strictly read-only Arcus Spot router client.
+//! Read-only Arcus Spot router client.
 //!
 //! This module intentionally exposes only public metadata, indicative-price,
-//! reference-price, and finalized-indexer GETs. It has no wallet, approval,
-//! signing, firm-quote, submission, or status-mutation surface. Arcus Spot is
-//! inventory-funded and does not fit the leveraged-perpetual
-//! [crate::DexConnector] contract, so the P0 client remains a separate API.
+//! pre-sign quote, reference-price, and finalized-indexer GETs. It can decode
+//! and validate EIP-712 payloads returned by `GET /v1/quote`, but has no
+//! wallet, approval, signing, submission, or status-mutation surface. Arcus
+//! Spot is inventory-funded and does not fit the leveraged-perpetual
+//! [crate::DexConnector] contract, so the client remains a separate API.
 
 mod indexer;
 mod recorder;
+mod signable_quote;
 
 pub use indexer::*;
 pub use recorder::*;
+pub use signable_quote::*;
 
 use chrono::{DateTime, Utc};
 use ethers::types::{Address, U256};
@@ -53,6 +56,62 @@ pub struct ArcusSpotConfig {
     pub retry_base_delay_ms: u64,
     pub max_retry_delay_ms: u64,
     pub user_agent: String,
+    /// Permit2 `spender` addresses this deployment recognizes as genuine
+    /// venue settlement contracts on `chain_id`, hex-encoded
+    /// (case-insensitive), keyed by lowercase venue name (e.g. `"arcus"`,
+    /// `"rialto"`).
+    ///
+    /// A signable quote's Permit2 signature authorizes this address to pull
+    /// the sell token; the spender is also responsible for enforcing the
+    /// signed witness's semantics once it executes. Comparing it only against
+    /// other fields in the same (attacker-influenceable) response, as the
+    /// venue-specific checks already do, cannot detect a compromised or
+    /// misconfigured router substituting an unrelated contract, so this map
+    /// is checked as an independent, deployer-controlled source of truth.
+    /// It is keyed per venue rather than one shared set: a response labeled
+    /// `"arcus"` must use the Arcus deployment's own spender, not any
+    /// address trusted for a different venue, since a compromised or
+    /// misconfigured router could otherwise mislabel a quote naming one
+    /// venue's spender while claiming another venue's settlement semantics.
+    /// Left empty (the default), every quote is refused rather than treated
+    /// as validated on an unverified spender: operators MUST populate this
+    /// with the real per-chain venue deployment addresses before consuming
+    /// this module's output as signing evidence.
+    pub trusted_permit2_spenders: BTreeMap<String, Vec<String>>,
+    /// Deployer-controlled per-chain token symbol → address pin, hex-encoded
+    /// (case-insensitive), keyed by uppercase symbol (see `normalize_symbol`).
+    ///
+    /// `signable_quote_by_symbol` resolves `sellToken`/`buyToken` addresses
+    /// from the router's own `v1/tokens` list (via `verified_token`), and a
+    /// signable quote's Permit2 signature authorizes pulling exactly the
+    /// returned sell-token address. A compromised or misconfigured router
+    /// could map a requested symbol to a different, valuable token while
+    /// still marking it `verified`, so this independent, deployer-controlled
+    /// pin is required before that router-supplied address is trusted as
+    /// signing evidence. Left empty (the default), every signable quote is
+    /// refused rather than treated as validated on an unpinned address:
+    /// operators MUST populate this with the real per-chain token addresses
+    /// before consuming `signable_quote_by_symbol`'s output as signing
+    /// evidence. Read-only lookups (`verified_token`, `indicative_price*`,
+    /// `refresh_tokens`) do not consult this map.
+    pub trusted_token_addresses: BTreeMap<String, String>,
+    /// Deployer-controlled per-chain token symbol → decimals pin, keyed by
+    /// uppercase symbol (see `normalize_symbol`).
+    ///
+    /// The router's `v1/tokens` list also supplies `decimals`, used to scale
+    /// raw on-chain amounts into human units before comparing a quote
+    /// against `sell_reference_price_usd`/`buy_reference_price_usd` in
+    /// `analyze()`. `trusted_token_addresses` pinning the address alone does
+    /// not protect this: a compromised or misconfigured router could report
+    /// incorrect `decimals` for the same (correctly pinned) address, and an
+    /// order-of-magnitude decimals error shifts `quote_to_reference_deviation_bps`
+    /// by a corresponding order of magnitude. Left empty (the default),
+    /// `signable_quote_by_symbol` refuses every quote rather than compute
+    /// this analysis on an unpinned decimals value: operators MUST populate
+    /// this with the real per-chain token decimals before consuming that
+    /// output. Read-only lookups (`verified_token`, `indicative_price*`,
+    /// `refresh_tokens`) do not consult this map.
+    pub trusted_token_decimals: BTreeMap<String, u32>,
 }
 
 impl Default for ArcusSpotConfig {
@@ -71,6 +130,9 @@ impl Default for ArcusSpotConfig {
                 "dex-connector/{}/arcus-spot-readonly",
                 env!("CARGO_PKG_VERSION")
             ),
+            trusted_permit2_spenders: BTreeMap::new(),
+            trusted_token_addresses: BTreeMap::new(),
+            trusted_token_decimals: BTreeMap::new(),
         }
     }
 }
