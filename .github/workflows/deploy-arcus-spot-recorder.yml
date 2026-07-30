@@ -134,7 +134,7 @@ jobs:
           # empty (pending) status until the cap, failing a deployment that
           # may have actually succeeded (Codex P2 follow-up, dex-connector#48).
           # Requires the debot-dashboard role's MaxSessionDuration >= this.
-          role-duration-seconds: 7200
+          role-duration-seconds: 8100
 
       # The timer is stopped before install (so an overlapping invocation
       # can't race the binary/unit swap) and the service is *restarted*,
