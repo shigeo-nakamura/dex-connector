@@ -119,7 +119,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 170
     environment: sidecar
     steps:
       - name: Configure AWS credentials
@@ -140,7 +140,7 @@ jobs:
           # raised to 10800s (applied 2026-07-30, out-of-band -- GitHub
           # Actions has no permission to self-provision this) to
           # accommodate it.
-          role-duration-seconds: 8100
+          role-duration-seconds: 9000
 
       # The timer is stopped before install (so an overlapping invocation
       # can't race the binary/unit swap) and the service is *restarted*,
@@ -182,11 +182,20 @@ jobs:
                   s|__UNIT_S3_KEY__|${UNIT_S3_KEY}|g; \
                   s|__TIMER_S3_KEY__|${TIMER_S3_KEY}|g" /tmp/ssm-params.json
 
+          # --timeout-seconds bounds SSM's *delivery* window (how long it
+          # waits for the instance to pick up and start the command) and is
+          # entirely separate from the document's own executionTimeout
+          # parameter; AWS's total command timeout is delivery + execution
+          # (same class of issue Codex flagged on the sibling
+          # bot-strategy#768 workflow). Set explicitly (matching the 600s
+          # default) so the local poll cap below can be sized against a
+          # known total instead of assuming the default.
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${ARCUS_INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy Arcus Spot Rust recorder (dex-connector)" \
             --parameters file:///tmp/ssm-params.json \
+            --timeout-seconds 600 \
             --query "Command.CommandId" \
             --output text)
 
@@ -200,15 +209,19 @@ jobs:
           # analysis Codex did for the sibling Python collector workflow
           # (bot-strategy#768, ~65min), this can comfortably exceed the
           # previous 40min estimate; poll manually with a cap well above
-          # that instead. `get-command-invocation` can also transiently
-          # return InvocationDoesNotExist immediately after send-command (AWS
-          # docs: results "might not be immediately visible to all
-          # subsequent commands"), which surfaces here as an empty STATUS --
-          # treat that as pending and retry rather than treating it as a
-          # terminal failure.
+          # that instead. AWS's total command timeout is delivery
+          # (--timeout-seconds above, 600s) plus execution (executionTimeout,
+          # 7200s) -- the poll cap must cover both, or a slow-to-pick-up
+          # instance can still legitimately be running past the cap.
+          # `get-command-invocation` can also transiently return
+          # InvocationDoesNotExist immediately after send-command (AWS docs:
+          # results "might not be immediately visible to all subsequent
+          # commands"), which surfaces here as an empty STATUS -- treat that
+          # as pending and retry rather than treating it as a terminal
+          # failure.
           set +e
           STATUS="Pending"
-          for _ in $(seq 1 480); do
+          for _ in $(seq 1 560); do
             STATUS=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
             case "$STATUS" in
               Pending|InProgress|Delayed|"") sleep 15 ;;
