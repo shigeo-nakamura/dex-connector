@@ -6,6 +6,14 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# systemd's manager default DefaultTimeoutStartSec is 90s, but the
+# recorder's own retry/backoff handling (including Retry-After) can
+# legitimately take well over an hour in the configured worst case (same
+# class of issue Codex flagged on the sibling Python collector unit,
+# bot-strategy#768); without an explicit TimeoutStartSec, systemd would
+# SIGTERM a still-legitimately-retrying invocation long before it can
+# finish or its own bounded max-attempts logic gives up.
+TimeoutStartSec=5400
 User=arcus
 Group=arcus
 ExecStart=/usr/local/bin/arcus-spot-recorder
