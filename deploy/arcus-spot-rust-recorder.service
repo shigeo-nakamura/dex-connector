@@ -1,0 +1,44 @@
+[Unit]
+Description=Arcus Spot Rust read-only indicative recorder canary
+Documentation=https://github.com/shigeo-nakamura/bot-strategy/issues/760
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# systemd's manager default DefaultTimeoutStartSec is 90s, but the
+# recorder's own retry/backoff handling (including Retry-After) can
+# legitimately take well over an hour in the configured worst case (same
+# class of issue Codex flagged on the sibling Python collector unit,
+# bot-strategy#768); without an explicit TimeoutStartSec, systemd would
+# SIGTERM a still-legitimately-retrying invocation long before it can
+# finish or its own bounded max-attempts logic gives up.
+TimeoutStartSec=5400
+User=arcus
+Group=arcus
+ExecStart=/usr/local/bin/arcus-spot-recorder
+Environment="ARCUS_SPOT_PAIRS=NVDA/AMD,SPY/QQQ,META/GOOGL"
+Environment="ARCUS_SPOT_NOTIONALS_USD=5,10,25,50"
+Environment="ARCUS_SPOT_MIN_REQUEST_INTERVAL_MS=250"
+Environment="ARCUS_SPOT_MAX_ATTEMPTS=3"
+Environment="ARCUS_SPOT_RETRY_BASE_DELAY_MS=500"
+Environment="ARCUS_SPOT_JSONL_PATH=/var/lib/debot-arcus/spot-rust/samples.jsonl"
+Environment="ARCUS_SPOT_LATEST_PATH=/var/lib/debot-arcus/spot-rust/latest.json"
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+StateDirectory=debot-arcus/spot-rust
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,248 @@
+name: Deploy Arcus Spot Rust recorder
+
+# Phase 0/1 read-only collector for the Arcus Spot pairtrade citizen
+# (bot-strategy#758, project 6 "Arcus"). Manual dispatch only. Models
+# deploy-rwa-logger.yml / deploy-sidecar.yml: build an aarch64 binary in a
+# QEMU arm64 AL2023 container, push to S3, then SSM-install on the dedicated
+# debot-arcus host.
+#
+# debot-arcus is a SEPARATE, SSM-only, no-inbound host from Frankfurt main
+# (bot-strategy#758). This workflow never touches debot-pair-btceth and has
+# no wallet/signing/submission capability — the recorder is public-GET
+# read-only (bot-strategy#760 P0).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "dex-connector ref to build from (default: whatever was checked out)"
+        required: false
+        type: string
+
+concurrency:
+  group: arcus-spot-recorder-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  ARCUS_S3_PREFIX: arcus-spot-recorder
+  UNIT_S3_KEY: deploy/arcus-spot-rust-recorder.service
+  TIMER_S3_KEY: deploy/arcus-spot-rust-recorder.timer
+  BUILD_REGION: eu-central-1
+  # bot-strategy#758: dedicated Frankfurt host, isolated from debot-pair-btceth.
+  ARCUS_INSTANCE_ID: i-0cb942c2950be020f
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: sidecar
+    steps:
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Cache cargo (linux/arm64)
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            target
+          key: ${{ runner.os }}-cargo-arm64-arcus-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64-arcus-
+
+      - name: Build arcus-spot-recorder (linux/arm64)
+        run: |
+          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/workspace/.cache/cargo \
+            -e RUSTUP_HOME=/workspace/.cache/rustup \
+            -e CARGO_INCREMENTAL=0 \
+            ${AL2023_IMAGE} \
+            /bin/bash -lc "set -euo pipefail; \
+              dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; \
+              if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then \
+                curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; \
+              fi; \
+              export PATH=/workspace/.cache/cargo/bin:\$PATH; \
+              rustc -V; cargo -V; \
+              cargo build --release --bin arcus-spot-recorder --features arcus-spot-sdk; \
+              chown -R \${HOST_UID}:\${HOST_GID} /workspace/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Fix cache permissions
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup target
+          fi
+
+      - name: Sanity-check binary
+        run: |
+          file "target/release/arcus-spot-recorder"
+          # Expect ARM aarch64 ELF — guard against an accidental host-arch build.
+          file "target/release/arcus-spot-recorder" | grep -q aarch64
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.BUILD_REGION }}
+
+      - name: Upload to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          aws s3 cp target/release/arcus-spot-recorder \
+            "s3://${S3_BUCKET}/${ARCUS_S3_PREFIX}/arcus-spot-recorder"
+          aws s3 cp deploy/arcus-spot-rust-recorder.service \
+            "s3://${S3_BUCKET}/${UNIT_S3_KEY}"
+          aws s3 cp deploy/arcus-spot-rust-recorder.timer \
+            "s3://${S3_BUCKET}/${TIMER_S3_KEY}"
+          aws s3 cp deploy/verify-arcus-recorder.sh \
+            "s3://${S3_BUCKET}/${ARCUS_S3_PREFIX}/verify-arcus-recorder.sh"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    environment: sidecar
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.BUILD_REGION }}
+          # configure-aws-credentials defaults role-duration-seconds to 3600s,
+          # but the SSM poll below can legitimately run up to 120min: an
+          # expired session makes get-command-invocation return
+          # ExpiredToken, which the poll's stderr-discarding treats as an
+          # empty (pending) status until the cap, failing a deployment that
+          # may have actually succeeded (Codex P2 follow-up, dex-connector#48).
+          # AssumeRoleWithWebIdentity itself rejects a requested duration
+          # above the role's own MaxSessionDuration (IAM default: 3600s), so
+          # this alone would fail before SSM deployment even begins; the
+          # debot-dashboard role's MaxSessionDuration has already been
+          # raised to 10800s (applied 2026-07-30, out-of-band -- GitHub
+          # Actions has no permission to self-provision this) to
+          # accommodate it.
+          role-duration-seconds: 9000
+
+      # The timer is stopped before install (so an overlapping invocation
+      # can't race the binary/unit swap) and the service is *restarted*,
+      # not started, before verification: on a redeploy overlapping the
+      # timer's own last invocation, `start` on an already-active oneshot
+      # unit is a no-op per systemd semantics, so the old binary's
+      # in-flight run could still write a valid sample and make
+      # verification pass without ever exercising the new binary (Codex
+      # P2 follow-up, dex-connector#48). The timer restarts at the very
+      # end, only after verification succeeds.
+      - name: Deploy via SSM (bootstrap, quiesce, install, verify, reactivate)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          cat > /tmp/ssm-params.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "id -u arcus >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /sbin/nologin arcus",
+              "sudo systemctl disable --now arcus-spot-rust-recorder.timer 2>/dev/null || true",
+              "sudo systemctl stop arcus-spot-rust-recorder.service 2>/dev/null || true",
+              "aws s3 cp s3://__S3_BUCKET__/__ARCUS_S3_PREFIX__/arcus-spot-recorder /usr/local/bin/arcus-spot-recorder && sudo chmod 755 /usr/local/bin/arcus-spot-recorder && sudo chown root:root /usr/local/bin/arcus-spot-recorder",
+              "aws s3 cp s3://__S3_BUCKET__/__ARCUS_S3_PREFIX__/verify-arcus-recorder.sh /tmp/verify-arcus-recorder.sh && sudo chmod +x /tmp/verify-arcus-recorder.sh",
+              "aws s3 cp s3://__S3_BUCKET__/__UNIT_S3_KEY__ /tmp/arcus-spot-rust-recorder.service",
+              "if [ ! -f /etc/systemd/system/arcus-spot-rust-recorder.service ] || ! cmp -s /etc/systemd/system/arcus-spot-rust-recorder.service /tmp/arcus-spot-rust-recorder.service; then sudo mv /tmp/arcus-spot-rust-recorder.service /etc/systemd/system/arcus-spot-rust-recorder.service; sudo systemctl daemon-reload; else rm /tmp/arcus-spot-rust-recorder.service; fi",
+              "aws s3 cp s3://__S3_BUCKET__/__TIMER_S3_KEY__ /tmp/arcus-spot-rust-recorder.timer",
+              "if [ ! -f /etc/systemd/system/arcus-spot-rust-recorder.timer ] || ! cmp -s /etc/systemd/system/arcus-spot-rust-recorder.timer /tmp/arcus-spot-rust-recorder.timer; then sudo mv /tmp/arcus-spot-rust-recorder.timer /etc/systemd/system/arcus-spot-rust-recorder.timer; sudo systemctl daemon-reload; else rm /tmp/arcus-spot-rust-recorder.timer; fi",
+              "f=/var/lib/debot-arcus/spot-rust/samples.jsonl; { [ -f \"$f\" ] && wc -l < \"$f\" || echo 0; } > /tmp/arcus_recorder_baseline; echo \"baseline=$(cat /tmp/arcus_recorder_baseline)\"",
+              "sudo systemctl restart arcus-spot-rust-recorder.service",
+              "sleep 3; systemctl is-active --quiet arcus-spot-rust-recorder.service || true",
+              "sudo /tmp/verify-arcus-recorder.sh /var/lib/debot-arcus/spot-rust/samples.jsonl /tmp/arcus_recorder_baseline arcus-spot-rust-recorder",
+              "sudo systemctl enable --now arcus-spot-rust-recorder.timer && systemctl list-timers arcus-spot-rust-recorder.timer --no-pager | tail -3"
+            ],
+            "executionTimeout": ["7200"]
+          }
+          JSON
+          sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; \
+                  s|__ARCUS_S3_PREFIX__|${ARCUS_S3_PREFIX}|g; \
+                  s|__UNIT_S3_KEY__|${UNIT_S3_KEY}|g; \
+                  s|__TIMER_S3_KEY__|${TIMER_S3_KEY}|g" /tmp/ssm-params.json
+
+          # --timeout-seconds bounds SSM's *delivery* window (how long it
+          # waits for the instance to pick up and start the command) and is
+          # entirely separate from the document's own executionTimeout
+          # parameter; AWS's total command timeout is delivery + execution
+          # (same class of issue Codex flagged on the sibling
+          # bot-strategy#768 workflow). Set explicitly (matching the 600s
+          # default) so the local poll cap below can be sized against a
+          # known total instead of assuming the default.
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${ARCUS_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy Arcus Spot Rust recorder (dex-connector)" \
+            --parameters file:///tmp/ssm-params.json \
+            --timeout-seconds 600 \
+            --query "Command.CommandId" \
+            --output text)
+
+          # `aws ssm wait command-executed` polls every 5s for a fixed 20
+          # attempts (100s max) and exits 255 on timeout even if the remote
+          # command is still genuinely running. The recorder issues up to 27
+          # sequential GETs (3 metadata + 12 round trips x 2 legs); each
+          # allows 3 attempts at a 30s client timeout and also honors
+          # Retry-After (see RETRY_AFTER handling in
+          # src/arcus_spot_connector.rs), so, matching the same worst-case
+          # analysis Codex did for the sibling Python collector workflow
+          # (bot-strategy#768, ~65min), this can comfortably exceed the
+          # previous 40min estimate; poll manually with a cap well above
+          # that instead. AWS's total command timeout is delivery
+          # (--timeout-seconds above, 600s) plus execution (executionTimeout,
+          # 7200s) -- the poll cap must cover both, or a slow-to-pick-up
+          # instance can still legitimately be running past the cap.
+          # `get-command-invocation` can also transiently return
+          # InvocationDoesNotExist immediately after send-command (AWS docs:
+          # results "might not be immediately visible to all subsequent
+          # commands"), which surfaces here as an empty STATUS -- treat that
+          # as pending and retry rather than treating it as a terminal
+          # failure.
+          set +e
+          STATUS="Pending"
+          for _ in $(seq 1 560); do
+            STATUS=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
+            case "$STATUS" in
+              Pending|InProgress|Delayed|"") sleep 15 ;;
+              *) break ;;
+            esac
+          done
+          # If the loop exhausted its cap while the last-seen STATUS was
+          # still non-terminal, the command may have completed during that
+          # final sleep; refresh once more so the exit check reflects the
+          # true final state. Only do this when STATUS is still
+          # non-terminal: if the loop already observed a terminal status via
+          # `break`, a redundant lookup here can itself transiently fail
+          # (the polling loop above explicitly treats that as possible) and
+          # clobber a genuine Success with an empty string (Codex P2
+          # follow-up, dex-connector#48); and only overwrite STATUS if the
+          # refresh actually returned something.
+          case "$STATUS" in
+            Pending|InProgress|Delayed|"")
+              REFRESHED=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
+              [ -n "$REFRESHED" ] && STATUS="$REFRESHED"
+              ;;
+          esac
+          aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --output text
+          [ "$STATUS" = "Success" ]

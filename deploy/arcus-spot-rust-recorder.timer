@@ -1,0 +1,12 @@
+[Unit]
+Description=Sample Arcus Spot with the Rust recorder every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:05,20,35,50:00 UTC
+AccuracySec=15s
+RandomizedDelaySec=30s
+Persistent=true
+Unit=arcus-spot-rust-recorder.service
+
+[Install]
+WantedBy=timers.target
