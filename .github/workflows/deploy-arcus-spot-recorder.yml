@@ -127,6 +127,14 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.BUILD_REGION }}
+          # configure-aws-credentials defaults role-duration-seconds to 3600s,
+          # but the SSM poll below can legitimately run up to 120min: an
+          # expired session makes get-command-invocation return
+          # ExpiredToken, which the poll's stderr-discarding treats as an
+          # empty (pending) status until the cap, failing a deployment that
+          # may have actually succeeded (Codex P2 follow-up, dex-connector#48).
+          # Requires the debot-dashboard role's MaxSessionDuration >= this.
+          role-duration-seconds: 7200
 
       # The timer is stopped before install (so an overlapping invocation
       # can't race the binary/unit swap) and the service is *restarted*,
@@ -159,7 +167,8 @@ jobs:
               "sleep 3; systemctl is-active --quiet arcus-spot-rust-recorder.service || true",
               "sudo /tmp/verify-arcus-recorder.sh /var/lib/debot-arcus/spot-rust/samples.jsonl /tmp/arcus_recorder_baseline arcus-spot-rust-recorder",
               "sudo systemctl enable --now arcus-spot-rust-recorder.timer && systemctl list-timers arcus-spot-rust-recorder.timer --no-pager | tail -3"
-            ]
+            ],
+            "executionTimeout": ["7200"]
           }
           JSON
           sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; \
