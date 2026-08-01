@@ -83,7 +83,7 @@ jobs:
               "aws s3 cp s3://__S3_BUCKET__/__TIMER_S3_KEY__ /tmp/archive-arcus-quotes.timer",
               "if [ ! -f /etc/systemd/system/archive-arcus-quotes.timer ] || ! cmp -s /etc/systemd/system/archive-arcus-quotes.timer /tmp/archive-arcus-quotes.timer; then sudo mv /tmp/archive-arcus-quotes.timer /etc/systemd/system/archive-arcus-quotes.timer; sudo systemctl daemon-reload; else rm /tmp/archive-arcus-quotes.timer; fi",
               "sudo systemctl start archive-arcus-quotes.service",
-              "sleep 2; systemctl is-active --quiet archive-arcus-quotes.service || { echo 'archive-arcus-quotes.service failed'; sudo journalctl -u archive-arcus-quotes.service -n 40 --no-pager; exit 1; }",
+              "result=$(systemctl show archive-arcus-quotes.service -p Result --value); if [ \"$result\" != \"success\" ]; then echo \"archive-arcus-quotes.service Result=$result\"; sudo journalctl -u archive-arcus-quotes.service -n 40 --no-pager; exit 1; fi",
               "sudo journalctl -u archive-arcus-quotes.service -n 20 --no-pager | grep -q 'sync complete' || { echo 'archive script did not report sync complete'; exit 1; }",
               "sudo systemctl enable --now archive-arcus-quotes.timer && systemctl list-timers archive-arcus-quotes.timer --no-pager | tail -3"
             ],
