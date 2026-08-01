@@ -98,10 +98,10 @@ jobs:
               "if [ ! -f /etc/systemd/system/archive-arcus-quotes.service ] || ! cmp -s /etc/systemd/system/archive-arcus-quotes.service /tmp/archive-arcus-quotes.service; then sudo mv /tmp/archive-arcus-quotes.service /etc/systemd/system/archive-arcus-quotes.service; sudo systemctl daemon-reload; else rm /tmp/archive-arcus-quotes.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__TIMER_S3_KEY__ /tmp/archive-arcus-quotes.timer",
               "if [ ! -f /etc/systemd/system/archive-arcus-quotes.timer ] || ! cmp -s /etc/systemd/system/archive-arcus-quotes.timer /tmp/archive-arcus-quotes.timer; then sudo mv /tmp/archive-arcus-quotes.timer /etc/systemd/system/archive-arcus-quotes.timer; sudo systemctl daemon-reload; else rm /tmp/archive-arcus-quotes.timer; fi",
-              "date -u '+%Y-%m-%d %H:%M:%S' > /tmp/arcus_archive_since",
+              "ARCUS_SINCE_FILE=$(mktemp); date -u '+%Y-%m-%d %H:%M:%S' > \"$ARCUS_SINCE_FILE\"",
               "sudo systemctl restart archive-arcus-quotes.service",
-              "result=$(systemctl show archive-arcus-quotes.service -p Result --value); if [ \"$result\" != \"success\" ]; then echo \"archive-arcus-quotes.service Result=$result\"; sudo journalctl -u archive-arcus-quotes.service --since \"$(cat /tmp/arcus_archive_since)\" --no-pager; exit 1; fi",
-              "sudo journalctl -u archive-arcus-quotes.service --since \"$(cat /tmp/arcus_archive_since)\" --no-pager | grep -q 'sync complete' || { echo 'archive script did not report sync complete since the restart'; sudo journalctl -u archive-arcus-quotes.service --since \"$(cat /tmp/arcus_archive_since)\" --no-pager; exit 1; }",
+              "result=$(systemctl show archive-arcus-quotes.service -p Result --value); if [ \"$result\" != \"success\" ]; then echo \"archive-arcus-quotes.service Result=$result\"; sudo journalctl -u archive-arcus-quotes.service --since \"$(cat \"$ARCUS_SINCE_FILE\")\" --no-pager; exit 1; fi",
+              "sudo journalctl -u archive-arcus-quotes.service --since \"$(cat \"$ARCUS_SINCE_FILE\")\" --no-pager | grep -q 'sync complete' || { echo 'archive script did not report sync complete since the restart'; sudo journalctl -u archive-arcus-quotes.service --since \"$(cat \"$ARCUS_SINCE_FILE\")\" --no-pager; exit 1; }",
               "sudo systemctl enable --now archive-arcus-quotes.timer && systemctl list-timers archive-arcus-quotes.timer --no-pager | tail -3"
             ],
             "executionTimeout": ["4200"]
