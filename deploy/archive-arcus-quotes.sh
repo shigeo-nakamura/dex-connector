@@ -57,6 +57,17 @@ ARCUS_RUST_DIR="${ARCUS_RUST_DIR:-/var/lib/debot-arcus/spot-rust}"
 # irreplaceable dataset stale (or entirely absent) in S3 while this script
 # keeps reporting success (Codex P2 follow-up, dex-connector#50).
 for dir in "$ARCUS_QUOTE_DIR" "$ARCUS_RUST_DIR"; do
+    # `-s` follows symlinks when checking size, so a samples.jsonl replaced
+    # by a symlink to some other nonempty file would still pass this check
+    # -- but the sync below (--no-follow-symlinks, by design) then skips
+    # that entry entirely, letting the script report "sync complete" while
+    # silently archiving nothing for that collector. Reject the symlink
+    # case explicitly rather than let it slip through both checks (Codex
+    # P2 follow-up, dex-connector#50).
+    if [ -L "$dir/samples.jsonl" ]; then
+        echo "ERROR: '$dir/samples.jsonl' is a symlink, refusing to treat it as collector data" >&2
+        exit 1
+    fi
     if [ ! -s "$dir/samples.jsonl" ]; then
         echo "ERROR: expected nonempty '$dir/samples.jsonl'" >&2
         exit 1
