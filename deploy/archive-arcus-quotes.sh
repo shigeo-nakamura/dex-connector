@@ -68,8 +68,14 @@ for dir in "$ARCUS_QUOTE_DIR" "$ARCUS_RUST_DIR"; do
         echo "ERROR: '$dir/samples.jsonl' is a symlink, refusing to treat it as collector data" >&2
         exit 1
     fi
-    if [ ! -s "$dir/samples.jsonl" ]; then
-        echo "ERROR: expected nonempty '$dir/samples.jsonl'" >&2
+    # `-s` alone only checks nonzero size, which a directory also satisfies
+    # on this filesystem (an inode entry has nonzero apparent size); a
+    # samples.jsonl accidentally replaced by a directory would then pass
+    # this check while `aws s3 sync`'s include/exclude globbing has no
+    # regular file to upload, again reaching "sync complete" with nothing
+    # actually archived for that collector.
+    if [ ! -f "$dir/samples.jsonl" ] || [ ! -s "$dir/samples.jsonl" ]; then
+        echo "ERROR: expected a nonempty regular file at '$dir/samples.jsonl'" >&2
         exit 1
     fi
 done
