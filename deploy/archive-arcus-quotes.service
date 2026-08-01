@@ -7,6 +7,13 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# systemd's manager default DefaultTimeoutStartSec is 90s. `aws s3 sync`
+# only needs to upload objects that changed since the last run, but the
+# collectors' samples.jsonl files grow without bound (append-only), so a
+# large first sync (or one after downtime) can legitimately take longer
+# than that default, getting SIGTERM'd mid-upload (Codex P2 follow-up,
+# dex-connector#50).
+TimeoutStartSec=3600
 ExecStart=/opt/arcus-archive/bin/archive-arcus-quotes.sh
 StandardOutput=journal
 StandardError=journal

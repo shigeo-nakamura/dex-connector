@@ -40,14 +40,15 @@ ARCUS_QUOTE_DIR="${ARCUS_QUOTE_DIR:-/var/lib/debot-arcus/spot-quote}"
 ARCUS_RUST_DIR="${ARCUS_RUST_DIR:-/var/lib/debot-arcus/spot-rust}"
 
 # Both collectors are expected to be running on this host; a missing
-# directory is a real regression (removed, renamed, or never-created
-# source), not an optional source to skip. Silently archiving only
-# whichever one happens to exist would leave the other's irreplaceable
-# dataset stale in S3 while this script keeps reporting success (Codex P2
-# follow-up, dex-connector#50).
+# directory, or one that exists but has not produced any sample data yet
+# (e.g. StateDirectory created before the collector's first successful
+# run), is a real regression -- not an optional source to skip. Silently
+# archiving only whichever one has data would leave the other's
+# irreplaceable dataset stale (or entirely absent) in S3 while this script
+# keeps reporting success (Codex P2 follow-up, dex-connector#50).
 for dir in "$ARCUS_QUOTE_DIR" "$ARCUS_RUST_DIR"; do
-    if [ ! -d "$dir" ]; then
-        echo "ERROR: expected collector directory '$dir' does not exist" >&2
+    if [ ! -s "$dir/samples.jsonl" ]; then
+        echo "ERROR: expected nonempty '$dir/samples.jsonl'" >&2
         exit 1
     fi
 done
