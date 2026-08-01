@@ -1,0 +1,15 @@
+[Unit]
+# Daily mirror of the Arcus Spot collector dumps to S3 (bot-strategy#758).
+# Read-only collector backup; does NOT touch debot-pair-btceth.
+Description=Archive Arcus Spot collector dumps to S3 (bot-strategy#758)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/arcus-archive/bin/archive-arcus-quotes.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

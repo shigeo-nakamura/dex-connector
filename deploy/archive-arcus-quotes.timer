@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily archive of Arcus Spot collector dumps to S3 (bot-strategy#758)
+
+[Timer]
+# 00:40 UTC -- after the RWA archive (00:35) and BT-replay archive (00:30)
+# timers, to avoid contending for the same network/S3 path. sync is
+# idempotent, so Persistent catches up a missed run after downtime.
+OnCalendar=*-*-* 00:40:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+Unit=archive-arcus-quotes.service
+
+[Install]
+WantedBy=timers.target
