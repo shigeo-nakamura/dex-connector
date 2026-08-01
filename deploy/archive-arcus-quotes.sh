@@ -53,14 +53,23 @@ for dir in "$ARCUS_QUOTE_DIR" "$ARCUS_RUST_DIR"; do
     fi
 done
 
+# This oneshot runs as root (no User= in the unit) so it can read both
+# collectors' state directories regardless of which unprivileged account
+# owns each. `aws s3 sync` follows local symlinks by default and uploads
+# their targets; a compromised collector could otherwise plant a symlink
+# in its own writable directory (e.g. named *.jsonl) pointing at any
+# root-readable file, and this job would upload that target to S3 under
+# the symlink's name, breaking the collector service's privilege boundary
+# (Codex P1 follow-up, dex-connector#50). --no-follow-symlinks makes sync
+# skip symlinks entirely instead.
 dest="s3://${S3_BUCKET}/${S3_PREFIX}/spot-quote/"
 echo "[archive_arcus_quotes] src=$ARCUS_QUOTE_DIR dest=$dest"
-aws s3 sync --no-progress "$ARCUS_QUOTE_DIR/" "$dest" \
+aws s3 sync --no-progress --no-follow-symlinks "$ARCUS_QUOTE_DIR/" "$dest" \
     --exclude '*' --include '*.jsonl'
 
 dest="s3://${S3_BUCKET}/${S3_PREFIX}/spot-rust/"
 echo "[archive_arcus_quotes] src=$ARCUS_RUST_DIR dest=$dest"
-aws s3 sync --no-progress "$ARCUS_RUST_DIR/" "$dest" \
+aws s3 sync --no-progress --no-follow-symlinks "$ARCUS_RUST_DIR/" "$dest" \
     --exclude '*' --include '*.jsonl'
 
 echo "[archive_arcus_quotes] sync complete"
