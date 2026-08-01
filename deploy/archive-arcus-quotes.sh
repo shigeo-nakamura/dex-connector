@@ -19,6 +19,16 @@
 # breaks the object actions (bot-strategy IAM incident, see
 # feedback_iam_s3_prefix_condition in project memory).
 #
+# `sync` overwrites the fixed samples.jsonl key on every run, which would
+# otherwise let a truncated/reset local collector file (disk pressure, an
+# operator mistake, a collector bug) permanently destroy already-archived
+# history with no recovery path -- precisely the kind of loss this backup
+# exists to prevent (Codex P1 follow-up, dex-connector#50). Mitigated at
+# the bucket level instead of in this script: S3 versioning was enabled on
+# debot-dashboard (2026-08-01), so every overwrite creates a new version
+# and prior ones remain retrievable; a 90-day NoncurrentVersionExpiration
+# lifecycle rule bounds the extra storage this accumulates.
+#
 # S3 layout (isolated from the arcus-quote-collector/arcus-spot-recorder/
 # deploy/ deploy-artifact prefixes the same bucket also holds):
 #   s3://<bucket>/<prefix>/spot-quote/samples.jsonl
