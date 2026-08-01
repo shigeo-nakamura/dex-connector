@@ -39,27 +39,27 @@ S3_PREFIX="${S3_PREFIX:-arcus-archive}"
 ARCUS_QUOTE_DIR="${ARCUS_QUOTE_DIR:-/var/lib/debot-arcus/spot-quote}"
 ARCUS_RUST_DIR="${ARCUS_RUST_DIR:-/var/lib/debot-arcus/spot-rust}"
 
-synced_any=0
+# Both collectors are expected to be running on this host; a missing
+# directory is a real regression (removed, renamed, or never-created
+# source), not an optional source to skip. Silently archiving only
+# whichever one happens to exist would leave the other's irreplaceable
+# dataset stale in S3 while this script keeps reporting success (Codex P2
+# follow-up, dex-connector#50).
+for dir in "$ARCUS_QUOTE_DIR" "$ARCUS_RUST_DIR"; do
+    if [ ! -d "$dir" ]; then
+        echo "ERROR: expected collector directory '$dir' does not exist" >&2
+        exit 1
+    fi
+done
 
-if [ -d "$ARCUS_QUOTE_DIR" ]; then
-    dest="s3://${S3_BUCKET}/${S3_PREFIX}/spot-quote/"
-    echo "[archive_arcus_quotes] src=$ARCUS_QUOTE_DIR dest=$dest"
-    aws s3 sync --no-progress "$ARCUS_QUOTE_DIR/" "$dest" \
-        --exclude '*' --include '*.jsonl'
-    synced_any=1
-fi
+dest="s3://${S3_BUCKET}/${S3_PREFIX}/spot-quote/"
+echo "[archive_arcus_quotes] src=$ARCUS_QUOTE_DIR dest=$dest"
+aws s3 sync --no-progress "$ARCUS_QUOTE_DIR/" "$dest" \
+    --exclude '*' --include '*.jsonl'
 
-if [ -d "$ARCUS_RUST_DIR" ]; then
-    dest="s3://${S3_BUCKET}/${S3_PREFIX}/spot-rust/"
-    echo "[archive_arcus_quotes] src=$ARCUS_RUST_DIR dest=$dest"
-    aws s3 sync --no-progress "$ARCUS_RUST_DIR/" "$dest" \
-        --exclude '*' --include '*.jsonl'
-    synced_any=1
-fi
-
-if [ "$synced_any" -eq 0 ]; then
-    echo "ERROR: neither ARCUS_QUOTE_DIR ('$ARCUS_QUOTE_DIR') nor ARCUS_RUST_DIR ('$ARCUS_RUST_DIR') exists" >&2
-    exit 1
-fi
+dest="s3://${S3_BUCKET}/${S3_PREFIX}/spot-rust/"
+echo "[archive_arcus_quotes] src=$ARCUS_RUST_DIR dest=$dest"
+aws s3 sync --no-progress "$ARCUS_RUST_DIR/" "$dest" \
+    --exclude '*' --include '*.jsonl'
 
 echo "[archive_arcus_quotes] sync complete"

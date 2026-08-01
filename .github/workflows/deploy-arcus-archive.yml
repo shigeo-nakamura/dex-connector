@@ -66,7 +66,12 @@ jobs:
       # redeploy can't leave a boot-time symlink pointing at an unverified
       # unit (Codex-flagged pattern, dex-connector#48/bot-strategy#768);
       # re-enabled only at the end, after the script has actually run once
-      # and produced no error.
+      # and produced no error. The service is also explicitly stopped (not
+      # just the timer) and restarted rather than started below: if a
+      # manual dispatch overlaps the daily timer's own invocation,
+      # `systemctl start` on an already-running oneshot only waits for or
+      # joins that in-flight (old-script) run instead of exercising the
+      # newly installed one (Codex P2 follow-up, dex-connector#50).
       - name: Deploy via SSM (install, verify, activate)
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
@@ -76,13 +81,14 @@ jobs:
             "commands": [
               "set -e",
               "sudo systemctl disable --now archive-arcus-quotes.timer 2>/dev/null || true",
+              "sudo systemctl stop archive-arcus-quotes.service 2>/dev/null || true",
               "sudo mkdir -p /opt/arcus-archive/bin",
               "aws s3 cp s3://__S3_BUCKET__/__SCRIPT_S3_KEY__ /opt/arcus-archive/bin/archive-arcus-quotes.sh && sudo chmod 755 /opt/arcus-archive/bin/archive-arcus-quotes.sh",
               "aws s3 cp s3://__S3_BUCKET__/__UNIT_S3_KEY__ /tmp/archive-arcus-quotes.service",
               "if [ ! -f /etc/systemd/system/archive-arcus-quotes.service ] || ! cmp -s /etc/systemd/system/archive-arcus-quotes.service /tmp/archive-arcus-quotes.service; then sudo mv /tmp/archive-arcus-quotes.service /etc/systemd/system/archive-arcus-quotes.service; sudo systemctl daemon-reload; else rm /tmp/archive-arcus-quotes.service; fi",
               "aws s3 cp s3://__S3_BUCKET__/__TIMER_S3_KEY__ /tmp/archive-arcus-quotes.timer",
               "if [ ! -f /etc/systemd/system/archive-arcus-quotes.timer ] || ! cmp -s /etc/systemd/system/archive-arcus-quotes.timer /tmp/archive-arcus-quotes.timer; then sudo mv /tmp/archive-arcus-quotes.timer /etc/systemd/system/archive-arcus-quotes.timer; sudo systemctl daemon-reload; else rm /tmp/archive-arcus-quotes.timer; fi",
-              "sudo systemctl start archive-arcus-quotes.service",
+              "sudo systemctl restart archive-arcus-quotes.service",
               "result=$(systemctl show archive-arcus-quotes.service -p Result --value); if [ \"$result\" != \"success\" ]; then echo \"archive-arcus-quotes.service Result=$result\"; sudo journalctl -u archive-arcus-quotes.service -n 40 --no-pager; exit 1; fi",
               "sudo journalctl -u archive-arcus-quotes.service -n 20 --no-pager | grep -q 'sync complete' || { echo 'archive script did not report sync complete'; exit 1; }",
               "sudo systemctl enable --now archive-arcus-quotes.timer && systemctl list-timers archive-arcus-quotes.timer --no-pager | tail -3"
