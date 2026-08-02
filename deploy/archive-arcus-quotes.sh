@@ -88,22 +88,65 @@ done
 
 # S3 (not a local tracking file, which could be wiped by the same
 # disk-pressure/reclone event this guards against) is the ground truth for
-# "already archived". A HEAD on a key that has never been synced returns no
-# ContentLength, which `head-object`'s default text output renders as the
-# literal string "None" -- treated as 0 (nothing archived yet, any local
-# size clears it) rather than a failure.
+# "already archived". On the very first deployment neither key exists yet,
+# so `head-object` returns a 404 service error (nonzero exit) rather than
+# a successful "None" ContentLength; used directly in a plain assignment,
+# `set -e` would abort the script on that 404 before either sync ever
+# runs, permanently wedging a fresh install unless both objects were
+# manually pre-created. Handled below with an `if cmd; then ... else ...`
+# guard (the standard idiom for tolerating a failure under `set -e`) so
+# only the not-found case is treated as size zero; permission and
+# connectivity errors still abort (Codex P1 follow-up, dex-connector#50
+# round 14).
 check_no_size_regression() {
     local local_file="$1" s3_key="$2" label="$3"
-    local local_size remote_size
+    local local_size remote_size head_err
+
     local_size=$(stat -c%s "$local_file")
-    remote_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$s3_key" \
-        --query 'ContentLength' --output text 2>/dev/null)
-    if [ -z "$remote_size" ] || [ "$remote_size" = "None" ]; then
+
+    head_err=$(mktemp)
+    if remote_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$s3_key" \
+        --query 'ContentLength' --output text 2>"$head_err"); then
+        rm -f "$head_err"
+    elif grep -q '404' "$head_err"; then
+        rm -f "$head_err"
         remote_size=0
+    else
+        echo "ERROR: failed to check archived size for $label at s3://${S3_BUCKET}/${s3_key}:" >&2
+        cat "$head_err" >&2
+        rm -f "$head_err"
+        exit 1
     fi
+
     if [ "$local_size" -lt "$remote_size" ]; then
         echo "ERROR: $label local file '$local_file' ($local_size bytes) is smaller than the already-archived s3://${S3_BUCKET}/${s3_key} ($remote_size bytes) -- refusing to sync a regression that would permanently truncate archived history. Investigate before retrying." >&2
         exit 1
+    fi
+
+    # A size match alone doesn't prove the content matches: a collector
+    # file that gets truncated/reset and then grows back to the archived
+    # size (or larger) before the next daily run would pass the check
+    # above while `s3 sync` replaces the complete archived object with an
+    # unrelated file, silently losing the history this guard exists to
+    # protect (Codex P1 follow-up, dex-connector#50 round 14). Download
+    # exactly the already-archived byte range and require the local file
+    # to still start with that same content -- append-only growth passes,
+    # a truncate-and-regrow does not.
+    if [ "$remote_size" -gt 0 ]; then
+        local remote_prefix
+        remote_prefix=$(mktemp)
+        if ! aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
+            --range "bytes=0-$((remote_size - 1))" "$remote_prefix" >/dev/null; then
+            echo "ERROR: failed to download archived content for $label at s3://${S3_BUCKET}/${s3_key} to verify against local file" >&2
+            rm -f "$remote_prefix"
+            exit 1
+        fi
+        if ! cmp -s <(head -c "$remote_size" "$local_file") "$remote_prefix"; then
+            echo "ERROR: $label local file '$local_file' does not start with the content already archived at s3://${S3_BUCKET}/${s3_key} (first $remote_size bytes differ) -- refusing to sync; the local file appears to have been reset and regrown rather than simply appended to. Investigate before retrying." >&2
+            rm -f "$remote_prefix"
+            exit 1
+        fi
+        rm -f "$remote_prefix"
     fi
 }
 
