@@ -7,10 +7,14 @@
 //! Spot is inventory-funded and does not fit the leveraged-perpetual
 //! [crate::DexConnector] contract, so the client remains a separate API.
 
+#[cfg(feature = "arcus-spot-execution")]
+mod execution;
 mod indexer;
 mod recorder;
 mod signable_quote;
 
+#[cfg(feature = "arcus-spot-execution")]
+pub use execution::*;
 pub use indexer::*;
 pub use recorder::*;
 pub use signable_quote::*;

@@ -1773,7 +1773,8 @@ mod tests {
             serde_json::from_str(QUOTE_FIXTURE).unwrap();
         let near_deadline = fixture_expectations().now_unix + 2;
         response.quotes[0].expiry = Some(near_deadline);
-        response.quotes[0].to_sign["message"]["deadline"] = Value::String(near_deadline.to_string());
+        response.quotes[0].to_sign["message"]["deadline"] =
+            Value::String(near_deadline.to_string());
         response.quotes[0].to_sign["message"]["witness"]["deadline"] =
             Value::String(near_deadline.to_string());
         let error = response.validate(&fixture_expectations()).unwrap_err();
