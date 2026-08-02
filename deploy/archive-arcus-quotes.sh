@@ -11,7 +11,8 @@
 # (archive-rwa-logs.sh, bot-strategy#574).
 #
 # `aws s3 sync` is idempotent and append-only friendly. The instance role
-# can PutObject under the isolated arcus-archive/ prefix but NOT
+# can Get/PutObject under the isolated arcus-archive/ prefix (GetObject
+# needed for the pre-sync regression check below, via HeadObject) but NOT
 # DeleteObject or write to any other prefix in the shared bucket -- List and
 # object permissions are two separate IAM statements (bucket-ARN +
 # s3:prefix condition for ListBucket, object-ARN glob for
@@ -23,11 +24,16 @@
 # otherwise let a truncated/reset local collector file (disk pressure, an
 # operator mistake, a collector bug) permanently destroy already-archived
 # history with no recovery path -- precisely the kind of loss this backup
-# exists to prevent (Codex P1 follow-up, dex-connector#50). Mitigated at
-# the bucket level instead of in this script: S3 versioning was enabled on
-# debot-dashboard (2026-08-01), so every overwrite creates a new version
-# and prior ones remain retrievable; a 90-day NoncurrentVersionExpiration
-# lifecycle rule bounds the extra storage this accumulates.
+# exists to prevent (Codex P1 follow-up, dex-connector#50). S3 versioning
+# is enabled on debot-dashboard (2026-08-01) as a recovery window, but a
+# 90-day NoncurrentVersionExpiration lifecycle rule means that window is
+# temporary, not a permanent guarantee: a reset that goes unnoticed for
+# over 90 days still loses the pre-reset history for good (Codex P1
+# follow-up, dex-connector#50 round 13). Guarded here instead: refuse to
+# sync a local file that is smaller than what is already archived in S3,
+# so a regression requires deliberate operator intervention (delete the
+# stale S3 object, or accept the loss knowingly) rather than silently
+# overwriting irreplaceable history on the next scheduled run.
 #
 # S3 layout (isolated from the arcus-quote-collector/arcus-spot-recorder/
 # deploy/ deploy-artifact prefixes the same bucket also holds):
@@ -79,6 +85,30 @@ for dir in "$ARCUS_QUOTE_DIR" "$ARCUS_RUST_DIR"; do
         exit 1
     fi
 done
+
+# S3 (not a local tracking file, which could be wiped by the same
+# disk-pressure/reclone event this guards against) is the ground truth for
+# "already archived". A HEAD on a key that has never been synced returns no
+# ContentLength, which `head-object`'s default text output renders as the
+# literal string "None" -- treated as 0 (nothing archived yet, any local
+# size clears it) rather than a failure.
+check_no_size_regression() {
+    local local_file="$1" s3_key="$2" label="$3"
+    local local_size remote_size
+    local_size=$(stat -c%s "$local_file")
+    remote_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$s3_key" \
+        --query 'ContentLength' --output text 2>/dev/null)
+    if [ -z "$remote_size" ] || [ "$remote_size" = "None" ]; then
+        remote_size=0
+    fi
+    if [ "$local_size" -lt "$remote_size" ]; then
+        echo "ERROR: $label local file '$local_file' ($local_size bytes) is smaller than the already-archived s3://${S3_BUCKET}/${s3_key} ($remote_size bytes) -- refusing to sync a regression that would permanently truncate archived history. Investigate before retrying." >&2
+        exit 1
+    fi
+}
+
+check_no_size_regression "$ARCUS_QUOTE_DIR/samples.jsonl" "${S3_PREFIX}/spot-quote/samples.jsonl" "spot-quote"
+check_no_size_regression "$ARCUS_RUST_DIR/samples.jsonl" "${S3_PREFIX}/spot-rust/samples.jsonl" "spot-rust"
 
 # This oneshot runs as root (no User= in the unit) so it can read both
 # collectors' state directories regardless of which unprivileged account
