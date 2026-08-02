@@ -175,6 +175,21 @@ archive_source() {
         exit 1
     fi
 
+    # Both archives grow without bound, so a full-file snapshot could in
+    # principle consume enough of /tmp to disrupt other host processes
+    # sharing the same filesystem; check headroom explicitly and fail
+    # loudly instead of letting `cp` run /tmp down to empty (Codex P2
+    # follow-up, dex-connector#50 round 18).
+    local src_size avail_bytes tmp_dir margin_bytes
+    tmp_dir="${TMPDIR:-/tmp}"
+    src_size=$(stat -c%s "$src_file")
+    avail_bytes=$(df --output=avail -B1 "$tmp_dir" | tail -n 1 | tr -d ' ')
+    margin_bytes=$((100 * 1024 * 1024))
+    if [ "$avail_bytes" -lt "$((src_size + margin_bytes))" ]; then
+        echo "ERROR: not enough free space in $tmp_dir to snapshot '$src_file' ($src_size bytes needed, $avail_bytes available) -- refusing to risk exhausting /tmp for other host processes. Investigate before retrying." >&2
+        exit 1
+    fi
+
     local snapshot
     snapshot=$(mktemp)
     TEMP_PATHS+=("$snapshot")
