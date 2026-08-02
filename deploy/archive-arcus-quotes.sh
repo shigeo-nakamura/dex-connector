@@ -53,6 +53,19 @@ S3_PREFIX="${S3_PREFIX:-arcus-archive}"
 ARCUS_QUOTE_DIR="${ARCUS_QUOTE_DIR:-/var/lib/debot-arcus/spot-quote}"
 ARCUS_RUST_DIR="${ARCUS_RUST_DIR:-/var/lib/debot-arcus/spot-rust}"
 
+# Every mktemp'd path created below (snapshots, FIFOs, head-object stderr
+# captures) is registered here and removed unconditionally on exit --
+# whether the script finishes normally or aborts via `set -e`/an explicit
+# `exit 1` partway through a check -- so a persistent regression or
+# transient S3 error can't leave archive-sized leftovers accumulating in
+# /tmp across daily timer runs (Codex P2 follow-up, dex-connector#50
+# round 16).
+TEMP_PATHS=()
+cleanup_temp_paths() {
+    rm -f "${TEMP_PATHS[@]}" 2>/dev/null || true
+}
+trap cleanup_temp_paths EXIT
+
 # S3 (not a local tracking file, which could be wiped by the same
 # disk-pressure/reclone event this guards against) is the ground truth for
 # "already archived". On the very first deployment neither key exists yet,
@@ -72,16 +85,15 @@ check_no_size_regression() {
     local_size=$(stat -c%s "$snapshot")
 
     head_err=$(mktemp)
+    TEMP_PATHS+=("$head_err")
     if remote_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$s3_key" \
         --query 'ContentLength' --output text 2>"$head_err"); then
-        rm -f "$head_err"
+        :
     elif grep -q '404' "$head_err"; then
-        rm -f "$head_err"
         remote_size=0
     else
         echo "ERROR: failed to check archived size for $label at s3://${S3_BUCKET}/${s3_key}:" >&2
         cat "$head_err" >&2
-        rm -f "$head_err"
         exit 1
     fi
 
@@ -97,16 +109,34 @@ check_no_size_regression() {
     # unrelated file, silently losing the history this guard exists to
     # protect (Codex P1 follow-up, dex-connector#50 round 14). Require the
     # source to still start with the same bytes already archived --
-    # append-only growth passes, a truncate-and-regrow does not. Streamed
-    # via process substitution (outfile `-`) rather than downloaded to a
-    # temp file first: the archived object is itself unbounded (the
-    # collectors never rotate), so materializing a full second copy on
-    # every run risks exhausting local disk on its own (Codex P2
-    # follow-up, dex-connector#50 round 15).
+    # append-only growth passes, a truncate-and-regrow does not.
     if [ "$remote_size" -gt 0 ]; then
-        if ! cmp -s <(aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
-                --range "bytes=0-$((remote_size - 1))" - 2>/dev/null) \
-             <(head -c "$remote_size" "$snapshot"); then
+        # `aws s3api get-object`'s trailing argument is a literal outfile
+        # path (per the AWS CLI reference), not the `aws s3 cp` stdout
+        # convention -- passing `-` creates a file actually named "-"
+        # once an archive key exists, so every run after the first would
+        # silently compare against that empty/wrong file and reject a
+        # valid source (Codex P1 follow-up, dex-connector#50 round 16).
+        # Stream through a FIFO instead of a regular file so the archived
+        # object -- itself unbounded, since the collectors never rotate --
+        # is never staged as a second full-size copy on disk either
+        # (Codex P2 follow-up, dex-connector#50 round 15). `timeout`
+        # bounds both sides: if the download stalls before ever opening
+        # the FIFO for writing, an unbounded blocking open() on the read
+        # side would otherwise hang this script for the unit's full
+        # TimeoutStartSec instead of failing cleanly.
+        local fifo
+        fifo=$(mktemp -u)
+        mkfifo "$fifo"
+        TEMP_PATHS+=("$fifo")
+        timeout 300 aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
+            --range "bytes=0-$((remote_size - 1))" "$fifo" >/dev/null 2>&1 &
+        local get_pid=$!
+        local content_matches=0
+        timeout 300 cmp -s "$fifo" <(head -c "$remote_size" "$snapshot") || content_matches=1
+        wait "$get_pid" || content_matches=1
+        rm -f "$fifo"
+        if [ "$content_matches" -ne 0 ]; then
             echo "ERROR: $label does not match (or could not be verified against) the content already archived at s3://${S3_BUCKET}/${s3_key} (first $remote_size bytes) -- refusing to upload; either the source was reset and regrown rather than simply appended to, or the archived content could not be downloaded for verification. Investigate before retrying." >&2
             exit 1
         fi
@@ -144,14 +174,26 @@ archive_source() {
 
     local snapshot
     snapshot=$(mktemp)
-    cp "$src_file" "$snapshot"
+    TEMP_PATHS+=("$snapshot")
+    # `--no-dereference` so a collector account that swaps samples.jsonl
+    # for a symlink in the window between the checks above and this copy
+    # can't make us silently snapshot (and later archive) an arbitrary
+    # root-readable file: if the source has become a symlink by the time
+    # we get here, `cp -P` preserves it as one instead of following it,
+    # and the check right below catches that -- we never read the
+    # symlink target's content either way (Codex P1 follow-up,
+    # dex-connector#50 round 16).
+    cp --no-dereference "$src_file" "$snapshot"
+    if [ -L "$snapshot" ]; then
+        echo "ERROR: '$src_file' became a symlink during snapshotting, refusing to treat it as collector data" >&2
+        exit 1
+    fi
 
     check_no_size_regression "$snapshot" "$s3_key" "$label ($src_file)"
 
     local dest="s3://${S3_BUCKET}/${s3_key}"
     echo "[archive_arcus_quotes] src=$src_file dest=$dest"
     aws s3 cp --no-progress "$snapshot" "$dest"
-    rm -f "$snapshot"
 }
 
 archive_source "$ARCUS_QUOTE_DIR" "spot-quote" "spot-quote"
