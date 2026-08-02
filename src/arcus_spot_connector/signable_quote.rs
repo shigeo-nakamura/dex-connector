@@ -663,6 +663,23 @@ impl ArcusSpotSignableQuoteResponse {
     }
 }
 
+fn project_signable_response_to_venue(
+    response: &mut ArcusSpotSignableQuoteResponse,
+    venue: &str,
+) -> Result<(), ArcusSpotError> {
+    response
+        .quotes
+        .retain(|quote| quote.venue.eq_ignore_ascii_case(venue));
+    if response.quotes.len() != 1 {
+        return Err(ArcusSpotError::InvalidResponse(format!(
+            "expected exactly one {venue} signable quote, found {}",
+            response.quotes.len()
+        )));
+    }
+    response.recommended = response.quotes[0].venue.clone();
+    Ok(())
+}
+
 /// Request and validated response evidence for one directed pre-sign quote.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArcusSpotSignableQuoteObservation {
@@ -849,6 +866,26 @@ impl ArcusSpotClient {
         &self,
         request: &ArcusSpotSignableQuoteRequest,
     ) -> Result<ArcusSpotSignableQuoteObservation, ArcusSpotError> {
+        self.signable_quote_by_symbol_inner(request, None).await
+    }
+
+    /// Request the same public payload but retain and validate exactly one
+    /// direct Arcus venue quote. Unsupported comparison venues remain
+    /// fail-closed in signable_quote_by_symbol, while the Arcus execution
+    /// path cannot be denied merely because the router also returned one.
+    pub async fn arcus_signable_quote_by_symbol(
+        &self,
+        request: &ArcusSpotSignableQuoteRequest,
+    ) -> Result<ArcusSpotSignableQuoteObservation, ArcusSpotError> {
+        self.signable_quote_by_symbol_inner(request, Some("arcus"))
+            .await
+    }
+
+    async fn signable_quote_by_symbol_inner(
+        &self,
+        request: &ArcusSpotSignableQuoteRequest,
+        only_venue: Option<&str>,
+    ) -> Result<ArcusSpotSignableQuoteObservation, ArcusSpotError> {
         let taker = request.validate()?;
         let sell = self.verified_token(&request.sell_symbol).await?;
         let buy = self.verified_token(&request.buy_symbol).await?;
@@ -883,9 +920,12 @@ impl ArcusSpotClient {
                 request.route_policy.allow_wrapped().to_string(),
             ),
         ];
-        let response: ArcusSpotObservation<ArcusSpotSignableQuoteResponse> = self
+        let mut response: ArcusSpotObservation<ArcusSpotSignableQuoteResponse> = self
             .get_json(&self.inner.router_base_url, "v1/quote", &query)
             .await?;
+        if let Some(venue) = only_venue {
+            project_signable_response_to_venue(&mut response.payload, venue)?;
+        }
         let now_unix = timestamp_u64(response.received_at.timestamp())?;
         let trusted_spenders = self
             .inner
@@ -1693,6 +1733,25 @@ mod tests {
                 .contains("do not exactly match the canonical schema"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn arcus_projection_discards_untrusted_comparison_venues_before_validation() {
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let mut lifi = response.quotes[0].clone();
+        lifi.venue = "lifi".to_string();
+        response.quotes.push(lifi);
+        response.recommended = "lifi".to_string();
+
+        project_signable_response_to_venue(&mut response, "arcus").unwrap();
+        assert_eq!(response.recommended, "arcus");
+        assert_eq!(response.quotes.len(), 1);
+        assert_eq!(response.quotes[0].venue, "arcus");
+        response.validate(&fixture_expectations()).unwrap();
+
+        response.quotes.push(response.quotes[0].clone());
+        assert!(project_signable_response_to_venue(&mut response, "arcus").is_err());
     }
 
     #[test]
