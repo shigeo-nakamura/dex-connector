@@ -128,9 +128,18 @@ check_no_size_regression() {
         # follow-up, dex-connector#50 round 17) -- that TimeoutStartSec
         # budget, not a constant re-guessed here, is what should bound
         # this.
+        # `mkfifo`'s default mode (a=rw minus umask, typically 0644 under
+        # this service's umask) would let the unprivileged collector
+        # account -- which this oneshot deliberately runs alongside as
+        # root, see the header comment above -- open the FIFO for
+        # reading too; FIFO readers split the byte stream between them,
+        # so a competing reader would make `cmp` see truncated/garbled
+        # content and reject an otherwise valid backup (Codex P2
+        # follow-up, dex-connector#50 round 19). `-m 600` sets the mode
+        # directly rather than relying on umask.
         local fifo
         fifo=$(mktemp -u)
-        mkfifo "$fifo"
+        mkfifo -m 600 "$fifo"
         TEMP_PATHS+=("$fifo")
         aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
             --range "bytes=0-$((remote_size - 1))" "$fifo" >/dev/null 2>&1 &
