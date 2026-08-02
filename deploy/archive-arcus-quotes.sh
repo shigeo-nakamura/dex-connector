@@ -120,20 +120,23 @@ check_no_size_regression() {
         # Stream through a FIFO instead of a regular file so the archived
         # object -- itself unbounded, since the collectors never rotate --
         # is never staged as a second full-size copy on disk either
-        # (Codex P2 follow-up, dex-connector#50 round 15). `timeout`
-        # bounds both sides: if the download stalls before ever opening
-        # the FIFO for writing, an unbounded blocking open() on the read
-        # side would otherwise hang this script for the unit's full
-        # TimeoutStartSec instead of failing cleanly.
+        # (Codex P2 follow-up, dex-connector#50 round 15). No fixed local
+        # timeout on either side: a short one would reject an otherwise
+        # healthy download of a large archived object well before the
+        # unit's own TimeoutStartSec (3600s) is reached, permanently
+        # stalling the backup on every subsequent run (Codex P2
+        # follow-up, dex-connector#50 round 17) -- that TimeoutStartSec
+        # budget, not a constant re-guessed here, is what should bound
+        # this.
         local fifo
         fifo=$(mktemp -u)
         mkfifo "$fifo"
         TEMP_PATHS+=("$fifo")
-        timeout 300 aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
+        aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
             --range "bytes=0-$((remote_size - 1))" "$fifo" >/dev/null 2>&1 &
         local get_pid=$!
         local content_matches=0
-        timeout 300 cmp -s "$fifo" <(head -c "$remote_size" "$snapshot") || content_matches=1
+        cmp -s "$fifo" <(head -c "$remote_size" "$snapshot") || content_matches=1
         wait "$get_pid" || content_matches=1
         rm -f "$fifo"
         if [ "$content_matches" -ne 0 ]; then
