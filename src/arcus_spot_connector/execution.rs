@@ -26,8 +26,6 @@ use std::{collections::BTreeMap, fmt::Display, str::FromStr, time::Instant};
 use thiserror::Error;
 
 const ARCUS_VENUE: &str = "arcus";
-const PERMIT2_ADDRESS: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
-const PERMIT2_PRIMARY_TYPE: &str = "PermitWitnessTransferFrom";
 const MIN_EXECUTION_TTL_SECS: u64 = 5;
 
 /// Exact-value EIP-2612 permit inputs obtained from trusted chain reads.
@@ -531,19 +529,7 @@ fn validate_submission(
         serde_json::from_value(submission.typed_data.clone()).map_err(|error| {
             ArcusSpotError::InvalidResponse(format!("submission typedData is invalid: {error}"))
         })?;
-    if typed_data.primary_type != PERMIT2_PRIMARY_TYPE
-        || typed_data.domain.name.as_deref() != Some("Permit2")
-    {
-        return Err(ArcusSpotError::InvalidResponse(
-            "submission must use the Permit2 PermitWitnessTransferFrom type".to_string(),
-        ));
-    }
-    let expected_permit2 = Address::from_str(PERMIT2_ADDRESS).expect("valid Permit2 constant");
-    if typed_data.domain.verifying_contract != Some(expected_permit2) {
-        return Err(ArcusSpotError::InvalidResponse(
-            "submission EIP-712 domain does not use the canonical Permit2 contract".to_string(),
-        ));
-    }
+    super::signable_quote::validate_arcus_typed_data_schema(&typed_data)?;
     if typed_data.domain.chain_id != Some(expected_chain_id.into()) {
         return Err(ArcusSpotError::InvalidResponse(
             "submission typedData chainId mismatch".to_string(),
@@ -925,6 +911,29 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("is not Permit2"));
+    }
+
+    #[tokio::test]
+    async fn submission_preflight_rejects_noncanonical_typed_data_schema() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let client = trusted_client("http://127.0.0.1:1/".to_string());
+        let observation = fresh_arcus_observation(wallet.address());
+        let mut submission = sign_arcus_spot_quote(&client, &observation, &wallet, None)
+            .await
+            .unwrap();
+        submission.typed_data["types"]["PermitWitnessTransferFrom"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+
+        let error = validate_submission(&submission, client.config()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("do not exactly match the canonical schema"));
     }
 
     #[test]

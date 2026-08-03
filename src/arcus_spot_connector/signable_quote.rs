@@ -9,6 +9,7 @@ use super::{
     normalize_symbol, parse_raw_amount, validate_token, ArcusSpotClient, ArcusSpotError,
     ArcusSpotObservation, ArcusSpotToken,
 };
+#[cfg(feature = "arcus-spot-execution")]
 use chrono::Utc;
 use ethers::types::{
     transaction::eip712::{Eip712, TypedData, Types as Eip712Types},
@@ -945,6 +946,7 @@ impl ArcusSpotClient {
     /// Repeat every trust and schema check immediately before an Arcus quote
     /// is signed. Observations are serializable evidence and therefore must
     /// never be treated as carrying an unforgeable "already validated" bit.
+    #[cfg(feature = "arcus-spot-execution")]
     pub(crate) fn revalidate_arcus_signable_observation(
         &self,
         observation: &ArcusSpotSignableQuoteObservation,
@@ -1331,6 +1333,58 @@ fn permit2_type_fields(witness_type: &'static str) -> [(&'static str, &'static s
         ("deadline", "uint256"),
         ("witness", witness_type),
     ]
+}
+
+#[cfg(feature = "arcus-spot-execution")]
+pub(crate) fn validate_arcus_typed_data_schema(
+    typed_data: &TypedData,
+) -> Result<(), ArcusSpotError> {
+    if typed_data.primary_type != PERMIT2_PRIMARY_TYPE
+        || typed_data.domain.name.as_deref() != Some("Permit2")
+    {
+        return Err(ArcusSpotError::InvalidResponse(
+            "Arcus submission must use the Permit2 PermitWitnessTransferFrom type".to_string(),
+        ));
+    }
+    let expected_permit2 = parse_address("Permit2 address", PERMIT2_ADDRESS)?;
+    if typed_data.domain.verifying_contract != Some(expected_permit2) {
+        return Err(ArcusSpotError::InvalidResponse(
+            "Arcus submission EIP-712 domain does not use the canonical Permit2 contract"
+                .to_string(),
+        ));
+    }
+    if typed_data.domain.version.is_some() || typed_data.domain.salt.is_some() {
+        return Err(ArcusSpotError::InvalidResponse(
+            "Arcus submission Permit2 domain unexpectedly includes version or salt".to_string(),
+        ));
+    }
+    if typed_data.types.contains_key(EIP712_DOMAIN_TYPE_NAME) {
+        require_exact_eip712_fields(
+            &typed_data.types,
+            EIP712_DOMAIN_TYPE_NAME,
+            EIP712_DOMAIN_FIELDS,
+            "arcus",
+        )?;
+    }
+    let witness_schema = canonical_witness_schema("arcus")?;
+    require_exact_eip712_fields(
+        &typed_data.types,
+        PERMIT2_PRIMARY_TYPE,
+        &permit2_type_fields(witness_schema.type_name),
+        "arcus",
+    )?;
+    require_exact_eip712_fields(
+        &typed_data.types,
+        "TokenPermissions",
+        TOKEN_PERMISSIONS_FIELDS,
+        "arcus",
+    )?;
+    require_exact_eip712_fields(
+        &typed_data.types,
+        witness_schema.type_name,
+        witness_schema.fields,
+        "arcus",
+    )
 }
 
 /// Fails unless `type_name` is declared in the venue's EIP-712 schema with
