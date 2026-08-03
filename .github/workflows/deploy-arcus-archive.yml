@@ -1,0 +1,151 @@
+name: Deploy Arcus Spot S3 archive
+
+# Daily mirror of the Arcus Spot collector dumps (Python quote collector +
+# Rust recorder, both on debot-arcus) to an isolated S3 prefix
+# (bot-strategy#758). Manual dispatch only; the installed unit runs on its
+# own daily timer once deployed.
+#
+# debot-arcus is a SEPARATE, SSM-only, no-inbound host from Frankfurt main
+# (bot-strategy#758). This workflow never touches debot-pair-btceth and has
+# no wallet/signing/submission capability -- it only mirrors already-public
+# collector output to S3.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "dex-connector ref to deploy from (default: whatever was checked out)"
+        required: false
+        type: string
+
+concurrency:
+  group: arcus-archive-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ARCUS_S3_PREFIX: arcus-archive-deploy
+  SCRIPT_S3_KEY: arcus-archive-deploy/archive-arcus-quotes.sh
+  UNIT_S3_KEY: deploy/archive-arcus-quotes.service
+  TIMER_S3_KEY: deploy/archive-arcus-quotes.timer
+  BUILD_REGION: eu-central-1
+  # bot-strategy#758: dedicated Frankfurt host, isolated from debot-pair-btceth.
+  ARCUS_INSTANCE_ID: i-0cb942c2950be020f
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    environment: sidecar
+    steps:
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.BUILD_REGION }}
+          # configure-aws-credentials defaults role-duration-seconds to
+          # 3600s, but the SSM poll below can legitimately run up to ~80min:
+          # an expired session makes get-command-invocation return
+          # ExpiredToken, which the poll's stderr-discarding treats as an
+          # empty (pending) status until the cap, failing a deployment that
+          # may have actually succeeded (same class of issue already fixed
+          # in deploy-arcus-spot-recorder.yml, Codex P2 follow-up,
+          # dex-connector#50). Within the debot-dashboard role's 10800s
+          # MaxSessionDuration.
+          role-duration-seconds: 5700
+
+      - name: Upload to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          aws s3 cp deploy/archive-arcus-quotes.sh \
+            "s3://${S3_BUCKET}/${SCRIPT_S3_KEY}"
+          aws s3 cp deploy/archive-arcus-quotes.service \
+            "s3://${S3_BUCKET}/${UNIT_S3_KEY}"
+          aws s3 cp deploy/archive-arcus-quotes.timer \
+            "s3://${S3_BUCKET}/${TIMER_S3_KEY}"
+
+      # The timer is stopped and disabled before install so a rejected
+      # redeploy can't leave a boot-time symlink pointing at an unverified
+      # unit (Codex-flagged pattern, dex-connector#48/bot-strategy#768);
+      # re-enabled only at the end, after the script has actually run once
+      # and produced no error. The service is also explicitly stopped (not
+      # just the timer) and restarted rather than started below: if a
+      # manual dispatch overlaps the daily timer's own invocation,
+      # `systemctl start` on an already-running oneshot only waits for or
+      # joins that in-flight (old-script) run instead of exercising the
+      # newly installed one (Codex P2 follow-up, dex-connector#50).
+      - name: Deploy via SSM (install, verify, activate)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          cat > /tmp/ssm-params.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "sudo systemctl disable --now archive-arcus-quotes.timer 2>/dev/null || true",
+              "sudo systemctl stop archive-arcus-quotes.service 2>/dev/null || true",
+              "sudo mkdir -p /opt/arcus-archive/bin",
+              "aws s3 cp s3://__S3_BUCKET__/__SCRIPT_S3_KEY__ /opt/arcus-archive/bin/archive-arcus-quotes.sh && sudo chmod 755 /opt/arcus-archive/bin/archive-arcus-quotes.sh",
+              "ARCUS_UNIT_TMP=$(mktemp); aws s3 cp s3://__S3_BUCKET__/__UNIT_S3_KEY__ \"$ARCUS_UNIT_TMP\"",
+              "if [ ! -f /etc/systemd/system/archive-arcus-quotes.service ] || ! cmp -s /etc/systemd/system/archive-arcus-quotes.service \"$ARCUS_UNIT_TMP\"; then sudo mv \"$ARCUS_UNIT_TMP\" /etc/systemd/system/archive-arcus-quotes.service; sudo systemctl daemon-reload; else rm \"$ARCUS_UNIT_TMP\"; fi",
+              "ARCUS_TIMER_TMP=$(mktemp); aws s3 cp s3://__S3_BUCKET__/__TIMER_S3_KEY__ \"$ARCUS_TIMER_TMP\"",
+              "if [ ! -f /etc/systemd/system/archive-arcus-quotes.timer ] || ! cmp -s /etc/systemd/system/archive-arcus-quotes.timer \"$ARCUS_TIMER_TMP\"; then sudo mv \"$ARCUS_TIMER_TMP\" /etc/systemd/system/archive-arcus-quotes.timer; sudo systemctl daemon-reload; else rm \"$ARCUS_TIMER_TMP\"; fi",
+              "ARCUS_SINCE_FILE=$(mktemp); date -u '+%Y-%m-%d %H:%M:%S UTC' > \"$ARCUS_SINCE_FILE\"",
+              "sudo systemctl restart archive-arcus-quotes.service",
+              "result=$(systemctl show archive-arcus-quotes.service -p Result --value); if [ \"$result\" != \"success\" ]; then echo \"archive-arcus-quotes.service Result=$result\"; sudo journalctl -u archive-arcus-quotes.service --since \"$(cat \"$ARCUS_SINCE_FILE\")\" --no-pager; exit 1; fi",
+              "sudo journalctl -u archive-arcus-quotes.service --since \"$(cat \"$ARCUS_SINCE_FILE\")\" --no-pager | grep -q 'sync complete' || { echo 'archive script did not report sync complete since the restart'; sudo journalctl -u archive-arcus-quotes.service --since \"$(cat \"$ARCUS_SINCE_FILE\")\" --no-pager; exit 1; }",
+              "sudo systemctl enable --now archive-arcus-quotes.timer && systemctl list-timers archive-arcus-quotes.timer --no-pager | tail -3"
+            ],
+            "executionTimeout": ["4200"]
+          }
+          JSON
+          sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; \
+                  s|__SCRIPT_S3_KEY__|${SCRIPT_S3_KEY}|g; \
+                  s|__UNIT_S3_KEY__|${UNIT_S3_KEY}|g; \
+                  s|__TIMER_S3_KEY__|${TIMER_S3_KEY}|g" /tmp/ssm-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${ARCUS_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy Arcus Spot S3 archive (dex-connector)" \
+            --parameters file:///tmp/ssm-params.json \
+            --timeout-seconds 300 \
+            --query "Command.CommandId" \
+            --output text)
+
+          # executionTimeout above (4200s) covers the *whole* command list --
+          # downloads, unit install, `systemctl restart` (which can itself
+          # run up to the service's own 3600s TimeoutStartSec), and the
+          # result/timer-enable steps after it -- not just the archive
+          # script's own run, so it's set above 3600s with a buffer for that
+          # surrounding overhead (Codex P2 follow-up, dex-connector#50).
+          # This poll cap is sized to stay comfortably above executionTimeout
+          # (4200s) plus delivery (300s) above -- aws s3 sync's upload time
+          # grows with the collectors' ever-appending samples.jsonl files, so
+          # this isn't bounded by a fixed retry count the way the
+          # recorder/collector workflows' worst case is.
+          set +e
+          STATUS="Pending"
+          for _ in $(seq 1 320); do
+            STATUS=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
+            case "$STATUS" in
+              Pending|InProgress|Delayed|"") sleep 15 ;;
+              *) break ;;
+            esac
+          done
+          case "$STATUS" in
+            Pending|InProgress|Delayed|"")
+              REFRESHED=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query "Status" --output text 2>/dev/null)
+              [ -n "$REFRESHED" ] && STATUS="$REFRESHED"
+              ;;
+          esac
+          aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --output text
+          [ "$STATUS" = "Success" ]
