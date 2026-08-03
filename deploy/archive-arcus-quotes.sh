@@ -11,12 +11,12 @@
 # (archive-rwa-logs.sh, bot-strategy#574).
 #
 # The instance role can Get/PutObject under the isolated arcus-archive/
-# prefix (GetObject needed for the regression check below, via
-# HeadObject/GetObject) but NOT DeleteObject or write to any other prefix
-# in the shared bucket -- List and object permissions are two separate IAM
-# statements (bucket-ARN + s3:prefix condition for ListBucket, object-ARN
-# glob for GetObject/PutObject), since combining them in one statement
-# silently breaks the object actions (bot-strategy IAM incident, see
+# prefix (GetObject needed for the regression check below) but NOT
+# DeleteObject or write to any other prefix in the shared bucket -- List
+# and object permissions are two separate IAM statements (bucket-ARN +
+# s3:prefix condition for ListBucket, object-ARN glob for
+# GetObject/PutObject), since combining them in one statement silently
+# breaks the object actions (bot-strategy IAM incident, see
 # feedback_iam_s3_prefix_condition in project memory).
 #
 # Each fixed samples.jsonl key is overwritten on every run, which would
@@ -32,6 +32,21 @@
 # already archived in S3, so a regression requires deliberate operator
 # intervention rather than silently overwriting irreplaceable history on
 # the next scheduled run.
+#
+# Both sides of that comparison (the local snapshot and the downloaded
+# archived content) are bounded, capacity-checked regular temp files
+# rather than a FIFO stream: an earlier FIFO-based design avoided
+# materializing the archived object on disk, but shell-level FIFO
+# producer/consumer synchronization (making a background writer's
+# failure promptly deliver EOF to a reader without a background process
+# inheriting -- and thereby permanently holding open -- the coordinating
+# descriptor) proved to have more edge cases than the disk-usage problem
+# it was solving; seven follow-up review rounds surfaced blocking-open
+# races, FD_CLOEXEC/inheritance bugs, and a fallback-writer-vs-reader
+# ordering race that manual testing confirmed could still hang the
+# service (Codex P1/P2 follow-ups, dex-connector#50 rounds 15-23). A
+# plain bounded temp file, guarded by the same /tmp capacity check
+# either way, is simpler and provably race-free.
 #
 # S3 layout (isolated from the arcus-quote-collector/arcus-spot-recorder/
 # deploy/ deploy-artifact prefixes the same bucket also holds):
@@ -53,18 +68,37 @@ S3_PREFIX="${S3_PREFIX:-arcus-archive}"
 ARCUS_QUOTE_DIR="${ARCUS_QUOTE_DIR:-/var/lib/debot-arcus/spot-quote}"
 ARCUS_RUST_DIR="${ARCUS_RUST_DIR:-/var/lib/debot-arcus/spot-rust}"
 
-# Every mktemp'd path created below (snapshots, FIFOs, head-object stderr
-# captures) is registered here and removed unconditionally on exit --
-# whether the script finishes normally or aborts via `set -e`/an explicit
-# `exit 1` partway through a check -- so a persistent regression or
-# transient S3 error can't leave archive-sized leftovers accumulating in
-# /tmp across daily timer runs (Codex P2 follow-up, dex-connector#50
-# round 16).
+# Every mktemp'd path created below (snapshots, downloaded archive
+# copies, head-object stderr captures) is registered here and removed
+# unconditionally on exit -- whether the script finishes normally or
+# aborts via `set -e`/an explicit `exit 1` partway through a check -- so
+# a persistent regression or transient S3 error can't leave
+# archive-sized leftovers accumulating in /tmp across daily timer runs
+# (Codex P2 follow-up, dex-connector#50 round 16).
 TEMP_PATHS=()
 cleanup_temp_paths() {
     rm -rf "${TEMP_PATHS[@]}" 2>/dev/null || true
 }
 trap cleanup_temp_paths EXIT
+
+# Both archives grow without bound, so materializing a full-size copy of
+# either one in /tmp -- the local snapshot below, or the downloaded
+# archived content in check_no_size_regression -- could in principle
+# consume enough of /tmp to disrupt other host processes sharing the
+# same filesystem; check headroom explicitly before each and fail loudly
+# instead of letting the copy run /tmp down to empty (Codex P2
+# follow-up, dex-connector#50 round 18).
+check_tmp_capacity() {
+    local needed_bytes="$1" what="$2"
+    local avail_bytes tmp_dir margin_bytes
+    tmp_dir="${TMPDIR:-/tmp}"
+    avail_bytes=$(df --output=avail -B1 "$tmp_dir" | tail -n 1 | tr -d ' ')
+    margin_bytes=$((100 * 1024 * 1024))
+    if [ "$avail_bytes" -lt "$((needed_bytes + margin_bytes))" ]; then
+        echo "ERROR: not enough free space in $tmp_dir for $what ($needed_bytes bytes needed, $avail_bytes available) -- refusing to risk exhausting /tmp for other host processes. Investigate before retrying." >&2
+        exit 1
+    fi
+}
 
 # S3 (not a local tracking file, which could be wiped by the same
 # disk-pressure/reclone event this guards against) is the ground truth for
@@ -109,70 +143,28 @@ check_no_size_regression() {
     # unrelated file, silently losing the history this guard exists to
     # protect (Codex P1 follow-up, dex-connector#50 round 14). Require the
     # source to still start with the same bytes already archived --
-    # append-only growth passes, a truncate-and-regrow does not.
+    # append-only growth passes, a truncate-and-regrow does not. `aws s3
+    # cp ... -` (unlike `aws s3api get-object`, whose outfile argument is
+    # a literal path, not a stdout convention -- Codex P1 follow-up,
+    # dex-connector#50 round 16) streams the object body straight to
+    # stdout, so this downloads the object exactly once into a bounded,
+    # capacity-checked temp file rather than a FIFO -- see the header
+    # comment for why a FIFO-streaming design was dropped.
     if [ "$remote_size" -gt 0 ]; then
-        # `aws s3api get-object`'s trailing argument is a literal outfile
-        # path (per the AWS CLI reference), not the `aws s3 cp` stdout
-        # convention -- passing `-` creates a file actually named "-"
-        # once an archive key exists, so every run after the first would
-        # silently compare against that empty/wrong file and reject a
-        # valid source (Codex P1 follow-up, dex-connector#50 round 16).
-        # Stream through a FIFO instead of a regular file so the archived
-        # object -- itself unbounded, since the collectors never rotate --
-        # is never staged as a second full-size copy on disk either
-        # (Codex P2 follow-up, dex-connector#50 round 15). No fixed local
-        # timeout on either side: a short one would reject an otherwise
-        # healthy download of a large archived object well before the
-        # unit's own TimeoutStartSec (3600s) is reached, permanently
-        # stalling the backup on every subsequent run (Codex P2
-        # follow-up, dex-connector#50 round 17) -- that TimeoutStartSec
-        # budget, not a constant re-guessed here, is what should bound
-        # this.
-        # `mktemp -u` only prints a name without creating anything --
-        # `mktemp --help` explicitly documents `-u` as unsafe -- so a
-        # compromised collector account watching for this root-owned
-        # command (e.g. via /proc) could pre-create the chosen path in
-        # the gap before `mkfifo` runs, making `mkfifo` fail under
-        # `set -e` and permanently block every subsequent archive
-        # attempt (Codex P2 follow-up, dex-connector#50 round 22).
-        # `mktemp -d` instead atomically creates a root-only (mode 700)
-        # directory that an unprivileged account can't write into, so
-        # nothing can be pre-planted inside it before the FIFO is
-        # created there. `-m 600` on the FIFO itself additionally keeps
-        # the unprivileged collector account from opening it as a
-        # second reader and splitting the byte stream, corrupting the
-        # comparison (Codex P2 follow-up, dex-connector#50 round 19).
-        local fifo_dir fifo
-        fifo_dir=$(mktemp -d)
-        TEMP_PATHS+=("$fifo_dir")
-        fifo="$fifo_dir/fifo"
-        mkfifo -m 600 "$fifo"
-        (
-            if ! aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
-                --range "bytes=0-$((remote_size - 1))" "$fifo" >/dev/null 2>&1; then
-                # aws can exit (auth failure, throttling, a transient
-                # service error) before ever opening $fifo as a writer;
-                # the blocking reader-open on the other end would then
-                # wait forever instead of failing promptly, hanging this
-                # service until its 3600s TimeoutStartSec (Codex P2
-                # follow-up, dex-connector#50 round 20). Opening
-                # read-write never blocks, unlike a write-only open, so
-                # this always unblocks a stuck reader with EOF whether or
-                # not aws itself ever touched the FIFO.
-                exec 3<>"$fifo"
-                exec 3>&-
-                exit 1
-            fi
-        ) &
-        local get_pid=$!
-        local content_matches=0
-        cmp -s "$fifo" <(head -c "$remote_size" "$snapshot") || content_matches=1
-        wait "$get_pid" || content_matches=1
-        rm -rf "$fifo_dir"
-        if [ "$content_matches" -ne 0 ]; then
-            echo "ERROR: $label does not match (or could not be verified against) the content already archived at s3://${S3_BUCKET}/${s3_key} (first $remote_size bytes) -- refusing to upload; either the source was reset and regrown rather than simply appended to, or the archived content could not be downloaded for verification. Investigate before retrying." >&2
+        check_tmp_capacity "$remote_size" "the archived content of $label at s3://${S3_BUCKET}/${s3_key}"
+
+        local remote_copy
+        remote_copy=$(mktemp)
+        TEMP_PATHS+=("$remote_copy")
+        if ! aws s3 cp --no-progress "s3://${S3_BUCKET}/${s3_key}" - >"$remote_copy" 2>/dev/null; then
+            echo "ERROR: failed to download archived content for $label at s3://${S3_BUCKET}/${s3_key} to verify against local file" >&2
             exit 1
         fi
+        if ! cmp -s "$remote_copy" <(head -c "$remote_size" "$snapshot"); then
+            echo "ERROR: $label does not match the content already archived at s3://${S3_BUCKET}/${s3_key} (first $remote_size bytes) -- refusing to upload; the source appears to have been reset and regrown rather than simply appended to. Investigate before retrying." >&2
+            exit 1
+        fi
+        rm -f "$remote_copy"
     fi
 }
 
@@ -205,20 +197,9 @@ archive_source() {
         exit 1
     fi
 
-    # Both archives grow without bound, so a full-file snapshot could in
-    # principle consume enough of /tmp to disrupt other host processes
-    # sharing the same filesystem; check headroom explicitly and fail
-    # loudly instead of letting `cp` run /tmp down to empty (Codex P2
-    # follow-up, dex-connector#50 round 18).
-    local src_size avail_bytes tmp_dir margin_bytes
-    tmp_dir="${TMPDIR:-/tmp}"
+    local src_size
     src_size=$(stat -c%s "$src_file")
-    avail_bytes=$(df --output=avail -B1 "$tmp_dir" | tail -n 1 | tr -d ' ')
-    margin_bytes=$((100 * 1024 * 1024))
-    if [ "$avail_bytes" -lt "$((src_size + margin_bytes))" ]; then
-        echo "ERROR: not enough free space in $tmp_dir to snapshot '$src_file' ($src_size bytes needed, $avail_bytes available) -- refusing to risk exhausting /tmp for other host processes. Investigate before retrying." >&2
-        exit 1
-    fi
+    check_tmp_capacity "$src_size" "a snapshot of '$src_file'"
 
     local snapshot
     snapshot=$(mktemp)
