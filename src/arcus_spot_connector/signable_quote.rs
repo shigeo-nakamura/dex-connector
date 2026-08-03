@@ -9,6 +9,7 @@ use super::{
     normalize_symbol, parse_raw_amount, validate_token, ArcusSpotClient, ArcusSpotError,
     ArcusSpotObservation, ArcusSpotToken,
 };
+use chrono::Utc;
 use ethers::types::{
     transaction::eip712::{Eip712, TypedData, Types as Eip712Types},
     Address, U256,
@@ -907,7 +908,6 @@ impl ArcusSpotClient {
                 "sell and buy token addresses are identical".to_string(),
             ));
         }
-        let sell_amount = parse_raw_amount("sellAmount", &request.sell_amount)?;
         let query = vec![
             ("chainId", self.inner.config.chain_id.to_string()),
             ("sellToken", sell.address.clone()),
@@ -926,7 +926,91 @@ impl ArcusSpotClient {
         if let Some(venue) = only_venue {
             project_signable_response_to_venue(&mut response.payload, venue)?;
         }
-        let now_unix = timestamp_u64(response.received_at.timestamp())?;
+        let received_at = response.received_at;
+        let observation = ArcusSpotSignableQuoteObservation {
+            chain_id: self.inner.config.chain_id,
+            request: request.clone(),
+            sell_token: sell,
+            buy_token: buy,
+            response,
+        };
+        self.validate_signable_observation_at(
+            &observation,
+            only_venue,
+            timestamp_u64(received_at.timestamp())?,
+        )?;
+        Ok(observation)
+    }
+
+    /// Repeat every trust and schema check immediately before an Arcus quote
+    /// is signed. Observations are serializable evidence and therefore must
+    /// never be treated as carrying an unforgeable "already validated" bit.
+    pub(crate) fn revalidate_arcus_signable_observation(
+        &self,
+        observation: &ArcusSpotSignableQuoteObservation,
+    ) -> Result<(), ArcusSpotError> {
+        self.validate_signable_observation_at(
+            observation,
+            Some("arcus"),
+            timestamp_u64(Utc::now().timestamp())?,
+        )
+    }
+
+    fn validate_signable_observation_at(
+        &self,
+        observation: &ArcusSpotSignableQuoteObservation,
+        only_venue: Option<&str>,
+        now_unix: u64,
+    ) -> Result<(), ArcusSpotError> {
+        let taker = observation.request.validate()?;
+        validate_token(&observation.sell_token)?;
+        validate_token(&observation.buy_token)?;
+        self.require_trusted_token_address(&observation.sell_token)?;
+        self.require_trusted_token_address(&observation.buy_token)?;
+        if observation.chain_id != self.inner.config.chain_id
+            || observation.sell_token.chain_id != self.inner.config.chain_id
+            || observation.buy_token.chain_id != self.inner.config.chain_id
+        {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "signable observation chain mismatch: expected {}, got observation={} sell={} buy={}",
+                self.inner.config.chain_id,
+                observation.chain_id,
+                observation.sell_token.chain_id,
+                observation.buy_token.chain_id
+            )));
+        }
+        if normalize_symbol(&observation.sell_token.symbol)
+            != normalize_symbol(&observation.request.sell_symbol)
+            || normalize_symbol(&observation.buy_token.symbol)
+                != normalize_symbol(&observation.request.buy_symbol)
+        {
+            return Err(ArcusSpotError::InvalidResponse(
+                "signable observation token symbols do not match its request".to_string(),
+            ));
+        }
+        let sell_address = parse_address("sellToken", &observation.sell_token.address)?;
+        let buy_address = parse_address("buyToken", &observation.buy_token.address)?;
+        if sell_address == buy_address {
+            return Err(ArcusSpotError::InvalidResponse(
+                "sell and buy token addresses are identical".to_string(),
+            ));
+        }
+        if let Some(venue) = only_venue {
+            if observation.response.payload.quotes.len() != 1
+                || !observation.response.payload.quotes[0]
+                    .venue
+                    .eq_ignore_ascii_case(venue)
+                || !observation
+                    .response
+                    .payload
+                    .recommended
+                    .eq_ignore_ascii_case(venue)
+            {
+                return Err(ArcusSpotError::InvalidResponse(format!(
+                    "signable observation must contain exactly one recommended {venue} quote"
+                )));
+            }
+        }
         let trusted_spenders = self
             .inner
             .config
@@ -945,23 +1029,16 @@ impl ArcusSpotClient {
                 Ok((venue.to_ascii_lowercase(), parsed))
             })
             .collect::<Result<BTreeMap<_, _>, ArcusSpotError>>()?;
-        response.payload.validate(&QuoteExpectations {
+        observation.response.payload.validate(&QuoteExpectations {
             chain_id: self.inner.config.chain_id,
             sell_token: sell_address,
             buy_token: buy_address,
-            sell_amount,
+            sell_amount: parse_raw_amount("sellAmount", &observation.request.sell_amount)?,
             taker,
-            slippage_bps: request.slippage_bps,
-            route_policy: request.route_policy,
+            slippage_bps: observation.request.slippage_bps,
+            route_policy: observation.request.route_policy,
             now_unix,
             trusted_spenders,
-        })?;
-        Ok(ArcusSpotSignableQuoteObservation {
-            chain_id: self.inner.config.chain_id,
-            request: request.clone(),
-            sell_token: sell,
-            buy_token: buy,
-            response,
         })
     }
 

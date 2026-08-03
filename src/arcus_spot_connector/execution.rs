@@ -173,6 +173,7 @@ impl ArcusSpotSubmitError {
 /// permit. Custody remains outside this connector, so S may be an AWS KMS
 /// signer without exposing key material here.
 pub async fn sign_arcus_spot_quote<S>(
+    client: &ArcusSpotClient,
     observation: &ArcusSpotSignableQuoteObservation,
     signer: &S,
     permit: Option<&ArcusSpotEip2612PermitContext>,
@@ -181,6 +182,7 @@ where
     S: Signer + Sync,
     S::Error: Display,
 {
+    client.revalidate_arcus_signable_observation(observation)?;
     let (quote, taker, typed_data) = execution_quote(observation)?;
     if signer.address() != taker {
         return Err(ArcusSpotError::InvalidResponse(format!(
@@ -379,6 +381,10 @@ fn verify_signature(
     Ok(())
 }
 
+fn is_definitive_submit_rejection(status: u16) -> bool {
+    matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422)
+}
+
 impl ArcusSpotClient {
     /// Dispatch one signed submission exactly once. Never retries.
     pub async fn submit_signed_quote_once(
@@ -435,10 +441,21 @@ impl ArcusSpotClient {
                 ),
             })?;
         if !status.is_success() {
-            return Err(ArcusSpotSubmitError::Rejected {
+            let status_code = status.as_u16();
+            let body = super::truncated_body(&body);
+            if is_definitive_submit_rejection(status_code) {
+                return Err(ArcusSpotSubmitError::Rejected {
+                    endpoint: endpoint.to_string(),
+                    status: status_code,
+                    body,
+                });
+            }
+            return Err(ArcusSpotSubmitError::Unknown {
                 endpoint: endpoint.to_string(),
-                status: status.as_u16(),
-                body: super::truncated_body(&body),
+                classification: ArcusSpotFailureClass::Http,
+                detail: format!(
+                    "HTTP {status_code} did not prove pre-acceptance rejection: {body}"
+                ),
             });
         }
         let payload: ArcusSpotSwapStatus =
@@ -807,6 +824,99 @@ mod tests {
         time::{timeout, Duration},
     };
 
+    fn trusted_client(router_base_url: String) -> ArcusSpotClient {
+        ArcusSpotClient::new(ArcusSpotConfig {
+            router_base_url,
+            request_timeout_ms: 1_000,
+            min_request_interval_ms: 1,
+            max_attempts: 5,
+            trusted_permit2_spenders: BTreeMap::from([(
+                ARCUS_VENUE.to_string(),
+                vec!["0x006102b16A04c20306A28b652745D3973D7D24fa".to_string()],
+            )]),
+            trusted_token_addresses: BTreeMap::from([
+                (
+                    "NVDA".to_string(),
+                    "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+                ),
+                (
+                    "AMD".to_string(),
+                    "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
+                ),
+            ]),
+            trusted_token_decimals: BTreeMap::from([
+                ("NVDA".to_string(), 18),
+                ("AMD".to_string(), 18),
+            ]),
+            ..ArcusSpotConfig::default()
+        })
+        .unwrap()
+    }
+
+    fn fresh_arcus_observation(taker: Address) -> ArcusSpotSignableQuoteObservation {
+        let now = Utc::now();
+        let deadline = u64::try_from(now.timestamp()).unwrap() + 60;
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(include_str!("fixtures/quote_nvda_amd.json")).unwrap();
+        response
+            .quotes
+            .retain(|quote| quote.venue.eq_ignore_ascii_case(ARCUS_VENUE));
+        response.recommended = ARCUS_VENUE.to_string();
+        let quote = response.quotes.first_mut().unwrap();
+        quote.expiry = Some(deadline);
+        quote.to_sign["message"]["witness"]["taker"] = Value::String(format!("{taker:#x}"));
+        quote.to_sign["message"]["deadline"] = Value::String(deadline.to_string());
+        quote.to_sign["message"]["witness"]["deadline"] = Value::String(deadline.to_string());
+        let tokens: Vec<crate::arcus_spot_connector::ArcusSpotToken> =
+            serde_json::from_str(include_str!("fixtures/tokens_nvda_amd.json")).unwrap();
+        ArcusSpotSignableQuoteObservation {
+            chain_id: 4663,
+            request: crate::arcus_spot_connector::ArcusSpotSignableQuoteRequest::new(
+                "NVDA",
+                "AMD",
+                "1000",
+                format!("{taker:#x}"),
+                37,
+                ArcusSpotQuoteRoutePolicy::DirectTokenOnly,
+            ),
+            sell_token: tokens
+                .iter()
+                .find(|token| token.symbol == "NVDA")
+                .unwrap()
+                .clone(),
+            buy_token: tokens
+                .iter()
+                .find(|token| token.symbol == "AMD")
+                .unwrap()
+                .clone(),
+            response: ArcusSpotObservation {
+                payload: response,
+                requested_at: now,
+                received_at: now,
+                latency_ms: 1,
+                attempts: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn signing_revalidates_deserialized_observation_against_client_trust() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let mut observation = fresh_arcus_observation(wallet.address());
+        observation.response.payload.quotes[0].to_sign["domain"]["verifyingContract"] =
+            Value::String("0x0000000000000000000000000000000000000001".to_string());
+        let client = trusted_client("http://127.0.0.1:1/".to_string());
+
+        let error = sign_arcus_spot_quote(&client, &observation, &wallet, None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("is not Permit2"));
+    }
+
     #[test]
     fn status_parses_official_unknown_shape() {
         let status: ArcusSpotSwapStatus = serde_json::from_str(
@@ -858,6 +968,54 @@ mod tests {
             .validate("arcus", Some(H256::from_low_u64_be(2)))
             .is_err());
     }
+    #[tokio::test]
+    async fn server_error_is_unknown_and_post_is_not_retried() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = trusted_client(format!("http://{address}/"));
+        let observation = fresh_arcus_observation(wallet.address());
+        let submission = sign_arcus_spot_quote(&client, &observation, &wallet, None)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8_192];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\nconnection: close\r\n\r\noops",
+                )
+                .await
+                .unwrap();
+            assert!(
+                timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err(),
+                "submit path opened a second connection"
+            );
+            1_u32
+        });
+
+        let error = client
+            .submit_signed_quote_once(&submission)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArcusSpotSubmitError::Unknown {
+                classification: ArcusSpotFailureClass::Http,
+                ..
+            }
+        ));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn malformed_success_is_unknown_and_post_is_not_retried() {
         let wallet = LocalWallet::from_str(
