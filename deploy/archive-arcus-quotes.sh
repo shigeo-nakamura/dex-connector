@@ -141,8 +141,23 @@ check_no_size_regression() {
         fifo=$(mktemp -u)
         mkfifo -m 600 "$fifo"
         TEMP_PATHS+=("$fifo")
-        aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
-            --range "bytes=0-$((remote_size - 1))" "$fifo" >/dev/null 2>&1 &
+        (
+            if ! aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
+                --range "bytes=0-$((remote_size - 1))" "$fifo" >/dev/null 2>&1; then
+                # aws can exit (auth failure, throttling, a transient
+                # service error) before ever opening $fifo as a writer;
+                # the blocking reader-open on the other end would then
+                # wait forever instead of failing promptly, hanging this
+                # service until its 3600s TimeoutStartSec (Codex P2
+                # follow-up, dex-connector#50 round 20). Opening
+                # read-write never blocks, unlike a write-only open, so
+                # this always unblocks a stuck reader with EOF whether or
+                # not aws itself ever touched the FIFO.
+                exec 3<>"$fifo"
+                exec 3>&-
+                exit 1
+            fi
+        ) &
         local get_pid=$!
         local content_matches=0
         cmp -s "$fifo" <(head -c "$remote_size" "$snapshot") || content_matches=1
