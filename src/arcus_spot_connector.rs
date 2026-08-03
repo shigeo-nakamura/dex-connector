@@ -405,6 +405,8 @@ struct ArcusSpotClientInner {
     meta_base_url: Url,
     indexer_base_url: Url,
     http: Client,
+    #[cfg(feature = "arcus-spot-execution")]
+    submit_http: Client,
     /// Both pacing timestamps behind a single lock, checked and updated as
     /// one atomic step. `pace()` re-reads them fresh on every iteration —
     /// including right before actually sending — rather than sleeping
@@ -444,6 +446,17 @@ impl ArcusSpotClient {
             .map_err(|error| {
                 ArcusSpotError::InvalidConfig(format!("could not build HTTP client: {error}"))
             })?;
+        #[cfg(feature = "arcus-spot-execution")]
+        let submit_http = Client::builder()
+            .timeout(Duration::from_millis(config.request_timeout_ms))
+            .user_agent(config.user_agent.clone())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                ArcusSpotError::InvalidConfig(format!(
+                    "could not build no-redirect submit HTTP client: {error}"
+                ))
+            })?;
         let now = Instant::now();
         // Backdated by the pacing interval so the very first request isn't
         // delayed waiting out an interval against a same-instant baseline.
@@ -457,6 +470,8 @@ impl ArcusSpotClient {
                 meta_base_url,
                 indexer_base_url,
                 http,
+                #[cfg(feature = "arcus-spot-execution")]
+                submit_http,
                 pace_state: Mutex::new(PaceState {
                     last_sent_at,
                     rate_limit_until: now,

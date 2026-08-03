@@ -400,11 +400,14 @@ impl ArcusSpotClient {
                 ArcusSpotError::InvalidConfig(format!("invalid submit endpoint: {error}"))
             })?;
         self.pace().await;
+        // The shared pacing gate may outlive a short quote. Re-run the full
+        // pre-dispatch validation after waiting and immediately before POST.
+        validate_submission(submission, &self.inner.config)?;
         let requested_at = Utc::now();
         let started = Instant::now();
         let response = self
             .inner
-            .http
+            .submit_http
             .post(endpoint.clone())
             .json(submission)
             .send()
@@ -854,8 +857,15 @@ mod tests {
     }
 
     fn fresh_arcus_observation(taker: Address) -> ArcusSpotSignableQuoteObservation {
+        fresh_arcus_observation_with_ttl(taker, 60)
+    }
+
+    fn fresh_arcus_observation_with_ttl(
+        taker: Address,
+        ttl_secs: u64,
+    ) -> ArcusSpotSignableQuoteObservation {
         let now = Utc::now();
-        let deadline = u64::try_from(now.timestamp()).unwrap() + 60;
+        let deadline = u64::try_from(now.timestamp()).unwrap() + ttl_secs;
         let mut response: ArcusSpotSignableQuoteResponse =
             serde_json::from_str(include_str!("fixtures/quote_nvda_amd.json")).unwrap();
         response
@@ -968,6 +978,83 @@ mod tests {
             .validate("arcus", Some(H256::from_low_u64_be(2)))
             .is_err());
     }
+    #[tokio::test]
+    async fn redirect_is_unknown_and_post_is_not_retried() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = trusted_client(format!("http://{address}/"));
+        let observation = fresh_arcus_observation(wallet.address());
+        let submission = sign_arcus_spot_quote(&client, &observation, &wallet, None)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8_192];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0);
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{address}/redirected\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            assert!(
+                timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err(),
+                "submit path followed the redirect with a second POST"
+            );
+            1_u32
+        });
+
+        let error = client
+            .submit_signed_quote_once(&submission)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArcusSpotSubmitError::Unknown {
+                classification: ArcusSpotFailureClass::Http,
+                ..
+            }
+        ));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pacing_wait_rechecks_deadline_before_post() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = trusted_client(format!("http://{address}/"));
+        let observation = fresh_arcus_observation_with_ttl(wallet.address(), 6);
+        let submission = sign_arcus_spot_quote(&client, &observation, &wallet, None)
+            .await
+            .unwrap();
+        client
+            .record_retry_after(Duration::from_millis(2_100))
+            .await;
+
+        let error = client
+            .submit_signed_quote_once(&submission)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ArcusSpotSubmitError::Preflight(_)));
+        assert!(
+            timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "expired submission reached the POST endpoint"
+        );
+    }
+
     #[tokio::test]
     async fn server_error_is_unknown_and_post_is_not_retried() {
         let wallet = LocalWallet::from_str(
