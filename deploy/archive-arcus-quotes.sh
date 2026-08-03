@@ -62,7 +62,7 @@ ARCUS_RUST_DIR="${ARCUS_RUST_DIR:-/var/lib/debot-arcus/spot-rust}"
 # round 16).
 TEMP_PATHS=()
 cleanup_temp_paths() {
-    rm -f "${TEMP_PATHS[@]}" 2>/dev/null || true
+    rm -rf "${TEMP_PATHS[@]}" 2>/dev/null || true
 }
 trap cleanup_temp_paths EXIT
 
@@ -128,19 +128,25 @@ check_no_size_regression() {
         # follow-up, dex-connector#50 round 17) -- that TimeoutStartSec
         # budget, not a constant re-guessed here, is what should bound
         # this.
-        # `mkfifo`'s default mode (a=rw minus umask, typically 0644 under
-        # this service's umask) would let the unprivileged collector
-        # account -- which this oneshot deliberately runs alongside as
-        # root, see the header comment above -- open the FIFO for
-        # reading too; FIFO readers split the byte stream between them,
-        # so a competing reader would make `cmp` see truncated/garbled
-        # content and reject an otherwise valid backup (Codex P2
-        # follow-up, dex-connector#50 round 19). `-m 600` sets the mode
-        # directly rather than relying on umask.
-        local fifo
-        fifo=$(mktemp -u)
+        # `mktemp -u` only prints a name without creating anything --
+        # `mktemp --help` explicitly documents `-u` as unsafe -- so a
+        # compromised collector account watching for this root-owned
+        # command (e.g. via /proc) could pre-create the chosen path in
+        # the gap before `mkfifo` runs, making `mkfifo` fail under
+        # `set -e` and permanently block every subsequent archive
+        # attempt (Codex P2 follow-up, dex-connector#50 round 22).
+        # `mktemp -d` instead atomically creates a root-only (mode 700)
+        # directory that an unprivileged account can't write into, so
+        # nothing can be pre-planted inside it before the FIFO is
+        # created there. `-m 600` on the FIFO itself additionally keeps
+        # the unprivileged collector account from opening it as a
+        # second reader and splitting the byte stream, corrupting the
+        # comparison (Codex P2 follow-up, dex-connector#50 round 19).
+        local fifo_dir fifo
+        fifo_dir=$(mktemp -d)
+        TEMP_PATHS+=("$fifo_dir")
+        fifo="$fifo_dir/fifo"
         mkfifo -m 600 "$fifo"
-        TEMP_PATHS+=("$fifo")
         (
             if ! aws s3api get-object --bucket "$S3_BUCKET" --key "$s3_key" \
                 --range "bytes=0-$((remote_size - 1))" "$fifo" >/dev/null 2>&1; then
@@ -162,7 +168,7 @@ check_no_size_regression() {
         local content_matches=0
         cmp -s "$fifo" <(head -c "$remote_size" "$snapshot") || content_matches=1
         wait "$get_pid" || content_matches=1
-        rm -f "$fifo"
+        rm -rf "$fifo_dir"
         if [ "$content_matches" -ne 0 ]; then
             echo "ERROR: $label does not match (or could not be verified against) the content already archived at s3://${S3_BUCKET}/${s3_key} (first $remote_size bytes) -- refusing to upload; either the source was reset and regrown rather than simply appended to, or the archived content could not be downloaded for verification. Investigate before retrying." >&2
             exit 1
