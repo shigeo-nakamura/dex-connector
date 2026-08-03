@@ -236,6 +236,15 @@ archive_source() {
     local dest="s3://${S3_BUCKET}/${s3_key}"
     echo "[archive_arcus_quotes] src=$src_file dest=$dest"
     aws s3 cp --no-progress "$snapshot" "$dest"
+
+    # Free this snapshot immediately rather than waiting for the
+    # process-wide EXIT trap: both sources are unbounded, and the second
+    # source's capacity preflight would otherwise see the first
+    # source's already-uploaded snapshot still occupying /tmp, failing a
+    # combined-size-only regression even though each fits individually
+    # (Codex P2 follow-up, dex-connector#50 round 21). `rm -f` here is
+    # safe to also run again from the trap on later failures.
+    rm -f "$snapshot"
 }
 
 archive_source "$ARCUS_QUOTE_DIR" "spot-quote" "spot-quote"
