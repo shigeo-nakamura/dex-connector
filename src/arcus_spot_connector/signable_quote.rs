@@ -9,6 +9,8 @@ use super::{
     normalize_symbol, parse_raw_amount, validate_token, ArcusSpotClient, ArcusSpotError,
     ArcusSpotObservation, ArcusSpotToken,
 };
+#[cfg(feature = "arcus-spot-execution")]
+use chrono::Utc;
 use ethers::types::{
     transaction::eip712::{Eip712, TypedData, Types as Eip712Types},
     Address, U256,
@@ -663,6 +665,23 @@ impl ArcusSpotSignableQuoteResponse {
     }
 }
 
+fn project_signable_response_to_venue(
+    response: &mut ArcusSpotSignableQuoteResponse,
+    venue: &str,
+) -> Result<(), ArcusSpotError> {
+    response
+        .quotes
+        .retain(|quote| quote.venue.eq_ignore_ascii_case(venue));
+    if response.quotes.len() != 1 {
+        return Err(ArcusSpotError::InvalidResponse(format!(
+            "expected exactly one {venue} signable quote, found {}",
+            response.quotes.len()
+        )));
+    }
+    response.recommended = response.quotes[0].venue.clone();
+    Ok(())
+}
+
 /// Request and validated response evidence for one directed pre-sign quote.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArcusSpotSignableQuoteObservation {
@@ -849,6 +868,26 @@ impl ArcusSpotClient {
         &self,
         request: &ArcusSpotSignableQuoteRequest,
     ) -> Result<ArcusSpotSignableQuoteObservation, ArcusSpotError> {
+        self.signable_quote_by_symbol_inner(request, None).await
+    }
+
+    /// Request the same public payload but retain and validate exactly one
+    /// direct Arcus venue quote. Unsupported comparison venues remain
+    /// fail-closed in signable_quote_by_symbol, while the Arcus execution
+    /// path cannot be denied merely because the router also returned one.
+    pub async fn arcus_signable_quote_by_symbol(
+        &self,
+        request: &ArcusSpotSignableQuoteRequest,
+    ) -> Result<ArcusSpotSignableQuoteObservation, ArcusSpotError> {
+        self.signable_quote_by_symbol_inner(request, Some("arcus"))
+            .await
+    }
+
+    async fn signable_quote_by_symbol_inner(
+        &self,
+        request: &ArcusSpotSignableQuoteRequest,
+        only_venue: Option<&str>,
+    ) -> Result<ArcusSpotSignableQuoteObservation, ArcusSpotError> {
         let taker = request.validate()?;
         let sell = self.verified_token(&request.sell_symbol).await?;
         let buy = self.verified_token(&request.buy_symbol).await?;
@@ -870,7 +909,6 @@ impl ArcusSpotClient {
                 "sell and buy token addresses are identical".to_string(),
             ));
         }
-        let sell_amount = parse_raw_amount("sellAmount", &request.sell_amount)?;
         let query = vec![
             ("chainId", self.inner.config.chain_id.to_string()),
             ("sellToken", sell.address.clone()),
@@ -883,10 +921,98 @@ impl ArcusSpotClient {
                 request.route_policy.allow_wrapped().to_string(),
             ),
         ];
-        let response: ArcusSpotObservation<ArcusSpotSignableQuoteResponse> = self
+        let mut response: ArcusSpotObservation<ArcusSpotSignableQuoteResponse> = self
             .get_json(&self.inner.router_base_url, "v1/quote", &query)
             .await?;
-        let now_unix = timestamp_u64(response.received_at.timestamp())?;
+        if let Some(venue) = only_venue {
+            project_signable_response_to_venue(&mut response.payload, venue)?;
+        }
+        let received_at = response.received_at;
+        let observation = ArcusSpotSignableQuoteObservation {
+            chain_id: self.inner.config.chain_id,
+            request: request.clone(),
+            sell_token: sell,
+            buy_token: buy,
+            response,
+        };
+        self.validate_signable_observation_at(
+            &observation,
+            only_venue,
+            timestamp_u64(received_at.timestamp())?,
+        )?;
+        Ok(observation)
+    }
+
+    /// Repeat every trust and schema check immediately before an Arcus quote
+    /// is signed. Observations are serializable evidence and therefore must
+    /// never be treated as carrying an unforgeable "already validated" bit.
+    #[cfg(feature = "arcus-spot-execution")]
+    pub(crate) fn revalidate_arcus_signable_observation(
+        &self,
+        observation: &ArcusSpotSignableQuoteObservation,
+    ) -> Result<(), ArcusSpotError> {
+        self.validate_signable_observation_at(
+            observation,
+            Some("arcus"),
+            timestamp_u64(Utc::now().timestamp())?,
+        )
+    }
+
+    fn validate_signable_observation_at(
+        &self,
+        observation: &ArcusSpotSignableQuoteObservation,
+        only_venue: Option<&str>,
+        now_unix: u64,
+    ) -> Result<(), ArcusSpotError> {
+        let taker = observation.request.validate()?;
+        validate_token(&observation.sell_token)?;
+        validate_token(&observation.buy_token)?;
+        self.require_trusted_token_address(&observation.sell_token)?;
+        self.require_trusted_token_address(&observation.buy_token)?;
+        if observation.chain_id != self.inner.config.chain_id
+            || observation.sell_token.chain_id != self.inner.config.chain_id
+            || observation.buy_token.chain_id != self.inner.config.chain_id
+        {
+            return Err(ArcusSpotError::InvalidResponse(format!(
+                "signable observation chain mismatch: expected {}, got observation={} sell={} buy={}",
+                self.inner.config.chain_id,
+                observation.chain_id,
+                observation.sell_token.chain_id,
+                observation.buy_token.chain_id
+            )));
+        }
+        if normalize_symbol(&observation.sell_token.symbol)
+            != normalize_symbol(&observation.request.sell_symbol)
+            || normalize_symbol(&observation.buy_token.symbol)
+                != normalize_symbol(&observation.request.buy_symbol)
+        {
+            return Err(ArcusSpotError::InvalidResponse(
+                "signable observation token symbols do not match its request".to_string(),
+            ));
+        }
+        let sell_address = parse_address("sellToken", &observation.sell_token.address)?;
+        let buy_address = parse_address("buyToken", &observation.buy_token.address)?;
+        if sell_address == buy_address {
+            return Err(ArcusSpotError::InvalidResponse(
+                "sell and buy token addresses are identical".to_string(),
+            ));
+        }
+        if let Some(venue) = only_venue {
+            if observation.response.payload.quotes.len() != 1
+                || !observation.response.payload.quotes[0]
+                    .venue
+                    .eq_ignore_ascii_case(venue)
+                || !observation
+                    .response
+                    .payload
+                    .recommended
+                    .eq_ignore_ascii_case(venue)
+            {
+                return Err(ArcusSpotError::InvalidResponse(format!(
+                    "signable observation must contain exactly one recommended {venue} quote"
+                )));
+            }
+        }
         let trusted_spenders = self
             .inner
             .config
@@ -905,23 +1031,16 @@ impl ArcusSpotClient {
                 Ok((venue.to_ascii_lowercase(), parsed))
             })
             .collect::<Result<BTreeMap<_, _>, ArcusSpotError>>()?;
-        response.payload.validate(&QuoteExpectations {
+        observation.response.payload.validate(&QuoteExpectations {
             chain_id: self.inner.config.chain_id,
             sell_token: sell_address,
             buy_token: buy_address,
-            sell_amount,
+            sell_amount: parse_raw_amount("sellAmount", &observation.request.sell_amount)?,
             taker,
-            slippage_bps: request.slippage_bps,
-            route_policy: request.route_policy,
+            slippage_bps: observation.request.slippage_bps,
+            route_policy: observation.request.route_policy,
             now_unix,
             trusted_spenders,
-        })?;
-        Ok(ArcusSpotSignableQuoteObservation {
-            chain_id: self.inner.config.chain_id,
-            request: request.clone(),
-            sell_token: sell,
-            buy_token: buy,
-            response,
         })
     }
 
@@ -1214,6 +1333,58 @@ fn permit2_type_fields(witness_type: &'static str) -> [(&'static str, &'static s
         ("deadline", "uint256"),
         ("witness", witness_type),
     ]
+}
+
+#[cfg(feature = "arcus-spot-execution")]
+pub(crate) fn validate_arcus_typed_data_schema(
+    typed_data: &TypedData,
+) -> Result<(), ArcusSpotError> {
+    if typed_data.primary_type != PERMIT2_PRIMARY_TYPE
+        || typed_data.domain.name.as_deref() != Some("Permit2")
+    {
+        return Err(ArcusSpotError::InvalidResponse(
+            "Arcus submission must use the Permit2 PermitWitnessTransferFrom type".to_string(),
+        ));
+    }
+    let expected_permit2 = parse_address("Permit2 address", PERMIT2_ADDRESS)?;
+    if typed_data.domain.verifying_contract != Some(expected_permit2) {
+        return Err(ArcusSpotError::InvalidResponse(
+            "Arcus submission EIP-712 domain does not use the canonical Permit2 contract"
+                .to_string(),
+        ));
+    }
+    if typed_data.domain.version.is_some() || typed_data.domain.salt.is_some() {
+        return Err(ArcusSpotError::InvalidResponse(
+            "Arcus submission Permit2 domain unexpectedly includes version or salt".to_string(),
+        ));
+    }
+    if typed_data.types.contains_key(EIP712_DOMAIN_TYPE_NAME) {
+        require_exact_eip712_fields(
+            &typed_data.types,
+            EIP712_DOMAIN_TYPE_NAME,
+            EIP712_DOMAIN_FIELDS,
+            "arcus",
+        )?;
+    }
+    let witness_schema = canonical_witness_schema("arcus")?;
+    require_exact_eip712_fields(
+        &typed_data.types,
+        PERMIT2_PRIMARY_TYPE,
+        &permit2_type_fields(witness_schema.type_name),
+        "arcus",
+    )?;
+    require_exact_eip712_fields(
+        &typed_data.types,
+        "TokenPermissions",
+        TOKEN_PERMISSIONS_FIELDS,
+        "arcus",
+    )?;
+    require_exact_eip712_fields(
+        &typed_data.types,
+        witness_schema.type_name,
+        witness_schema.fields,
+        "arcus",
+    )
 }
 
 /// Fails unless `type_name` is declared in the venue's EIP-712 schema with
@@ -1696,6 +1867,25 @@ mod tests {
     }
 
     #[test]
+    fn arcus_projection_discards_untrusted_comparison_venues_before_validation() {
+        let mut response: ArcusSpotSignableQuoteResponse =
+            serde_json::from_str(QUOTE_FIXTURE).unwrap();
+        let mut lifi = response.quotes[0].clone();
+        lifi.venue = "lifi".to_string();
+        response.quotes.push(lifi);
+        response.recommended = "lifi".to_string();
+
+        project_signable_response_to_venue(&mut response, "arcus").unwrap();
+        assert_eq!(response.recommended, "arcus");
+        assert_eq!(response.quotes.len(), 1);
+        assert_eq!(response.quotes[0].venue, "arcus");
+        response.validate(&fixture_expectations()).unwrap();
+
+        response.quotes.push(response.quotes[0].clone());
+        assert!(project_signable_response_to_venue(&mut response, "arcus").is_err());
+    }
+
+    #[test]
     fn lifi_venue_is_rejected_outright() {
         // LiFi's signed witness only commits to a hash of opaque diamond
         // calldata; without a maintained LiFi facet ABI to decode it, this
@@ -1773,7 +1963,8 @@ mod tests {
             serde_json::from_str(QUOTE_FIXTURE).unwrap();
         let near_deadline = fixture_expectations().now_unix + 2;
         response.quotes[0].expiry = Some(near_deadline);
-        response.quotes[0].to_sign["message"]["deadline"] = Value::String(near_deadline.to_string());
+        response.quotes[0].to_sign["message"]["deadline"] =
+            Value::String(near_deadline.to_string());
         response.quotes[0].to_sign["message"]["witness"]["deadline"] =
             Value::String(near_deadline.to_string());
         let error = response.validate(&fixture_expectations()).unwrap_err();

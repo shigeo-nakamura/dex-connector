@@ -18,6 +18,7 @@ lighter-sdk = ["dep:libc", "dep:lighter-ratelimit"]
 extended-sdk = ["dep:rust-crypto-lib-base", "dep:starknet"]
 hyperliquid-sdk = []
 arcus-spot-sdk = ["dep:fs2"]
+arcus-spot-execution = ["arcus-spot-sdk"]
 arcus-sdk = []
 
 [dependencies]
