@@ -74,6 +74,24 @@ impl ArcusSpotSignedQuoteSubmission {
         })?;
         Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
     }
+
+    /// The Permit2 nonce this submission was signed under, as a canonical
+    /// decimal string.
+    ///
+    /// `submit_signed_quote_once` is one-shot and never retries, and a
+    /// transport failure or malformed success response leaves the caller
+    /// with no server-issued `tx_hash` to reconcile against later -- the
+    /// only other reconciliation path (`swap_status`) requires exactly that
+    /// hash. Unlike the server's response, this nonce is already fixed by
+    /// what was signed, so a caller can preserve it in a durable ledger
+    /// *before* dispatch and use it (e.g. checking the Permit2 contract's
+    /// own on-chain nonce-consumption state directly) to investigate an
+    /// otherwise-unidentifiable ambiguous submission (Codex P1 follow-up,
+    /// dex-connector#52).
+    pub fn permit2_nonce(&self) -> Result<String, ArcusSpotError> {
+        let nonce = submission_u256(&self.typed_data, "/message/nonce", "Permit2 nonce")?;
+        Ok(nonce.to_string())
+    }
 }
 
 /// Submit/status response shape used by the official Arcus web client.
@@ -960,6 +978,24 @@ mod tests {
             submission.payload_hash().unwrap(),
             submission.payload_hash().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn permit2_nonce_matches_the_signed_typed_data() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let client = trusted_client("http://127.0.0.1:1/".to_string());
+        let observation = fresh_arcus_observation(wallet.address());
+        let submission = sign_arcus_spot_quote(&client, &observation, &wallet, None)
+            .await
+            .unwrap();
+
+        let expected = submission_u256(&submission.typed_data, "/message/nonce", "nonce")
+            .unwrap()
+            .to_string();
+        assert_eq!(submission.permit2_nonce().unwrap(), expected);
     }
 
     #[test]
