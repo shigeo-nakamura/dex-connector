@@ -406,8 +406,9 @@ impl ArcusSpotClient {
     pub async fn submit_signed_quote_once(
         &self,
         submission: &ArcusSpotSignedQuoteSubmission,
+        permit_context: Option<&ArcusSpotEip2612PermitContext>,
     ) -> Result<ArcusSpotObservation<ArcusSpotSwapStatus>, ArcusSpotSubmitError> {
-        validate_submission(submission, &self.inner.config)?;
+        validate_submission(submission, &self.inner.config, permit_context)?;
         let endpoint = self
             .inner
             .router_base_url
@@ -418,7 +419,7 @@ impl ArcusSpotClient {
         self.pace().await;
         // The shared pacing gate may outlive a short quote. Re-run the full
         // pre-dispatch validation after waiting and immediately before POST.
-        validate_submission(submission, &self.inner.config)?;
+        validate_submission(submission, &self.inner.config, permit_context)?;
         let requested_at = Utc::now();
         let started = Instant::now();
         let response = self
@@ -526,6 +527,7 @@ impl ArcusSpotClient {
 fn validate_submission(
     submission: &ArcusSpotSignedQuoteSubmission,
     config: &ArcusSpotConfig,
+    permit_context: Option<&ArcusSpotEip2612PermitContext>,
 ) -> Result<(), ArcusSpotError> {
     let expected_chain_id = config.chain_id;
     if !submission.venue.eq_ignore_ascii_case(ARCUS_VENUE) {
@@ -658,7 +660,27 @@ fn validate_submission(
         ));
     }
     require_deadline_ttl("submission", deadline)?;
-    validate_submission_permit(submission, permitted_token, permitted_amount, deadline)?;
+    // The EIP-2612 permit's own "spender" is the canonical Permit2 contract
+    // itself (this permit grants Permit2 the ERC-20 allowance; Arcus's
+    // settlement contract is authorized separately, by the Permit2 witness
+    // signature above, to pull from Permit2) -- not `spender` (Arcus's
+    // witness-level settlement spender), which sign_exact_permit never uses
+    // for this field. Passing the wrong address here would silently
+    // reconstruct a different digest than what was actually signed,
+    // permanently failing recovery even for a genuine permit.
+    let permit2_contract = typed_data.domain.verifying_contract.ok_or_else(|| {
+        ArcusSpotError::InvalidResponse("submission typedData omitted domain verifyingContract".to_string())
+    })?;
+    validate_submission_permit(
+        submission,
+        expected_chain_id,
+        taker,
+        permit2_contract,
+        permitted_token,
+        permitted_amount,
+        deadline,
+        permit_context,
+    )?;
     let signature = Signature::from_str(&submission.signature).map_err(|error| {
         ArcusSpotError::InvalidResponse(format!("submission signature is invalid: {error}"))
     })?;
@@ -771,11 +793,29 @@ fn require_trusted_submission_spender(
     )))
 }
 
+/// Validate an optional exact-value EIP-2612 permit accompanying a
+/// submission, including cryptographically recovering its signer.
+///
+/// `v`/`r`/`s` plausibility alone (nonzero components, a valid recovery
+/// byte) doesn't prove the permit was actually signed by `taker` over the
+/// exact token/spender/value/nonce/deadline being submitted: a corrupted
+/// permit, or one signed under the wrong domain, would previously pass this
+/// check and only fail later at the router or on-chain, wasting the
+/// one-shot submission. `context` (the same `ArcusSpotEip2612PermitContext`
+/// used to *sign* the permit, from an already-trusted chain preflight) is
+/// required to reconstruct that exact typed-data and verify the recovered
+/// signer -- without it, this refuses the permit rather than accept it
+/// unverified (Codex P2 follow-up, dex-connector#52).
+#[allow(clippy::too_many_arguments)]
 fn validate_submission_permit(
     submission: &ArcusSpotSignedQuoteSubmission,
+    chain_id: u64,
+    taker: Address,
+    permit2_contract: Address,
     sell_token: Address,
     sell_amount: ethers::types::U256,
     quote_deadline: u64,
+    context: Option<&ArcusSpotEip2612PermitContext>,
 ) -> Result<(), ArcusSpotError> {
     if submission.permits.len() > 1 {
         return Err(ArcusSpotError::InvalidResponse(
@@ -784,6 +824,11 @@ fn validate_submission_permit(
     }
     let Some(permit) = submission.permits.first() else {
         return Ok(());
+    };
+    let Some(context) = context else {
+        return Err(ArcusSpotError::InvalidResponse(
+            "submission includes a permit but no trusted EIP-2612 context was supplied to verify it".to_string(),
+        ));
     };
     let permit_token = Address::from_str(&permit.token).map_err(|error| {
         ArcusSpotError::InvalidResponse(format!("permit token is invalid: {error}"))
@@ -817,7 +862,49 @@ fn validate_submission_permit(
             "permit signature components must be non-zero".to_string(),
         ));
     }
-    Ok(())
+    if context.token_name.trim().is_empty() || context.token_version.trim().is_empty() {
+        return Err(ArcusSpotError::InvalidResponse(
+            "EIP-2612 permit context token name/version must not be empty".to_string(),
+        ));
+    }
+    let nonce = parse_raw_amount("permit nonce", &context.nonce)?;
+    // Mirrors sign_exact_permit's typed-data construction exactly, so a
+    // genuine signature recovers to `taker` and any corruption or
+    // wrong-domain signature does not.
+    let permit_typed_data: TypedData = serde_json::from_value(json!({
+        "domain": {
+            "name": context.token_name,
+            "version": context.token_version,
+            "chainId": chain_id,
+            "verifyingContract": format!("{sell_token:#x}")
+        },
+        "types": {
+            "Permit": [
+                {"name": "owner", "type": "address"},
+                {"name": "spender", "type": "address"},
+                {"name": "value", "type": "uint256"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"}
+            ]
+        },
+        "primaryType": "Permit",
+        "message": {
+            "owner": format!("{taker:#x}"),
+            "spender": format!("{permit2_contract:#x}"),
+            "value": permit_value.to_string(),
+            "nonce": nonce.to_string(),
+            "deadline": permit_deadline.to_string()
+        }
+    }))
+    .map_err(|error| {
+        ArcusSpotError::InvalidResponse(format!("could not build permit typed data: {error}"))
+    })?;
+    let signature = Signature {
+        r: ethers::types::U256::from_big_endian(r.as_bytes()),
+        s: ethers::types::U256::from_big_endian(s.as_bytes()),
+        v: permit.v,
+    };
+    verify_signature(&permit_typed_data, &signature, taker, "permit")
 }
 
 #[cfg(test)]
@@ -947,7 +1034,7 @@ mod tests {
             .unwrap()
             .swap(0, 1);
 
-        let error = validate_submission(&submission, client.config()).unwrap_err();
+        let error = validate_submission(&submission, client.config(), None).unwrap_err();
 
         assert!(error
             .to_string()
@@ -996,6 +1083,72 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(submission.permit2_nonce().unwrap(), expected);
+    }
+
+    fn permit_context(deadline: u64) -> ArcusSpotEip2612PermitContext {
+        ArcusSpotEip2612PermitContext {
+            token_name: "NVDA".to_string(),
+            token_version: "1".to_string(),
+            nonce: "0".to_string(),
+            deadline,
+        }
+    }
+
+    #[tokio::test]
+    async fn genuine_permit_signature_is_accepted() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let client = trusted_client("http://127.0.0.1:1/".to_string());
+        let observation = fresh_arcus_observation(wallet.address());
+        let quote_deadline = observation.response.payload.quotes[0].expiry.unwrap();
+        let context = permit_context(quote_deadline);
+        let submission = sign_arcus_spot_quote(&client, &observation, &wallet, Some(&context))
+            .await
+            .unwrap();
+
+        validate_submission(&submission, client.config(), Some(&context)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tampered_permit_signature_is_rejected() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let client = trusted_client("http://127.0.0.1:1/".to_string());
+        let observation = fresh_arcus_observation(wallet.address());
+        let quote_deadline = observation.response.payload.quotes[0].expiry.unwrap();
+        let context = permit_context(quote_deadline);
+        let mut submission = sign_arcus_spot_quote(&client, &observation, &wallet, Some(&context))
+            .await
+            .unwrap();
+        // Flip the permit's recovery byte so it recovers a different signer
+        // than the actual taker, without touching r/s plausibility (both
+        // stay nonzero, matching what the pre-fix check alone verified).
+        submission.permits[0].v = if submission.permits[0].v == 27 { 28 } else { 27 };
+
+        let error = validate_submission(&submission, client.config(), Some(&context)).unwrap_err();
+        assert!(error.to_string().contains("permit signature recovered"));
+    }
+
+    #[tokio::test]
+    async fn permit_without_a_trusted_context_is_rejected() {
+        let wallet = LocalWallet::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        )
+        .unwrap();
+        let client = trusted_client("http://127.0.0.1:1/".to_string());
+        let observation = fresh_arcus_observation(wallet.address());
+        let quote_deadline = observation.response.payload.quotes[0].expiry.unwrap();
+        let context = permit_context(quote_deadline);
+        let submission = sign_arcus_spot_quote(&client, &observation, &wallet, Some(&context))
+            .await
+            .unwrap();
+
+        let error = validate_submission(&submission, client.config(), None).unwrap_err();
+        assert!(error.to_string().contains("no trusted EIP-2612 context"));
     }
 
     #[test]
@@ -1055,7 +1208,7 @@ mod tests {
         });
 
         let error = client
-            .submit_signed_quote_once(&submission)
+            .submit_signed_quote_once(&submission, None)
             .await
             .unwrap_err();
 
@@ -1087,7 +1240,7 @@ mod tests {
             .await;
 
         let error = client
-            .submit_signed_quote_once(&submission)
+            .submit_signed_quote_once(&submission, None)
             .await
             .unwrap_err();
 
@@ -1134,7 +1287,7 @@ mod tests {
         });
 
         let error = client
-            .submit_signed_quote_once(&submission)
+            .submit_signed_quote_once(&submission, None)
             .await
             .unwrap_err();
 
@@ -1222,7 +1375,7 @@ mod tests {
         };
         let client = ArcusSpotClient::new(config).unwrap();
         let error = client
-            .submit_signed_quote_once(&submission)
+            .submit_signed_quote_once(&submission, None)
             .await
             .unwrap_err();
         assert!(matches!(
